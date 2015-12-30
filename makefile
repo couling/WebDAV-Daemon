@@ -1,7 +1,9 @@
-all: build/webdav
+-include build/*.d
 
-build/webdav: main.c | build
-	gcc -std=c99 -o $@ -O3 $< -lmicrohttpd
+all: build/webdavd build/rap
+
+build/%: %.c | build
+	gcc -std=c99 -o $@ -O3 $(filter %.c,$^) -MMD -lmicrohttpd
 
 build:
 	mkdir $@
