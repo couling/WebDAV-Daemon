@@ -17,21 +17,10 @@ char NOT_FOUND_STRING[] = "Not Found!";
 
 typedef struct {
 	char * user;
-	char * home;
+	char * password;
 } User;
 
-typedef struct {
-	int fdIn;
-	int fdOut;
-} DataSession, RestrictedAccessProcessor;
 
-typedef struct {
-	char * password;
-	time_t lastAccess;
-	//  = time(NULL);
-	User user;
-//RestrictedAccessProcessor processor;
-} Authentication;
 
 struct MHD_Daemon **daemons;
 int daemonCount;
@@ -52,16 +41,17 @@ int queueAuthRequired(struct MHD_Connection *request) {
 }
 
 int authLookup(struct MHD_Connection *request, User * foundUser) {
+	char * user;
 	char * password;
-	foundUser->user = MHD_basic_auth_get_username_password(request, &password);
-	foundUser->home = password;
+	user = MHD_basic_auth_get_username_password(request, &password);
+	foundUser->password = password;
 
-	if (foundUser) {
+	if (foundUser->user) {
 		// TODO add PAM authentication
 		return MHD_YES;
 	}
 
-	foundUser->home = NULL;
+	foundUser->password = NULL;
 
 	// Authentication failed.
 	return queueAuthRequired(request);
@@ -78,11 +68,14 @@ static int processNewRequest(struct MHD_Connection *request, const char *url, co
 		return MHD_YES;
 
 	char dummyString[1024];
-	sprintf(dummyString, "User %s Home %s", user.user, user.home);
+	sprintf(dummyString, "User %s Home %s", user.user, user.password);
 	struct MHD_Response * response = MHD_create_response_from_buffer(strlen(dummyString), dummyString,
 			MHD_RESPMEM_MUST_COPY);
 	int ret = MHD_queue_response(request, MHD_HTTP_OK, response);
 	MHD_destroy_response(response);
+
+	printf("User %s Home %s\n", user.user, user.password);
+
 	return ret;
 }
 
@@ -109,11 +102,7 @@ static int answerToRequest(void *cls, struct MHD_Connection *request, const char
 
 int main(int argCount, char ** args) {
 	daemonCount = 1;
-	daemons = malloc(sizeof(struct MHD_Daemon *) * daemonCount);
-	if (!daemons) {
-		fprintf(stderr, "Unable to allocate memory\n");
-		exit(255);
-	}
+	daemons = mallocSafe(sizeof(struct MHD_Daemon *) * daemonCount);
 
 	daemons[0] = MHD_start_daemon(MHD_USE_SELECT_INTERNALLY,
 	PORT, NULL, NULL, (MHD_AccessHandlerCallback) &answerToRequest, NULL, MHD_OPTION_END);

@@ -11,4 +11,13 @@ typedef enum {
 	AUTH_BOUNCE
 } RAPResult;
 
+typedef struct {
+	int fdIn;
+	int fdOut;
+} DataSession;
+
+void * mallocSafe(size_t size);
+
+int forkExec(const char * program, char *const argv[], DataSession * dataSession, int errFd);
+
 #endif
