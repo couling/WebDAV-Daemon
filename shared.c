@@ -6,11 +6,11 @@
 #include "shared.h"
 
 void * mallocSafe(size_t size) {
-	void * result = malloc(size);
-	if (result) {
-		return result;
+	void * allocatedMemory = malloc(size);
+	if (allocatedMemory) {
+		return allocatedMemory;
 	} else {
-		fprintf(stderr, "Could not allocate memory! Exiting.\n");
+		perror("Could not allocate memory! Exiting!");
 		exit(255);
 	}
 }
@@ -27,20 +27,20 @@ static void moveFd(int fromFd, int toFd) {
 #define FD_READ  0
 #define FD_WRITE 1
 
-int forkPipeExec(const char * path, char * const argv[], DataSession * dataSession, int errFd) {
+int forkPipeExec(const char * path, char * const argv[], struct DataSession * dataSession, int errFd) {
 	// Create pipes for stdin and stdout
 	int inFd[2];
 	int outFd[2];
 	int result = pipe2(inFd, O_CLOEXEC);
 	if (!result) {
-		return result;
+		return 0;
 	}
 
 	result = pipe2(outFd, O_CLOEXEC);
 	if (!result) {
 		close(inFd[0]);
 		close(inFd[1]);
-		return result;
+		return 0;
 	}
 
 	result = fork();
@@ -52,13 +52,13 @@ int forkPipeExec(const char * path, char * const argv[], DataSession * dataSessi
 			// fork failed so close parent pipes and return non-zero
 			close(inFd[FD_WRITE]);
 			close(outFd[FD_READ]);
-			return result;
+			return 0;
 		}
 
 		dataSession->fdIn = inFd[FD_WRITE];
 		dataSession->fdOut = outFd[FD_WRITE];
 
-		return 0;
+		return result;
 	} else {
 		// child
 		// Sort out pipes
@@ -70,7 +70,12 @@ int forkPipeExec(const char * path, char * const argv[], DataSession * dataSessi
 			moveFd(errFd, STDERR_FILENO);
 		}
 
-		execv(path, argv);
+		if (argv) {
+			execv(path, argv);
+		} else {
+			char * const blankArg[] = { NULL };
+			execv(path, blankArg);
+		}
 		perror("Could not run program");
 		exit(255);
 	}
