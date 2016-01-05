@@ -2,27 +2,20 @@
 #define WEBDAV_SHARED_H
 
 #define RAP_PATH "/usr/sbin/rap"
-#define RAP_PATH_MAX 4096
-struct User {
-	char * user;
-	char * password;
-};
 
 enum RAPAction {
-	OPEN_FILE
+	RAP_INVALID_METHOD, RAP_READ_FILE, RAP_WRITE_FILE, RAP_LIST_FOLDER
 };
 
 enum RAPResult {
-	READ_SUCCESS, READ_WRITE_SUCCESS, AUTH_BOUNCE
+	RAP_SUCCESS, RAP_NOT_FOUND, RAP_ACCESS_DENIED, RAP_AUTH_FAILLED
 };
 
-struct DataSession {
-	int fdIn;
-	int fdOut;
-};
+#define RAP_ACTION_INDEX 0
+#define RAP_FILE_INDEX 1
 
 void * mallocSafe(size_t size);
-
-int forkPipeExec(const char * program, char * const argv[], struct DataSession * dataSession, int errFd);
+ssize_t sock_fd_read(int sock, int bufferCount, struct iovec * buffers, int *fd);
+ssize_t sock_fd_write(int sock, int bufferCount, struct iovec * buffers, int fd);
 
 #endif

@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <sys/socket.h>
 #include "shared.h"
 
 void * mallocSafe(size_t size) {
@@ -15,68 +16,65 @@ void * mallocSafe(size_t size) {
 	}
 }
 
-static void moveFd(int fromFd, int toFd) {
-	if (dup2(fromFd, toFd) == -1) {
-		fprintf(stderr, "Could not move FD\n");
-		exit(255);
+ssize_t sock_fd_write(int sock, int bufferCount, struct iovec * buffers, int fd) {
+	ssize_t size;
+	struct msghdr msg;
+	char ctrl_buf[CMSG_SPACE(sizeof(int))];
+
+	msg.msg_name = NULL;
+	msg.msg_namelen = 0;
+	msg.msg_iov = buffers;
+	msg.msg_iovlen = bufferCount;
+	if (fd != -1) {
+		msg.msg_control = &ctrl_buf;
+		msg.msg_controllen = sizeof(ctrl_buf);
+		((struct cmsghdr *) ctrl_buf)->cmsg_len = sizeof(ctrl_buf);
+		((struct cmsghdr *) ctrl_buf)->cmsg_level = SOL_SOCKET;
+		((struct cmsghdr *) ctrl_buf)->cmsg_type = SCM_RIGHTS;
+		*((int *) CMSG_DATA((struct cmsghdr * ) ctrl_buf)) = fd;
 	} else {
-		close(fromFd);
+		msg.msg_control = NULL;
+		msg.msg_controllen = 0;
 	}
+
+	return sendmsg(sock, &msg, 0);
 }
 
-#define FD_READ  0
-#define FD_WRITE 1
+ssize_t sock_fd_read(int sock, int bufferCount, struct iovec * buffers, int *fd) {
+	ssize_t size;
+	struct msghdr msg;
+	struct iovec iov[1];
+	char ctrl_buf[CMSG_SPACE(sizeof(int))];
 
-int forkPipeExec(const char * path, char * const argv[], struct DataSession * dataSession, int errFd) {
-	// Create pipes for stdin and stdout
-	int inFd[2];
-	int outFd[2];
-	int result = pipe2(inFd, O_CLOEXEC);
-	if (!result) {
+	msg.msg_name = NULL;
+	msg.msg_namelen = 0;
+	msg.msg_iov = buffers;
+	msg.msg_iovlen = bufferCount;
+	msg.msg_control = &ctrl_buf;
+	msg.msg_controllen = sizeof(ctrl_buf);
+
+	size = recvmsg(sock, &msg, 0);
+	if (size < 0) {
+		perror("recvmsg");
+		return -1;
+	}
+	if (size == 0) {
 		return 0;
 	}
-
-	result = pipe2(outFd, O_CLOEXEC);
-	if (!result) {
-		close(inFd[0]);
-		close(inFd[1]);
-		return 0;
-	}
-
-	result = fork();
-	if (result) {
-		// parent
-		close(inFd[FD_READ]);
-		close(outFd[FD_WRITE]);
-		if (result == -1) {
-			// fork failed so close parent pipes and return non-zero
-			close(inFd[FD_WRITE]);
-			close(outFd[FD_READ]);
-			return 0;
-		}
-
-		dataSession->fdIn = inFd[FD_WRITE];
-		dataSession->fdOut = outFd[FD_WRITE];
-
-		return result;
-	} else {
-		// child
-		// Sort out pipes
-		close(inFd[FD_WRITE]);
-		close(outFd[FD_READ]);
-		moveFd(inFd[FD_READ], STDIN_FILENO);
-		moveFd(outFd[FD_WRITE], STDOUT_FILENO);
-		if (STDERR_FILENO != errFd) {
-			moveFd(errFd, STDERR_FILENO);
-		}
-
-		if (argv) {
-			execv(path, argv);
+	struct cmsghdr * cmsg = CMSG_FIRSTHDR(&msg);
+	if (cmsg && cmsg->cmsg_len == CMSG_LEN(sizeof(int)) && cmsg->cmsg_level == SOL_SOCKET
+			&& cmsg->cmsg_type != SCM_RIGHTS) {
+		int recievedFd = *((int *) CMSG_DATA(cmsg));
+		if (fd) {
+			*fd = recievedFd;
 		} else {
-			char * const blankArg[] = { NULL };
-			execv(path, blankArg);
+			fprintf(stderr, "Warning: closing ignored fd\n");
+			close(recievedFd);
 		}
-		perror("Could not run program");
-		exit(255);
+	} else if (fd) {
+		// report back to the calling method that no FD was recieved.
+		*fd = -1;
 	}
+
+	return size;
 }

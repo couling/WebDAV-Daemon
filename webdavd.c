@@ -1,13 +1,17 @@
+#include <sys/stat.h>
+#include <signal.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
 #include <pthread.h>
 #include <time.h>
+#include <limits.h>
+#include <unistd.h>
 #include <sys/types.h>
 #include <sys/select.h>
 #include <sys/socket.h>
+#include <sys/wait.h>
 #include <microhttpd.h>
-#include <limits.h>
 
 #include "shared.h"
 
@@ -18,9 +22,9 @@ int daemonCount;
 
 struct RestrictedAccessProcessor {
 	int pid;
-	struct DataSession dataSession;
-	struct User user;
-	char * socketFile;
+	int socketFd;
+	char * user;
+	char * password;
 };
 
 struct WriteHandle {
@@ -61,101 +65,255 @@ static int queueSimpleStringResponse(struct MHD_Connection *request, int httpRes
 	return ret;
 }
 
-static int queueAuthRequired(struct MHD_Connection *request) {
+static int queueAuthRequiredResponse(struct MHD_Connection *request) {
 	struct Header headers[] = { { .headerKey = "WWW-Authenticate", .headerValue = "Basic realm=\"My Server\"" } };
 	return queueStringResponse(request, MHD_HTTP_UNAUTHORIZED, "Access Denied!", 1, headers);
 }
 
-static void destroyRestrictedAccessProcessor(struct RestrictedAccessProcessor * processor) {
-	close(processor->dataSession.fdIn);
-	close(processor->dataSession.fdOut);
-	free(processor->socketFile);
-	free(processor->user.user);
+static int fdContentReader(int *fd, uint64_t pos, char *buf, size_t max) {
+	size_t bytesRead = read(*fd, buf, max);
+	if (bytesRead < 0) {
+		// error
+		return -2;
+	}
+	if (bytesRead == 0) {
+		// End of stream
+		return -1;
+	}
+	return bytesRead;
 }
 
-static int createRestrictedAccessProcessor(struct RestrictedAccessProcessor * processor, const struct User * user) {
-	processor->pid = forkPipeExec(RAP_PATH, NULL, &(processor->dataSession), STDERR_FILENO);
+static void fdContentReaderCleanup(int *fd) {
+	close(*fd);
+	free(fd);
+	void *MHD_ContentReaderFreeCallback(void *cls);
+}
+
+static int queueFdResponse(struct MHD_Connection *request, int fd) {
+	struct stat statBuffer;
+	if (fstat(fd, &statBuffer)) {
+		return MHD_NO;
+	}
+
+	if (statBuffer.st_mode | S_IFMT == S_IFREG) {
+		fprintf(stderr, "Serving regular file\n");
+		struct MHD_Response * response = MHD_create_response_from_fd((uint64_t) statBuffer.st_size, fd);
+		if (!response)
+			return MHD_NO;
+		int ret = MHD_queue_response(request, MHD_HTTP_OK, response);
+		MHD_destroy_response(response);
+		return ret;
+	} else {
+		int * fdAllocated = mallocSafe(sizeof(int));
+		*fdAllocated = fd;
+		struct MHD_Response * response = MHD_create_response_from_callback(-1, 4096,
+				(MHD_ContentReaderCallback) &queueFdResponse, fdAllocated,
+				(MHD_ContentReaderFreeCallback) & fdContentReaderCleanup);
+		if (!response)
+			return MHD_NO;
+		int ret = MHD_queue_response(request, MHD_HTTP_OK, response);
+		MHD_destroy_response(response);
+		return ret;
+	}
+}
+
+static int filterHostHeader(const char ** host, enum MHD_ValueKind kind, const char *key, const char *value) {
+	if (!strcmp(key, "Host")) {
+		*host = value;
+	}
+	return MHD_YES;
+}
+
+static int forkSockExec(const char * path, int * newSockFd) {
+// Create unix domain socket for
+	int sockFd[2];
+	int result = socketpair(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0, sockFd);
+	if (result != 0) {
+		perror("socketpair() failed");
+		return 0;
+	}
+
+	result = fork();
+	if (result) {
+		// parent
+		close(sockFd[1]);
+		if (result == -1) {
+			// fork failed so close parent pipes and return non-zero
+			close(sockFd[0]);
+			return 0;
+		}
+
+		*newSockFd = sockFd[0];
+
+		return result;
+	} else {
+		// child
+		// Sort out pipes
+		close(newSockFd[0]);
+		char fdBuffer[10];
+		int dupSocket = dup(fdBuffer[1]);
+		sprintf(fdBuffer, "%d", dupSocket);
+
+		char * argv[] = { fdBuffer, NULL };
+		execv(path, argv);
+
+		perror("Could not run program");
+		exit(255);
+	}
+}
+
+static void destroyRestrictedAccessProcessor(struct RestrictedAccessProcessor * processor) {
+	close(processor->socketFd);
+	free(processor->user);
+}
+
+static int createRestrictedAccessProcessor(struct MHD_Connection *request,
+		struct RestrictedAccessProcessor ** newProcessor, const char * user, const char * password) {
+
+	struct RestrictedAccessProcessor * processor = mallocSafe(sizeof(struct RestrictedAccessProcessor));
+	processor->pid = forkSockExec(RAP_PATH, &(processor->socketFd));
 	if (!processor->pid) {
+		free(processor);
+		*newProcessor = NULL;
 		perror("Could not fork ");
 		return MHD_NO;
 	}
-	size_t userLen = strlen(user->user) + 1;
-	size_t passLen = strlen(user->password) + 1;
+	size_t userLen = strlen(user) + 1;
+	size_t passLen = strlen(password) + 1;
 	size_t bufferSize = userLen + passLen;
-	processor->user.user = mallocSafe(bufferSize);
-	processor->user.password = processor->user.user + userLen;
-	processor->socketFile = mallocSafe(RAP_PATH_MAX);
-	memcpy(processor->user.user, user->user, userLen);
-	memcpy(processor->user.password, user->password, passLen);
-	if (write(processor->dataSession.fdIn, processor->user.user, bufferSize) != bufferSize) {
+	processor->user = mallocSafe(bufferSize);
+	processor->password = processor->user + userLen;
+	memcpy(processor->user, user, userLen);
+	memcpy(processor->password, password, passLen);
+	struct iovec message[2];
+	message[0].iov_len = userLen;
+	message[0].iov_base = processor->user;
+	message[1].iov_len = passLen;
+	message[1].iov_base = processor->password;
+	if (sock_fd_write(processor->socketFd, 2, message, -1) <= 0) {
 		destroyRestrictedAccessProcessor(processor);
+		free(processor);
+		*newProcessor = NULL;
+		perror("Could not send auth to RAP ");
+		return MHD_NO;
+	}
+	enum RAPResult authResult;
+// TODO implement timeout ... possibly using "select"
+	message[0].iov_len = sizeof(authResult);
+	message[0].iov_base = &authResult;
+	size_t readResult = sock_fd_read(processor->socketFd, 1, message, NULL);
+	if (readResult <= 0 || authResult != RAP_SUCCESS) {
+		destroyRestrictedAccessProcessor(processor);
+		free(processor);
+		*newProcessor = NULL;
+		if (readResult < 0) {
+			perror("Could not read result from RAP ");
+		} else if (readResult == 0) {
+			fprintf(stderr, "RAP closed socket unexpectedly\n");
+		} else {
+			fprintf(stderr, "Access deined for user %s\n", user);
+		}
 		return MHD_NO;
 	}
 
-	// TODO implement timeout ... possibly using "select"
-	size_t bytesRead = 0;
-	do {
-		size_t newBytesRead = read(processor->dataSession.fdOut, processor->socketFile + bytesRead,
-		RAP_PATH_MAX - bytesRead);
-
-		bytesRead += newBytesRead;
-		if (newBytesRead <= 0 || (bytesRead == RAP_PATH_MAX && processor->socketFile[bytesRead - 1] != '\0')) {
-			fprintf(stderr, "RAP did not provide complete path\n");
-			destroyRestrictedAccessProcessor(processor);
-			return MHD_NO;
-		}
-	} while (processor->socketFile[bytesRead - 1] != '\0');
+	*newProcessor = processor;
 
 	return MHD_YES;
 }
 
-static int authLookup(struct MHD_Connection *request, struct User * foundUser, struct DataSession * dataSession) {
-	foundUser->user = MHD_basic_auth_get_username_password(request, &(foundUser->password));
+static int authLookup(struct MHD_Connection *request, struct RestrictedAccessProcessor ** processor) {
+	char * user;
+	char * password;
+	user = MHD_basic_auth_get_username_password(request, &(password));
 
-	if (foundUser->user && foundUser->password) {
-		struct RestrictedAccessProcessor rap;
-		if (!createRestrictedAccessProcessor(&rap, foundUser)) {
-			return queueAuthRequired(request);
+	if (user && password) {
+		if (!createRestrictedAccessProcessor(request, processor, user, password)) {
+			return queueAuthRequiredResponse(request);
 		}
-
-		// TODO connect to unix domain socket
-
-		destroyRestrictedAccessProcessor(&rap);
 		return MHD_YES;
 	}
 
-	foundUser->password = NULL;
+// Authentication failed.
+	*processor = NULL;
+	return queueAuthRequiredResponse(request);
+}
 
-	// Authentication failed.
-	return queueAuthRequired(request);
+static enum RAPAction selectRAPAction(const char * method) {
+// TODO analyse method to give the correct response;
+	if (!strcmp("GET", method))
+		return RAP_READ_FILE;
+	else
+		return RAP_INVALID_METHOD;
 }
 
 static int processNewRequest(struct MHD_Connection *request, const char *url, const char *method,
 		struct WriteHandle **writeHandle) {
+	// TODO handle put requests!
+	enum RAPAction action = selectRAPAction(method);
+	if (action == RAP_INVALID_METHOD) {
+		// TODO handle bad responses to bulky PUT requests.
+		struct Header headers[0];
+		headers[0].headerKey = "Allow";
+		headers[0].headerValue = "GET, HEAD, PUT";
+		return queueStringResponse(request, MHD_HTTP_METHOD_NOT_ACCEPTABLE, "Method Not Supported", 1, headers);
+	}
+	struct RestrictedAccessProcessor * rapSocketSession;
 
-	struct User user;
-	struct DataSession rapSocketSession;
-	if (!authLookup(request, &user, &rapSocketSession)) {
+	if (!authLookup(request, &rapSocketSession)) {
 		// This only happens if a systemic error happens (eg a loss of connection)
 		// It does NOT account for authentication failures (access denied).
 		return MHD_NO;
 	}
 
-	// If the user was not authenticated (access denied) then the authLookup will return the appropriate response
-	if (!user.user)
+// If the user was not authenticated (access denied) then the authLookup will return the appropriate response
+	if (!rapSocketSession)
 		return MHD_YES;
 
-	// TODO send request to the RAP socket and get back the file handle response
-	char dummyString[1024];
-	sprintf(dummyString, "User %s Home %s", user.user, user.password);
-	struct MHD_Response * response = MHD_create_response_from_buffer(strlen(dummyString), dummyString,
-			MHD_RESPMEM_MUST_COPY);
-	int ret = MHD_queue_response(request, MHD_HTTP_OK, response);
-	MHD_destroy_response(response);
+	char * host;
+	if (!MHD_get_connection_values(request, MHD_HEADER_KIND, (MHD_KeyValueIterator) &filterHostHeader, &host)) {
+		return MHD_NO;
+	}
 
-	printf("User %s Home %s URL %s\n", user.user, user.password, url);
+	struct iovec message[3];
+	message[0].iov_len = sizeof(action);
+	message[0].iov_base = &action;
+	message[1].iov_len = strlen(host) + 1;
+	message[1].iov_base = host;
+	message[2].iov_len = strlen(url) + 1;
+	message[2].iov_base = (void *) url;
 
-	return ret;
+	if (sock_fd_write(rapSocketSession->socketFd, 3, message, -1) < 0) {
+		perror("Sending request to RAP");
+		return MHD_NO;
+	}
+
+// TODO send request to the RAP socket and get back the file handle response
+
+	int fd;
+	enum RAPResult result;
+	message[0].iov_len = sizeof(result);
+	message[0].iov_base = &result;
+	int readResult = sock_fd_read(rapSocketSession->socketFd, 1, message, &fd);
+	if (readResult <= 0) {
+		if (readResult < 0) {
+			perror("Reading response from RAP");
+		} else {
+			fprintf(stderr, "RAP closed socket unexpectedly while waiting for response\n");
+		}
+		return MHD_NO;
+	}
+
+	switch (result) {
+	case RAP_SUCCESS:
+		return queueFdResponse(request, fd);
+	case RAP_ACCESS_DENIED:
+		return queueSimpleStringResponse(request, MHD_HTTP_FORBIDDEN, "Access denied");
+	case RAP_NOT_FOUND:
+		return queueSimpleStringResponse(request, MHD_HTTP_FORBIDDEN, "File not found");
+	default:
+		fprintf(stderr, "invalid response from RAP %d\n", (int) result);
+		return MHD_NO;
+	}
 }
 
 static int processUploadData(struct MHD_Connection *request, const char *upload_data, size_t * upload_data_size,
@@ -190,9 +348,9 @@ static int completeUpload(struct MHD_Connection *request, struct WriteHandle ** 
 static int answerToRequest(void *cls, struct MHD_Connection *request, const char *url, const char *method,
 		const char *version, const char *upload_data, size_t *upload_data_size, struct WriteHandle ** writeHandle) {
 
-	// We can only accept http 1.1 sessions
-	// Http 1.0 is old and REALLY shouldn't be used
-	// It misses out the "Host" header which is required for this program to function correctly
+// We can only accept http 1.1 sessions
+// Http 1.0 is old and REALLY shouldn't be used
+// It misses out the "Host" header which is required for this program to function correctly
 	if (strcmp(method, "1.1")) {
 		return queueSimpleStringResponse(request, MHD_HTTP_HTTP_VERSION_NOT_SUPPORTED,
 				"HTTP Version not supported, only HTTP 1.1 is accepted");
@@ -208,7 +366,22 @@ static int answerToRequest(void *cls, struct MHD_Connection *request, const char
 	}
 }
 
+static void hdl(int sig, siginfo_t *siginfo, void *context) {
+	int status;
+	waitpid(siginfo->si_pid, &status, 0);
+	fprintf(stderr, "Child finished PID: %d staus: %d\n", siginfo->si_pid, status);
+}
+
 int main(int argCount, char ** args) {
+	struct sigaction act;
+	memset(&act, 0, sizeof(act));
+	act.sa_sigaction = &hdl;
+	act.sa_flags = SA_SIGINFO;
+	if (sigaction(SIGCHLD, &act, NULL) < 0) {
+		perror("sigaction");
+		return 255;
+	}
+
 	daemonCount = 1;
 	daemons = mallocSafe(sizeof(struct MHD_Daemon *) * daemonCount);
 
@@ -222,6 +395,6 @@ int main(int argCount, char ** args) {
 
 	pthread_exit(NULL);
 
-	//MHD_stop_daemon(daemon);
-	//return 0;
+//MHD_stop_daemon(daemon);
+//return 0;
 }
