@@ -15,9 +15,9 @@
 
 #include "shared.h"
 
-struct MHD_Daemon **daemons;
-int daemonPorts[] = { 8888 };
-int daemonCount = sizeof(daemonPorts) / sizeof(daemonPorts[0]);
+static struct MHD_Daemon **daemons;
+static int daemonPorts[] = { 8888 };
+static int daemonCount = sizeof(daemonPorts) / sizeof(daemonPorts[0]);
 
 struct RestrictedAccessProcessor {
 	int pid;
@@ -197,7 +197,9 @@ static int createRestrictedAccessProcessor(struct MHD_Connection *request,
 	// TODO implement timeout ... possibly using "select"
 	message[0].iov_len = sizeof(authResult);
 	message[0].iov_base = &authResult;
-	size_t readResult = sock_fd_read(processor->socketFd, 1, message, NULL);
+
+	int bufferCount = 1;
+	size_t readResult = sock_fd_read(processor->socketFd, &bufferCount, message, NULL);
 	if (readResult <= 0 || authResult != RAP_SUCCESS) {
 		destroyRestrictedAccessProcessor(processor);
 		free(processor);
@@ -209,8 +211,10 @@ static int createRestrictedAccessProcessor(struct MHD_Connection *request,
 		} else {
 			fprintf(stderr, "Access deined for user %s\n", user);
 		}
-		return queueAuthRequiredResponse(request);
+		return queueInternalServerError(request);
 	}
+
+	// TODO check the response code from the request
 
 	*newProcessor = processor;
 
@@ -288,7 +292,8 @@ static int processNewRequest(struct MHD_Connection *request, const char *url, co
 	enum RAPResult result;
 	message[0].iov_len = sizeof(result);
 	message[0].iov_base = &result;
-	int readResult = sock_fd_read(rapSocketSession->socketFd, 1, message, &fd);
+	int bufferCount = 1;
+	int readResult = sock_fd_read(rapSocketSession->socketFd, &bufferCount, message, &fd);
 	if (readResult <= 0) {
 		if (readResult < 0) {
 			perror("Reading response from RAP");

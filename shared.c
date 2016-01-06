@@ -1,4 +1,3 @@
-#define _GNU_SOURCE
 #include <stdlib.h>
 #include <stdio.h>
 #include <fcntl.h>
@@ -40,7 +39,7 @@ ssize_t sock_fd_write(int sock, int bufferCount, struct iovec * buffers, int fd)
 	return sendmsg(sock, &msg, 0);
 }
 
-ssize_t sock_fd_read(int sock, int bufferCount, struct iovec * buffers, int *fd) {
+ssize_t sock_fd_read(int sock, int * bufferCount, struct iovec * buffers, int *fd) {
 	ssize_t size;
 	struct msghdr msg;
 	struct iovec iov[1];
@@ -49,7 +48,7 @@ ssize_t sock_fd_read(int sock, int bufferCount, struct iovec * buffers, int *fd)
 	msg.msg_name = NULL;
 	msg.msg_namelen = 0;
 	msg.msg_iov = buffers;
-	msg.msg_iovlen = bufferCount;
+	msg.msg_iovlen = *bufferCount;
 	msg.msg_control = &ctrl_buf;
 	msg.msg_controllen = sizeof(ctrl_buf);
 
@@ -61,6 +60,7 @@ ssize_t sock_fd_read(int sock, int bufferCount, struct iovec * buffers, int *fd)
 	if (size == 0) {
 		return 0;
 	}
+	*bufferCount = msg.msg_iovlen;
 	struct cmsghdr * cmsg = CMSG_FIRSTHDR(&msg);
 	if (cmsg && cmsg->cmsg_len == CMSG_LEN(sizeof(int)) && cmsg->cmsg_level == SOL_SOCKET
 			&& cmsg->cmsg_type != SCM_RIGHTS) {
