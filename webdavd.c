@@ -15,10 +15,9 @@
 
 #include "shared.h"
 
-#define PORT 8888
-
 struct MHD_Daemon **daemons;
-int daemonCount;
+int daemonPorts[] = { 8888 };
+int daemonCount = sizeof(daemonPorts) / sizeof(daemonPorts[0]);
 
 struct RestrictedAccessProcessor {
 	int pid;
@@ -70,6 +69,10 @@ static int queueAuthRequiredResponse(struct MHD_Connection *request) {
 	return queueStringResponse(request, MHD_HTTP_UNAUTHORIZED, "Access Denied!", 1, headers);
 }
 
+static int queueInternalServerError(struct MHD_Connection * request) {
+	return queueSimpleStringResponse(request, MHD_HTTP_INTERNAL_SERVER_ERROR, "Internal Error!");
+}
+
 static int fdContentReader(int *fd, uint64_t pos, char *buf, size_t max) {
 	size_t bytesRead = read(*fd, buf, max);
 	if (bytesRead < 0) {
@@ -91,11 +94,7 @@ static void fdContentReaderCleanup(int *fd) {
 
 static int queueFdResponse(struct MHD_Connection *request, int fd) {
 	struct stat statBuffer;
-	if (fstat(fd, &statBuffer)) {
-		return MHD_NO;
-	}
-
-	if (statBuffer.st_mode | S_IFMT == S_IFREG) {
+	if (!fstat(fd, &statBuffer) && (statBuffer.st_mode | S_IFMT == S_IFREG)) {
 		fprintf(stderr, "Serving regular file\n");
 		struct MHD_Response * response = MHD_create_response_from_fd((uint64_t) statBuffer.st_size, fd);
 		if (!response)
@@ -107,7 +106,7 @@ static int queueFdResponse(struct MHD_Connection *request, int fd) {
 		int * fdAllocated = mallocSafe(sizeof(int));
 		*fdAllocated = fd;
 		struct MHD_Response * response = MHD_create_response_from_callback(-1, 4096,
-				(MHD_ContentReaderCallback) &queueFdResponse, fdAllocated,
+				(MHD_ContentReaderCallback) &fdContentReader, fdAllocated,
 				(MHD_ContentReaderFreeCallback) & fdContentReaderCleanup);
 		if (!response)
 			return MHD_NO;
@@ -125,7 +124,7 @@ static int filterHostHeader(const char ** host, enum MHD_ValueKind kind, const c
 }
 
 static int forkSockExec(const char * path, int * newSockFd) {
-// Create unix domain socket for
+	// Create unix domain socket for
 	int sockFd[2];
 	int result = socketpair(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0, sockFd);
 	if (result != 0) {
@@ -137,26 +136,23 @@ static int forkSockExec(const char * path, int * newSockFd) {
 	if (result) {
 		// parent
 		close(sockFd[1]);
-		if (result == -1) {
+		if (result != -1) {
+			*newSockFd = sockFd[0];
+			return result;
+		} else {
 			// fork failed so close parent pipes and return non-zero
 			close(sockFd[0]);
 			return 0;
 		}
-
-		*newSockFd = sockFd[0];
-
-		return result;
 	} else {
 		// child
-		// Sort out pipes
+		// Sort out socket
 		close(newSockFd[0]);
-		char fdBuffer[10];
-		int dupSocket = dup(fdBuffer[1]);
-		sprintf(fdBuffer, "%d", dupSocket);
-
-		char * argv[] = { fdBuffer, NULL };
+		dup2(STDIN_FILENO, newSockFd[1]);
+		dup2(STDOUT_FILENO, newSockFd[1]);
+		close(newSockFd[1]);
+		char * argv[] = { NULL };
 		execv(path, argv);
-
 		perror("Could not run program");
 		exit(255);
 	}
@@ -176,7 +172,7 @@ static int createRestrictedAccessProcessor(struct MHD_Connection *request,
 		free(processor);
 		*newProcessor = NULL;
 		perror("Could not fork ");
-		return MHD_NO;
+		return queueInternalServerError(request);
 	}
 	size_t userLen = strlen(user) + 1;
 	size_t passLen = strlen(password) + 1;
@@ -186,19 +182,19 @@ static int createRestrictedAccessProcessor(struct MHD_Connection *request,
 	memcpy(processor->user, user, userLen);
 	memcpy(processor->password, password, passLen);
 	struct iovec message[2];
-	message[0].iov_len = userLen;
-	message[0].iov_base = processor->user;
-	message[1].iov_len = passLen;
-	message[1].iov_base = processor->password;
+	message[RAP_USER_INDEX].iov_len = userLen;
+	message[RAP_USER_INDEX].iov_base = processor->user;
+	message[RAP_PASSWORD_INDEX].iov_len = passLen;
+	message[RAP_PASSWORD_INDEX].iov_base = processor->password;
 	if (sock_fd_write(processor->socketFd, 2, message, -1) <= 0) {
 		destroyRestrictedAccessProcessor(processor);
 		free(processor);
 		*newProcessor = NULL;
 		perror("Could not send auth to RAP ");
-		return MHD_NO;
+		return queueInternalServerError(request);
 	}
 	enum RAPResult authResult;
-// TODO implement timeout ... possibly using "select"
+	// TODO implement timeout ... possibly using "select"
 	message[0].iov_len = sizeof(authResult);
 	message[0].iov_base = &authResult;
 	size_t readResult = sock_fd_read(processor->socketFd, 1, message, NULL);
@@ -213,7 +209,7 @@ static int createRestrictedAccessProcessor(struct MHD_Connection *request,
 		} else {
 			fprintf(stderr, "Access deined for user %s\n", user);
 		}
-		return MHD_NO;
+		return queueAuthRequiredResponse(request);
 	}
 
 	*newProcessor = processor;
@@ -225,17 +221,12 @@ static int authLookup(struct MHD_Connection *request, struct RestrictedAccessPro
 	char * user;
 	char * password;
 	user = MHD_basic_auth_get_username_password(request, &(password));
-
 	if (user && password) {
-		if (!createRestrictedAccessProcessor(request, processor, user, password)) {
-			return queueAuthRequiredResponse(request);
-		}
-		return MHD_YES;
+		return createRestrictedAccessProcessor(request, processor, user, password);
+	} else {
+		*processor = NULL;
+		return queueAuthRequiredResponse(request);
 	}
-
-// Authentication failed.
-	*processor = NULL;
-	return queueAuthRequiredResponse(request);
 }
 
 static enum RAPAction selectRAPAction(const char * method) {
@@ -249,6 +240,8 @@ static enum RAPAction selectRAPAction(const char * method) {
 static int processNewRequest(struct MHD_Connection *request, const char *url, const char *method,
 		struct WriteHandle **writeHandle) {
 	// TODO handle put requests!
+
+	// Interpret the method
 	enum RAPAction action = selectRAPAction(method);
 	if (action == RAP_INVALID_METHOD) {
 		// TODO handle bad responses to bulky PUT requests.
@@ -257,38 +250,40 @@ static int processNewRequest(struct MHD_Connection *request, const char *url, co
 		headers[0].headerValue = "GET, HEAD, PUT";
 		return queueStringResponse(request, MHD_HTTP_METHOD_NOT_ACCEPTABLE, "Method Not Supported", 1, headers);
 	}
-	struct RestrictedAccessProcessor * rapSocketSession;
 
+	// Get the host header
+	char * host;
+	if (!MHD_get_connection_values(request, MHD_HEADER_KIND, (MHD_KeyValueIterator) &filterHostHeader, &host)) {
+		return queueInternalServerError(request);
+	}
+
+	// Get a RAP
+	struct RestrictedAccessProcessor * rapSocketSession;
 	if (!authLookup(request, &rapSocketSession)) {
 		// This only happens if a systemic error happens (eg a loss of connection)
 		// It does NOT account for authentication failures (access denied).
 		return MHD_NO;
 	}
 
-// If the user was not authenticated (access denied) then the authLookup will return the appropriate response
+	// If the user was not authenticated (access denied) then the authLookup will return the appropriate response
 	if (!rapSocketSession)
 		return MHD_YES;
 
-	char * host;
-	if (!MHD_get_connection_values(request, MHD_HEADER_KIND, (MHD_KeyValueIterator) &filterHostHeader, &host)) {
-		return MHD_NO;
-	}
-
+	// Send the request to the RAP
 	struct iovec message[3];
-	message[0].iov_len = sizeof(action);
-	message[0].iov_base = &action;
-	message[1].iov_len = strlen(host) + 1;
-	message[1].iov_base = host;
-	message[2].iov_len = strlen(url) + 1;
-	message[2].iov_base = (void *) url;
+	message[RAP_ACTION_INDEX].iov_len = sizeof(action);
+	message[RAP_ACTION_INDEX].iov_base = &action;
+	message[RAP_HOST_INDEX].iov_len = strlen(host) + 1;
+	message[RAP_HOST_INDEX].iov_base = host;
+	message[RAP_FILE_INDEX].iov_len = strlen(url) + 1;
+	message[RAP_FILE_INDEX].iov_base = (void *) url;
 
 	if (sock_fd_write(rapSocketSession->socketFd, 3, message, -1) < 0) {
 		perror("Sending request to RAP");
-		return MHD_NO;
+		return queueInternalServerError(request);
 	}
 
-// TODO send request to the RAP socket and get back the file handle response
-
+	// Get result from RAP
 	int fd;
 	enum RAPResult result;
 	message[0].iov_len = sizeof(result);
@@ -309,10 +304,10 @@ static int processNewRequest(struct MHD_Connection *request, const char *url, co
 	case RAP_ACCESS_DENIED:
 		return queueSimpleStringResponse(request, MHD_HTTP_FORBIDDEN, "Access denied");
 	case RAP_NOT_FOUND:
-		return queueSimpleStringResponse(request, MHD_HTTP_FORBIDDEN, "File not found");
+		return queueSimpleStringResponse(request, MHD_HTTP_NOT_FOUND, "File not found");
 	default:
 		fprintf(stderr, "invalid response from RAP %d\n", (int) result);
-		return MHD_NO;
+		return queueInternalServerError(request);
 	}
 }
 
@@ -348,9 +343,9 @@ static int completeUpload(struct MHD_Connection *request, struct WriteHandle ** 
 static int answerToRequest(void *cls, struct MHD_Connection *request, const char *url, const char *method,
 		const char *version, const char *upload_data, size_t *upload_data_size, struct WriteHandle ** writeHandle) {
 
-// We can only accept http 1.1 sessions
-// Http 1.0 is old and REALLY shouldn't be used
-// It misses out the "Host" header which is required for this program to function correctly
+	// We can only accept http 1.1 sessions
+	// Http 1.0 is old and REALLY shouldn't be used
+	// It misses out the "Host" header which is required for this program to function correctly
 	if (strcmp(method, "1.1")) {
 		return queueSimpleStringResponse(request, MHD_HTTP_HTTP_VERSION_NOT_SUPPORTED,
 				"HTTP Version not supported, only HTTP 1.1 is accepted");
@@ -366,35 +361,38 @@ static int answerToRequest(void *cls, struct MHD_Connection *request, const char
 	}
 }
 
-static void hdl(int sig, siginfo_t *siginfo, void *context) {
+static void initializeDaemin(int port, struct MHD_Daemon **newDaemon) {
+	*newDaemon = MHD_start_daemon(MHD_USE_SELECT_INTERNALLY | MHD_USE_PEDANTIC_CHECKS, port, NULL, NULL,
+			(MHD_AccessHandlerCallback) &answerToRequest, NULL, MHD_OPTION_END);
+
+	if (!*newDaemon) {
+		fprintf(stderr, "Unable to initialise daemon on port %d\n", port);
+		exit(255);
+	}
+}
+
+static void cleanupZombyChildren(int sig, siginfo_t *siginfo, void *context) {
 	int status;
 	waitpid(siginfo->si_pid, &status, 0);
 	fprintf(stderr, "Child finished PID: %d staus: %d\n", siginfo->si_pid, status);
 }
 
 int main(int argCount, char ** args) {
+	// Avoid zombie children
 	struct sigaction act;
 	memset(&act, 0, sizeof(act));
-	act.sa_sigaction = &hdl;
+	act.sa_sigaction = &cleanupZombyChildren;
 	act.sa_flags = SA_SIGINFO;
 	if (sigaction(SIGCHLD, &act, NULL) < 0) {
 		perror("sigaction");
 		return 255;
 	}
 
-	daemonCount = 1;
+	// Start up the daemons
 	daemons = mallocSafe(sizeof(struct MHD_Daemon *) * daemonCount);
-
-	daemons[0] = MHD_start_daemon(MHD_USE_SELECT_INTERNALLY | MHD_USE_PEDANTIC_CHECKS,
-	PORT, NULL, NULL, (MHD_AccessHandlerCallback) &answerToRequest, NULL, MHD_OPTION_END);
-
-	if (!daemons[0]) {
-		fprintf(stderr, "Unable to initialise daemon on port %d\n", PORT);
-		exit(255);
+	for (int i = 0; i < daemonCount; i++) {
+		initializeDaemin(daemonPorts[i], &(daemons[i]));
 	}
 
 	pthread_exit(NULL);
-
-//MHD_stop_daemon(daemon);
-//return 0;
 }

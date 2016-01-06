@@ -11,8 +11,14 @@ enum RAPResult {
 	RAP_SUCCESS, RAP_NOT_FOUND, RAP_ACCESS_DENIED, RAP_AUTH_FAILLED
 };
 
+#define RAP_USER_INDEX 0
+#define RAP_PASSWORD_INDEX 1
+
 #define RAP_ACTION_INDEX 0
-#define RAP_FILE_INDEX 1
+#define RAP_HOST_INDEX 1
+#define RAP_FILE_INDEX 2
+
+
 
 void * mallocSafe(size_t size);
 ssize_t sock_fd_read(int sock, int bufferCount, struct iovec * buffers, int *fd);
