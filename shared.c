@@ -5,6 +5,7 @@
 #include <sys/socket.h>
 #include "shared.h"
 
+
 void * mallocSafe(size_t size) {
 	void * allocatedMemory = malloc(size);
 	if (allocatedMemory) {
@@ -36,7 +37,11 @@ ssize_t sock_fd_write(int sock, int bufferCount, struct iovec * buffers, int fd)
 		msg.msg_controllen = 0;
 	}
 
-	return sendmsg(sock, &msg, 0);
+	size = sendmsg(sock, &msg, 0);
+	if (size < 0) {
+		perror("sendmsg");
+	}
+	return size;
 }
 
 ssize_t sock_fd_read(int sock, int * bufferCount, struct iovec * buffers, int *fd) {

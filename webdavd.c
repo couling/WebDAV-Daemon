@@ -126,13 +126,14 @@ static int filterHostHeader(const char ** host, enum MHD_ValueKind kind, const c
 static int forkSockExec(const char * path, int * newSockFd) {
 	// Create unix domain socket for
 	int sockFd[2];
-	int result = socketpair(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0, sockFd);
+	int result = socketpair(PF_LOCAL, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, sockFd);
 	if (result != 0) {
 		perror("socketpair() failed");
 		return 0;
 	}
 
 	result = fork();
+
 	if (result) {
 		// parent
 		close(sockFd[1]);
@@ -147,10 +148,14 @@ static int forkSockExec(const char * path, int * newSockFd) {
 	} else {
 		// child
 		// Sort out socket
-		close(newSockFd[0]);
-		dup2(STDIN_FILENO, newSockFd[1]);
-		dup2(STDOUT_FILENO, newSockFd[1]);
-		close(newSockFd[1]);
+		if (dup2(sockFd[1], STDIN_FILENO) == -1 || dup2(sockFd[1], STDOUT_FILENO) == -1) {
+			fprintf(stderr, "Could not assign new socket (%d) to stdin/stdout\n", newSockFd[1]);
+			perror("Assigning socket to stdin/stdout");
+			exit(255);
+		}
+
+		//close(newSockFd[0]);
+		//close(newSockFd[1]);
 		char * argv[] = { NULL };
 		execv(path, argv);
 		perror("Could not run program");
@@ -181,16 +186,19 @@ static int createRestrictedAccessProcessor(struct MHD_Connection *request,
 	processor->password = processor->user + userLen;
 	memcpy(processor->user, user, userLen);
 	memcpy(processor->password, password, passLen);
-	struct iovec message[2];
+	struct iovec message[3];
+	enum RAPAction action = RAP_AUTHENTICATE;
+	message[RAP_ACTION_INDEX].iov_len = sizeof(action);
+	message[RAP_ACTION_INDEX].iov_base = &action;
 	message[RAP_USER_INDEX].iov_len = userLen;
 	message[RAP_USER_INDEX].iov_base = processor->user;
 	message[RAP_PASSWORD_INDEX].iov_len = passLen;
 	message[RAP_PASSWORD_INDEX].iov_base = processor->password;
-	if (sock_fd_write(processor->socketFd, 2, message, -1) <= 0) {
+	if (sock_fd_write(processor->socketFd, 3, message, -1) <= 0) {
 		destroyRestrictedAccessProcessor(processor);
 		free(processor);
 		*newProcessor = NULL;
-		perror("Could not send auth to RAP ");
+		perror("sendmsg auth");
 		return queueInternalServerError(request);
 	}
 	enum RAPResult authResult;
@@ -351,7 +359,8 @@ static int answerToRequest(void *cls, struct MHD_Connection *request, const char
 	// We can only accept http 1.1 sessions
 	// Http 1.0 is old and REALLY shouldn't be used
 	// It misses out the "Host" header which is required for this program to function correctly
-	if (strcmp(method, "1.1")) {
+	if (strcmp(version, "HTTP/1.1")) {
+		fprintf(stderr, "HTTP Version not supported, only HTTP/1.1 is accepted. Supplied: %s\n", version);
 		return queueSimpleStringResponse(request, MHD_HTTP_HTTP_VERSION_NOT_SUPPORTED,
 				"HTTP Version not supported, only HTTP 1.1 is accepted");
 	}

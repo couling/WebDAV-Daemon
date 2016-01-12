@@ -17,16 +17,6 @@ static size_t respond(enum RAPResult result, int fd) {
 	return sock_fd_write(STDOUT_FILENO, 1, &header, fd);
 }
 
-static void protectBuffers(int bufferCount, struct iovec * bufferHeaders) {
-	for (int i = 0; i < 3; i++) {
-		if (bufferHeaders[i].iov_len == BUFFER_SIZE) {
-			((char *) bufferHeaders[i].iov_base)[BUFFER_SIZE - 1] = '\0';
-		} else {
-			((char *) bufferHeaders[i].iov_base)[bufferHeaders[i].iov_len] = '\0';
-		}
-	}
-}
-
 static size_t listFolder(int bufferCount, struct iovec * bufferHeaders) {
 	return respond(RAP_BAD_REQUEST, -1);
 }
@@ -56,12 +46,17 @@ static size_t readFile(int bufferCount, struct iovec * bufferHeaders) {
 }
 
 static size_t authenticate(int bufferCount, struct iovec * bufferHeaders) {
+	char * user = (char *) bufferHeaders[RAP_USER_INDEX].iov_base;
+	char * password = (char *) bufferHeaders[RAP_PASSWORD_INDEX].iov_base;
+	user[BUFFER_SIZE - 1] = '\0';
+	password[BUFFER_SIZE - 1] = '\0';
+
+	fprintf(stderr, "Login request for %s %s\n", user, password);
 	if (authenticated || bufferCount != 3) {
 		return respond(RAP_BAD_REQUEST, -1);
 	}
-	protectBuffers(bufferCount, bufferHeaders);
-	if (!strcmp("AAA", bufferHeaders[RAP_USER_INDEX].iov_base)
-			&& !strcmp("BBB", bufferHeaders[RAP_PASSWORD_INDEX].iov_base)) {
+
+	if (!strcmp("AAA", user) && !strcmp("BBB", password)) {
 		return respond(RAP_SUCCESS, -1);
 	} else {
 		return respond(RAP_AUTH_FAILLED, -1);
@@ -70,7 +65,7 @@ static size_t authenticate(int bufferCount, struct iovec * bufferHeaders) {
 
 // RAP_AUTHENTICATE, RAP_INVALID_METHOD, RAP_READ_FILE, RAP_WRITE_FILE, RAP_LIST_FOLDER
 typedef size_t (*handlerMethod)(int bufferCount, struct iovec * bufferHeaders);
-static handlerMethod handlerMethods[] = { authenticate, NULL, };
+static handlerMethod handlerMethods[] = { authenticate, NULL, readFile, writeFile, listFolder };
 
 int main(int argCount, char ** args) {
 	int bufferCount = 3;
@@ -101,7 +96,12 @@ int main(int argCount, char ** args) {
 			ioResult = respond(RAP_BAD_REQUEST, -1);
 			continue;
 		}
-
+		fprintf(stderr, "Request for %d with %d buffers:", (int) request, bufferCount);
+		for (int i=1; i<bufferCount; i++) {
+			fprintf(stderr, " %d",(int)bufferHeaders[i].iov_len);
+			int x =write(STDERR_FILENO, bufferHeaders[i].iov_base, bufferHeaders[i].iov_len);
+		}
+		fprintf(stderr, "\n");
 		ioResult = handlerMethods[request](bufferCount, bufferHeaders);
 
 	} while (ioResult);
