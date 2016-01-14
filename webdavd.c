@@ -186,43 +186,35 @@ static int createRestrictedAccessProcessor(struct MHD_Connection *request,
 	processor->password = processor->user + userLen;
 	memcpy(processor->user, user, userLen);
 	memcpy(processor->password, password, passLen);
-	struct iovec message[3];
-	enum RAPAction action = RAP_AUTHENTICATE;
-	message[RAP_ACTION_INDEX].iov_len = sizeof(action);
-	message[RAP_ACTION_INDEX].iov_base = &action;
-	message[RAP_USER_INDEX].iov_len = userLen;
-	message[RAP_USER_INDEX].iov_base = processor->user;
-	message[RAP_PASSWORD_INDEX].iov_len = passLen;
-	message[RAP_PASSWORD_INDEX].iov_base = processor->password;
-	if (sock_fd_write(processor->socketFd, 3, message, -1) <= 0) {
+	struct iovec message[MAX_BUFFER_PARTS] = { { .iov_len = userLen, .iov_base = processor->user }, {
+			.iov_len = passLen, .iov_base = processor->password } };
+	if (sendMessage(processor->socketFd, RAP_AUTHENTICATE, -1, 2, message) <= 0) {
 		destroyRestrictedAccessProcessor(processor);
 		free(processor);
 		*newProcessor = NULL;
 		perror("sendmsg auth");
 		return queueInternalServerError(request);
 	}
-	enum RAPResult authResult;
 	// TODO implement timeout ... possibly using "select"
-	message[0].iov_len = sizeof(authResult);
-	message[0].iov_base = &authResult;
-
-	int bufferCount = 1;
-	size_t readResult = sock_fd_read(processor->socketFd, &bufferCount, message, NULL);
-	if (readResult <= 0 || authResult != RAP_SUCCESS) {
+	int bufferCount = MAX_BUFFER_PARTS;
+	enum RapConstant responseCode;
+	size_t readResult = recvMessage(processor->socketFd, &responseCode, NULL, &bufferCount, message);
+	if (readResult <= 0 || responseCode != RAP_SUCCESS) {
 		destroyRestrictedAccessProcessor(processor);
 		free(processor);
 		*newProcessor = NULL;
 		if (readResult < 0) {
 			perror("Could not read result from RAP ");
+			return queueInternalServerError(request);
 		} else if (readResult == 0) {
 			fprintf(stderr, "RAP closed socket unexpectedly\n");
+			return queueInternalServerError(request);
 		} else {
 			fprintf(stderr, "Access deined for user %s\n", user);
+			return queueAuthRequiredResponse(request);
 		}
-		return queueInternalServerError(request);
-	}
 
-	// TODO check the response code from the request
+	}
 
 	*newProcessor = processor;
 
@@ -241,7 +233,7 @@ static int authLookup(struct MHD_Connection *request, struct RestrictedAccessPro
 	}
 }
 
-static enum RAPAction selectRAPAction(const char * method) {
+static enum RapConstant selectRAPAction(const char * method) {
 // TODO analyse method to give the correct response;
 	if (!strcmp("GET", method))
 		return RAP_READ_FILE;
@@ -254,8 +246,8 @@ static int processNewRequest(struct MHD_Connection *request, const char *url, co
 	// TODO handle put requests!
 
 	// Interpret the method
-	enum RAPAction action = selectRAPAction(method);
-	if (action == RAP_INVALID_METHOD) {
+	enum RapConstant mID = selectRAPAction(method);
+	if (mID == RAP_INVALID_METHOD) {
 		// TODO handle bad responses to bulky PUT requests.
 		struct Header headers[0];
 		headers[0].headerKey = "Allow";
@@ -282,36 +274,28 @@ static int processNewRequest(struct MHD_Connection *request, const char *url, co
 		return MHD_YES;
 
 	// Send the request to the RAP
-	struct iovec message[3];
-	message[RAP_ACTION_INDEX].iov_len = sizeof(action);
-	message[RAP_ACTION_INDEX].iov_base = &action;
-	message[RAP_HOST_INDEX].iov_len = strlen(host) + 1;
-	message[RAP_HOST_INDEX].iov_base = host;
-	message[RAP_FILE_INDEX].iov_len = strlen(url) + 1;
-	message[RAP_FILE_INDEX].iov_base = (void *) url;
+	struct iovec message[MAX_BUFFER_PARTS] = { { .iov_len = strlen(host) + 1, .iov_base = host }, { .iov_len = strlen(
+			url) + 1, .iov_base = (void *) url } };
 
-	if (sock_fd_write(rapSocketSession->socketFd, 3, message, -1) < 0) {
+	if (sendMessage(rapSocketSession->socketFd, mID, -1, 2, message) < 0) {
 		perror("Sending request to RAP");
 		return queueInternalServerError(request);
 	}
 
 	// Get result from RAP
 	int fd;
-	enum RAPResult result;
-	message[0].iov_len = sizeof(result);
-	message[0].iov_base = &result;
-	int bufferCount = 1;
-	int readResult = sock_fd_read(rapSocketSession->socketFd, &bufferCount, message, &fd);
+	int bufferCount = 0;
+	int readResult = recvMessage(rapSocketSession->socketFd, &mID, &fd, &bufferCount, NULL);
 	if (readResult <= 0) {
 		if (readResult < 0) {
 			perror("Reading response from RAP");
 		} else {
 			fprintf(stderr, "RAP closed socket unexpectedly while waiting for response\n");
 		}
-		return MHD_NO;
+		return queueInternalServerError(request);
 	}
 
-	switch (result) {
+	switch (mID) {
 	case RAP_SUCCESS:
 		return queueFdResponse(request, fd);
 	case RAP_ACCESS_DENIED:
@@ -319,7 +303,7 @@ static int processNewRequest(struct MHD_Connection *request, const char *url, co
 	case RAP_NOT_FOUND:
 		return queueSimpleStringResponse(request, MHD_HTTP_NOT_FOUND, "File not found");
 	default:
-		fprintf(stderr, "invalid response from RAP %d\n", (int) result);
+		fprintf(stderr, "invalid response from RAP %d\n", (int) mID);
 		return queueInternalServerError(request);
 	}
 }

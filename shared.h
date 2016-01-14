@@ -6,24 +6,36 @@
 
 #define RAP_PATH "/usr/sbin/rap"
 
-enum RAPAction {
-	RAP_AUTHENTICATE, RAP_INVALID_METHOD, RAP_READ_FILE, RAP_WRITE_FILE, RAP_LIST_FOLDER, RAP_MAX = RAP_LIST_FOLDER
+enum RapConstant {
+	RAP_INVALID_METHOD,
+
+	RAP_AUTHENTICATE,
+	RAP_READ_FILE,
+	RAP_WRITE_FILE,
+	RAP_LIST_FOLDER,
+	RAP_SUCCESS,
+	RAP_NOT_FOUND,
+	RAP_ACCESS_DENIED,
+	RAP_AUTH_FAILLED,
+	RAP_BAD_REQUEST,
+
+	RAP_MIN_REQUEST = RAP_AUTHENTICATE,
+	RAP_MAX_REQUEST = RAP_LIST_FOLDER,
+	RAP_MIN_RESPONSE = RAP_SUCCESS,
+	RAP_MAX_RESPONSE = RAP_BAD_REQUEST
 };
 
-enum RAPResult {
-	RAP_SUCCESS, RAP_NOT_FOUND, RAP_ACCESS_DENIED, RAP_AUTH_FAILLED, RAP_BAD_REQUEST
-};
+#define RAP_USER_INDEX 0
+#define RAP_PASSWORD_INDEX 1
 
-#define RAP_ACTION_INDEX 0
-
-#define RAP_USER_INDEX 1
-#define RAP_PASSWORD_INDEX 2
-
-#define RAP_HOST_INDEX 1
-#define RAP_FILE_INDEX 2
+#define RAP_HOST_INDEX 0
+#define RAP_FILE_INDEX 1
 
 void * mallocSafe(size_t size);
-ssize_t sock_fd_read(int sock, int * bufferCount, struct iovec * buffers, int *fd);
-ssize_t sock_fd_write(int sock, int bufferCount, struct iovec * buffers, int fd);
+
+#define MAX_BUFFER_PARTS 2
+
+ssize_t sendMessage(int sock, enum RapConstant mID, int fd, int bufferCount, struct iovec buffer[]);
+ssize_t recvMessage(int sock, enum RapConstant * mID, int * fd, int * bufferCount, struct iovec * buffers);
 
 #endif

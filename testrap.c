@@ -10,12 +10,7 @@
 
 static int authenticated = 0;
 
-static size_t respond(enum RAPResult result, int fd) {
-	struct iovec header;
-	header.iov_base = &result;
-	header.iov_len = sizeof(result);
-	return sock_fd_write(STDOUT_FILENO, 1, &header, fd);
-}
+#define respond(result, fd) sendMessage(STDOUT_FILENO, result, fd, 0, NULL)
 
 static size_t listFolder(int bufferCount, struct iovec * bufferHeaders) {
 	return respond(RAP_BAD_REQUEST, -1);
@@ -68,19 +63,15 @@ typedef size_t (*handlerMethod)(int bufferCount, struct iovec * bufferHeaders);
 static handlerMethod handlerMethods[] = { authenticate, NULL, readFile, writeFile, listFolder };
 
 int main(int argCount, char ** args) {
-	int bufferCount = 3;
-	char buffer[3][BUFFER_SIZE];
-	struct iovec bufferHeaders[3];
+	int bufferCount;
+	struct iovec bufferHeaders[MAX_BUFFER_PARTS];
+	enum RapConstant mID;
 	size_t ioResult;
 	do {
-		// Initialise buffers
-		for (int i = 0; i < 3; i++) {
-			bufferHeaders[i].iov_len = BUFFER_SIZE;
-			bufferHeaders[i].iov_base = buffer[i];
-		}
+		bufferCount = MAX_BUFFER_PARTS;
 
 		// Read a message
-		size_t ioResult = sock_fd_read(STDIN_FILENO, &bufferCount, bufferHeaders, NULL);
+		size_t ioResult = recvMessage(STDIN_FILENO, &mID, NULL, &bufferCount, bufferHeaders);
 		if (ioResult <= 0) {
 			if (ioResult < 0) {
 				perror("Reading auth from socket");
@@ -91,18 +82,15 @@ int main(int argCount, char ** args) {
 		}
 
 		// Handle the message
-		enum RAPAction request = *((enum RAPAction *) buffer[RAP_ACTION_INDEX]);
-		if (request < 0 || request > RAP_MAX || request == RAP_INVALID_METHOD) {
+		if (mID > RAP_MAX_REQUEST || mID < RAP_MIN_REQUEST) {
 			ioResult = respond(RAP_BAD_REQUEST, -1);
 			continue;
 		}
-		fprintf(stderr, "Request for %d with %d buffers:", (int) request, bufferCount);
-		for (int i=1; i<bufferCount; i++) {
-			fprintf(stderr, " %d",(int)bufferHeaders[i].iov_len);
-			int x =write(STDERR_FILENO, bufferHeaders[i].iov_base, bufferHeaders[i].iov_len);
+		ioResult = handlerMethods[mID - RAP_MIN_REQUEST](bufferCount, bufferHeaders);
+		if (ioResult < 0) {
+			perror("sendmsg:");
+			ioResult = 0;
 		}
-		fprintf(stderr, "\n");
-		ioResult = handlerMethods[request](bufferCount, bufferHeaders);
 
 	} while (ioResult);
 	return 0;
