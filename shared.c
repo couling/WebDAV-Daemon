@@ -22,6 +22,18 @@ struct MessageHeader {
 	size_t partLengths[MAX_BUFFER_PARTS];
 };
 
+void hexWrite(size_t bufferSize, void * buffer) {
+	for (size_t x = 0; x < bufferSize; x++) {
+		fprintf(stderr, "%d%d ", (((char *) buffer)[x] & 0xF0) >> 4, ((char *) buffer)[x] & 0x0F);
+		if (!((x + 1) % 8)) {
+			fprintf(stderr, "\n");
+		}
+	}
+	if ((bufferSize) % 8) {
+		fprintf(stderr, "\n");
+	}
+}
+
 ssize_t sendMessage(int sock, enum RapConstant mID, int fd, int bufferCount, struct iovec buffer[]) {
 	ssize_t size;
 	struct msghdr msg;
@@ -32,7 +44,7 @@ ssize_t sendMessage(int sock, enum RapConstant mID, int fd, int bufferCount, str
 	msg.msg_name = NULL;
 	msg.msg_namelen = 0;
 	msg.msg_iov = liovec;
-	msg.msg_iovlen = 1;
+	msg.msg_iovlen = bufferCount + 1;
 	liovec[0].iov_base = &messageHeader;
 	liovec[0].iov_len = sizeof(messageHeader);
 	memcpy(&(liovec[1]), &buffer, sizeof(struct iovec) * bufferCount);
@@ -69,10 +81,11 @@ ssize_t recvMessage(int sock, enum RapConstant * mID, int * fd, int * bufferCoun
 	ssize_t size;
 	struct msghdr msg;
 	char ctrl_buf[CMSG_SPACE(sizeof(int))];
-	struct iovec iovec[1];
+	struct iovec iovec[2];
 	int dummyBufferCount = 0;
 	// TODO refactor to remove the need for static
 	static char incomingBuffer[INCOMING_BUFFER_SIZE + 1];
+	static char incomingBuffer2[INCOMING_BUFFER_SIZE + 1];
 
 	if (!bufferCount) {
 		bufferCount = &dummyBufferCount;
@@ -87,6 +100,8 @@ ssize_t recvMessage(int sock, enum RapConstant * mID, int * fd, int * bufferCoun
 	iovec[0].iov_base = incomingBuffer;
 	iovec[0].iov_len = INCOMING_BUFFER_SIZE;
 
+	memset(incomingBuffer, 0, INCOMING_BUFFER_SIZE);
+
 	size = recvmsg(sock, &msg, 0);
 	if (size < 0) {
 		perror("recvmsg");
@@ -95,6 +110,8 @@ ssize_t recvMessage(int sock, enum RapConstant * mID, int * fd, int * bufferCoun
 	if (size == 0) {
 		return 0;
 	}
+
+	hexWrite(size, incomingBuffer);
 
 	// Null terminate the buffer to avoid buffer overread
 	incomingBuffer[size] = '\0';

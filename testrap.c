@@ -41,26 +41,32 @@ static size_t readFile(int bufferCount, struct iovec * bufferHeaders) {
 }
 
 static size_t authenticate(int bufferCount, struct iovec * bufferHeaders) {
-	char * user = (char *) bufferHeaders[RAP_USER_INDEX].iov_base;
-	char * password = (char *) bufferHeaders[RAP_PASSWORD_INDEX].iov_base;
-	user[BUFFER_SIZE - 1] = '\0';
-	password[BUFFER_SIZE - 1] = '\0';
-
-	fprintf(stderr, "Login request for %s %s\n", user, password);
-	if (authenticated || bufferCount != 3) {
+	if (authenticated || bufferCount != 2) {
+		if (authenticated) {
+			fprintf(stderr, "Login request for already logged in RAP\n");
+		} else {
+			fprintf(stderr, "Login request did not provide both user and password and gave %d buffer(s)\n",
+					bufferCount);
+		}
 		return respond(RAP_BAD_REQUEST, -1);
 	}
 
+	char * user = (char *) bufferHeaders[RAP_USER_INDEX].iov_base;
+	char * password = (char *) bufferHeaders[RAP_PASSWORD_INDEX].iov_base;
+	user[bufferHeaders[RAP_USER_INDEX].iov_len - 1] = '\0';
+	password[bufferHeaders[RAP_PASSWORD_INDEX].iov_len - 1] = '\0';
+
 	if (!strcmp("AAA", user) && !strcmp("BBB", password)) {
+		fprintf(stderr, "Login request accepted for %s\n", user);
 		return respond(RAP_SUCCESS, -1);
 	} else {
+		fprintf(stderr, "Login request denied for %s\n", user);
 		return respond(RAP_AUTH_FAILLED, -1);
 	}
 }
 
-// RAP_AUTHENTICATE, RAP_INVALID_METHOD, RAP_READ_FILE, RAP_WRITE_FILE, RAP_LIST_FOLDER
 typedef size_t (*handlerMethod)(int bufferCount, struct iovec * bufferHeaders);
-static handlerMethod handlerMethods[] = { authenticate, NULL, readFile, writeFile, listFolder };
+static handlerMethod handlerMethods[] = { authenticate, readFile, writeFile, listFolder };
 
 int main(int argCount, char ** args) {
 	int bufferCount;
