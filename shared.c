@@ -28,27 +28,46 @@ static char * timeNow() {
 }
 
 void stdLog(const char * str, ...) {
-	//flockfile(stderr);
-	fprintf(stderr, "%s [%d] ", timeNow(), getpid());
+	char buffer[10240];
+	int remaining = 10240;
+	char * ptr = buffer;
+	int written = snprintf(ptr, remaining, "%s [%d] ", timeNow(), getpid());
+	ptr += written;
+	remaining -= written;
 	va_list ap;
 	va_start(ap, str);
-	vfprintf(stderr, str, ap);
+	written = vsnprintf(ptr, remaining, str, ap);
+	ptr += written;
+	remaining -= written;
 	va_end(ap);
-	fprintf(stderr, "\n");
-	//funlockfile(stderr);
+	written = snprintf(ptr, remaining, "\n");
+	ptr += written;
+	//remaining -= written;
+	size_t ignored = write(STDERR_FILENO, buffer, ptr - buffer);
 }
 
 void stdLogError(int errorNumber, const char * str, ...) {
-	//flockfile(stderr);
-	fprintf(stderr, "%s [%d] Error: \n", timeNow(), getpid());
+	char buffer[10240];
+	int remaining = 10240;
+	char * ptr = buffer;
+	int written = snprintf(ptr, remaining, "%s [%d] Error: \n", timeNow(), getpid());
+	ptr += written;
+	remaining -= written;
 	va_list ap;
 	va_start(ap, str);
-	vfprintf(stderr, str, ap);
+	written = vsnprintf(ptr, remaining, str, ap);
+	ptr += written;
+	remaining -= written;
 	va_end(ap);
-	fprintf(stderr, "\n");
-	if (errorNumber)
-		fprintf(stderr, "%s [%d] Error: %s\n", timeNow(), getpid(), strerror(errorNumber));
-	//funlockfile(stderr);
+	written = snprintf(ptr, remaining, "\n");
+	ptr += written;
+	remaining -= written;
+	if (errorNumber) {
+		written = snprintf(ptr, remaining, "%s [%d] Error: %s\n", timeNow(), getpid(), strerror(errorNumber));
+		ptr += written;
+		//remaining -= written;
+	}
+	size_t ignored = write(STDERR_FILENO, buffer, ptr - buffer);
 }
 
 struct MessageHeader {
