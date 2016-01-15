@@ -1,6 +1,9 @@
 -include build/*.d
 
-all: build/webdavd build/rap build/testrap
+all: build/webdavd build/rap build/testrap build/items.txt
+
+build/items.txt:
+	cp items.txt build/items.txt
 
 build/webdavd build/rap build/testrap: shared.c
 

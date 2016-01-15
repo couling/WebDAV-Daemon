@@ -21,7 +21,12 @@ static size_t writeFile(int bufferCount, struct iovec * bufferHeaders) {
 }
 
 static size_t readFile(int bufferCount, struct iovec * bufferHeaders) {
-	if (!authenticated || bufferCount != 3) {
+	if (!authenticated || bufferCount != 2) {
+		if (!authenticated) {
+			stdLogError(0, "Not authenticated RAP");
+		} else {
+			stdLogError(0, "Get request did not provide correct buffers: %d buffer(s)", bufferCount);
+		}
 		return respond(RAP_BAD_REQUEST, -1);
 	}
 	const char * file = "items.txt";
@@ -36,6 +41,7 @@ static size_t readFile(int bufferCount, struct iovec * bufferHeaders) {
 			return respond(RAP_NOT_FOUND, -1);
 		}
 	} else {
+		//stdLog("Returning file");
 		return respond(RAP_SUCCESS, fd);
 	}
 }
@@ -43,10 +49,9 @@ static size_t readFile(int bufferCount, struct iovec * bufferHeaders) {
 static size_t authenticate(int bufferCount, struct iovec * bufferHeaders) {
 	if (authenticated || bufferCount != 2) {
 		if (authenticated) {
-			fprintf(stderr, "Login request for already logged in RAP\n");
+			stdLogError(0, "Login request for already logged in RAP");
 		} else {
-			fprintf(stderr, "Login request did not provide both user and password and gave %d buffer(s)\n",
-					bufferCount);
+			stdLogError(0, "Login request did not provide both user and password and gave %d buffer(s)", bufferCount);
 		}
 		return respond(RAP_BAD_REQUEST, -1);
 	}
@@ -57,10 +62,11 @@ static size_t authenticate(int bufferCount, struct iovec * bufferHeaders) {
 	password[bufferHeaders[RAP_PASSWORD_INDEX].iov_len - 1] = '\0';
 
 	if (!strcmp("AAA", user) && !strcmp("BBB", password)) {
-		fprintf(stderr, "Login request accepted for %s\n", user);
+		stdLog("Login request accepted for %s", user);
+		authenticated = 1;
 		return respond(RAP_SUCCESS, -1);
 	} else {
-		fprintf(stderr, "Login request denied for %s\n", user);
+		stdLogError(0, "Login request denied for %s", user);
 		return respond(RAP_AUTH_FAILLED, -1);
 	}
 }
@@ -77,7 +83,7 @@ int main(int argCount, char ** args) {
 		bufferCount = MAX_BUFFER_PARTS;
 
 		// Read a message
-		size_t ioResult = recvMessage(STDIN_FILENO, &mID, NULL, &bufferCount, bufferHeaders);
+		ioResult = recvMessage(STDIN_FILENO, &mID, NULL, &bufferCount, bufferHeaders);
 		if (ioResult <= 0) {
 			if (ioResult < 0) {
 				perror("Reading auth from socket");
@@ -94,7 +100,6 @@ int main(int argCount, char ** args) {
 		}
 		ioResult = handlerMethods[mID - RAP_MIN_REQUEST](bufferCount, bufferHeaders);
 		if (ioResult < 0) {
-			perror("sendmsg:");
 			ioResult = 0;
 		}
 

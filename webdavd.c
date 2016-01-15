@@ -12,6 +12,7 @@
 #include <sys/socket.h>
 #include <sys/wait.h>
 #include <microhttpd.h>
+#include <errno.h>
 
 #include "shared.h"
 
@@ -95,7 +96,6 @@ static void fdContentReaderCleanup(int *fd) {
 static int queueFdResponse(struct MHD_Connection *request, int fd) {
 	struct stat statBuffer;
 	if (!fstat(fd, &statBuffer) && (statBuffer.st_mode | S_IFMT == S_IFREG)) {
-		fprintf(stderr, "Serving regular file\n");
 		struct MHD_Response * response = MHD_create_response_from_fd((uint64_t) statBuffer.st_size, fd);
 		if (!response)
 			return MHD_NO;
@@ -149,8 +149,7 @@ static int forkSockExec(const char * path, int * newSockFd) {
 		// child
 		// Sort out socket
 		if (dup2(sockFd[1], STDIN_FILENO) == -1 || dup2(sockFd[1], STDOUT_FILENO) == -1) {
-			fprintf(stderr, "Could not assign new socket (%d) to stdin/stdout\n", newSockFd[1]);
-			perror("Assigning socket to stdin/stdout");
+			stdLogError(errno, "Could not assign new socket (%d) to stdin/stdout", newSockFd[1]);
 			exit(255);
 		}
 
@@ -166,6 +165,7 @@ static int forkSockExec(const char * path, int * newSockFd) {
 static void destroyRestrictedAccessProcessor(struct RestrictedAccessProcessor * processor) {
 	close(processor->socketFd);
 	free(processor->user);
+	free(processor);
 }
 
 static int createRestrictedAccessProcessor(struct MHD_Connection *request,
@@ -204,13 +204,13 @@ static int createRestrictedAccessProcessor(struct MHD_Connection *request,
 		free(processor);
 		*newProcessor = NULL;
 		if (readResult < 0) {
-			perror("Could not read result from RAP ");
+			stdLogError(errno, "Could not read result from RAP ");
 			return queueInternalServerError(request);
 		} else if (readResult == 0) {
-			fprintf(stderr, "RAP closed socket unexpectedly\n");
+			stdLogError(0, "RAP closed socket unexpectedly");
 			return queueInternalServerError(request);
 		} else {
-			fprintf(stderr, "Access deined for user %s\n", user);
+			stdLogError(0, "Access deined for user %s", user);
 			return queueAuthRequiredResponse(request);
 		}
 
@@ -231,6 +231,10 @@ static int authLookup(struct MHD_Connection *request, struct RestrictedAccessPro
 		*processor = NULL;
 		return queueAuthRequiredResponse(request);
 	}
+}
+
+static void releaseRap(struct RestrictedAccessProcessor * processor) {
+	destroyRestrictedAccessProcessor(processor);
 }
 
 static enum RapConstant selectRAPAction(const char * method) {
@@ -287,14 +291,16 @@ static int processNewRequest(struct MHD_Connection *request, const char *url, co
 	int bufferCount = 0;
 	int readResult = recvMessage(rapSocketSession->socketFd, &mID, &fd, &bufferCount, NULL);
 	if (readResult <= 0) {
-		if (readResult < 0) {
-			perror("Reading response from RAP");
-		} else {
-			fprintf(stderr, "RAP closed socket unexpectedly while waiting for response\n");
+		if (readResult == 0) {
+			stdLogError(0, "RAP closed socket unexpectedly while waiting for response");
 		}
 		return queueInternalServerError(request);
 	}
 
+	// Release the RAP.
+	releaseRap(rapSocketSession);
+
+	// Queue the response
 	switch (mID) {
 	case RAP_SUCCESS:
 		return queueFdResponse(request, fd);
@@ -302,10 +308,14 @@ static int processNewRequest(struct MHD_Connection *request, const char *url, co
 		return queueSimpleStringResponse(request, MHD_HTTP_FORBIDDEN, "Access denied");
 	case RAP_NOT_FOUND:
 		return queueSimpleStringResponse(request, MHD_HTTP_NOT_FOUND, "File not found");
+	case RAP_BAD_REQUEST:
+		stdLogError(0, "RAP reported bad request");
+		return queueInternalServerError(request);
 	default:
-		fprintf(stderr, "invalid response from RAP %d\n", (int) mID);
+		stdLogError(0, "invalid response from RAP %d", (int) mID);
 		return queueInternalServerError(request);
 	}
+
 }
 
 static int processUploadData(struct MHD_Connection *request, const char *upload_data, size_t * upload_data_size,
@@ -344,7 +354,7 @@ static int answerToRequest(void *cls, struct MHD_Connection *request, const char
 	// Http 1.0 is old and REALLY shouldn't be used
 	// It misses out the "Host" header which is required for this program to function correctly
 	if (strcmp(version, "HTTP/1.1")) {
-		fprintf(stderr, "HTTP Version not supported, only HTTP/1.1 is accepted. Supplied: %s\n", version);
+		stdLogError(0, "HTTP Version not supported, only HTTP/1.1 is accepted. Supplied: %s", version);
 		return queueSimpleStringResponse(request, MHD_HTTP_HTTP_VERSION_NOT_SUPPORTED,
 				"HTTP Version not supported, only HTTP 1.1 is accepted");
 	}
@@ -364,7 +374,7 @@ static void initializeDaemin(int port, struct MHD_Daemon **newDaemon) {
 			(MHD_AccessHandlerCallback) &answerToRequest, NULL, MHD_OPTION_END);
 
 	if (!*newDaemon) {
-		fprintf(stderr, "Unable to initialise daemon on port %d\n", port);
+		stdLogError(errno, "Unable to initialise daemon on port %d", port);
 		exit(255);
 	}
 }
@@ -372,7 +382,7 @@ static void initializeDaemin(int port, struct MHD_Daemon **newDaemon) {
 static void cleanupZombyChildren(int sig, siginfo_t *siginfo, void *context) {
 	int status;
 	waitpid(siginfo->si_pid, &status, 0);
-	fprintf(stderr, "Child finished PID: %d staus: %d\n", siginfo->si_pid, status);
+	stdLog("Child finished PID: %d staus: %d", siginfo->si_pid, status);
 }
 
 int main(int argCount, char ** args) {

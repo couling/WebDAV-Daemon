@@ -3,6 +3,7 @@
 
 #include <stdlib.h>
 #include <sys/socket.h>
+#include <stdarg.h>
 
 #define RAP_PATH "/usr/sbin/rap"
 
@@ -33,10 +34,14 @@ enum RapConstant {
 #define RAP_FILE_INDEX 1
 
 void * mallocSafe(size_t size);
+void stdLog(const char * str, ...);
+void stdLogError(int errorNumber, const char * str, ...);
 
 #define MAX_BUFFER_PARTS 2
 
 ssize_t sendMessage(int sock, enum RapConstant mID, int fd, int bufferCount, struct iovec buffer[]);
 ssize_t recvMessage(int sock, enum RapConstant * mID, int * fd, int * bufferCount, struct iovec * buffers);
+
+
 
 #endif

@@ -4,6 +4,7 @@
 #include <unistd.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <time.h>
 #include "shared.h"
 
 void * mallocSafe(size_t size) {
@@ -16,23 +17,45 @@ void * mallocSafe(size_t size) {
 	}
 }
 
+static char * timeNow() {
+	time_t rawtime;
+	struct tm * timeinfo;
+	time(&rawtime);
+	timeinfo = localtime(&rawtime);
+	static char t[100];
+	strftime(t, 100, "%a %b %d %H:%M:%S %Y", timeinfo);
+	return t;
+}
+
+void stdLog(const char * str, ...) {
+	flockfile(stderr);
+	fprintf(stderr, "%s [%d] ", timeNow(), getpid());
+	va_list ap;
+	va_start(ap, str);
+	vfprintf(stderr, str, ap);
+	va_end(ap);
+	fprintf(stderr, "\n");
+	funlockfile(stderr);
+}
+
+void stdLogError(int errorNumber, const char * str, ...) {
+	flockfile(stderr);
+	fprintf(stderr, "%s [%d] Error: \n", timeNow(), getpid());
+	va_list ap;
+	va_start(ap, str);
+	vfprintf(stderr, str, ap);
+	va_end(ap);
+	fprintf(stderr, "\n");
+	if (errorNumber)
+		fprintf(stderr, "%s [%d] Error: %s\n", timeNow(), getpid(), strerror(errorNumber));
+	funlockfile(stderr);
+}
+
 struct MessageHeader {
 	enum RapConstant mID;
 	int partCount;
 	size_t partLengths[MAX_BUFFER_PARTS];
 };
-
-void hexWrite(size_t bufferSize, void * buffer) {
-	for (size_t x = 0; x < bufferSize; x++) {
-		fprintf(stderr, "%d%d ", (((char *) buffer)[x] & 0xF0) >> 4, ((char *) buffer)[x] & 0x0F);
-		if (!((x + 1) % 8)) {
-			fprintf(stderr, "\n");
-		}
-	}
-	if ((bufferSize) % 8) {
-		fprintf(stderr, "\n");
-	}
-}
 
 ssize_t sendMessage(int sock, enum RapConstant mID, int fd, int bufferCount, struct iovec buffer[]) {
 	ssize_t size;
@@ -47,7 +70,7 @@ ssize_t sendMessage(int sock, enum RapConstant mID, int fd, int bufferCount, str
 	msg.msg_iovlen = bufferCount + 1;
 	liovec[0].iov_base = &messageHeader;
 	liovec[0].iov_len = sizeof(messageHeader);
-	memcpy(&(liovec[1]), &buffer, sizeof(struct iovec) * bufferCount);
+	memcpy(&(liovec[1]), buffer, sizeof(struct iovec) * bufferCount);
 
 	memset(&messageHeader, 0, sizeof(messageHeader));
 	messageHeader.mID = mID;
@@ -57,12 +80,14 @@ ssize_t sendMessage(int sock, enum RapConstant mID, int fd, int bufferCount, str
 	}
 
 	if (fd != -1) {
+		memset(&ctrl_buf, 0, sizeof(ctrl_buf));
 		msg.msg_control = &ctrl_buf;
 		msg.msg_controllen = sizeof(ctrl_buf);
-		((struct cmsghdr *) ctrl_buf)->cmsg_len = sizeof(ctrl_buf);
-		((struct cmsghdr *) ctrl_buf)->cmsg_level = SOL_SOCKET;
-		((struct cmsghdr *) ctrl_buf)->cmsg_type = SCM_RIGHTS;
-		*((int *) CMSG_DATA((struct cmsghdr * ) ctrl_buf)) = fd;
+		struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
+		cmsg->cmsg_len = CMSG_LEN(sizeof(int));
+		cmsg->cmsg_level = SOL_SOCKET;
+		cmsg->cmsg_type = SCM_RIGHTS;
+		*((int *) CMSG_DATA(cmsg)) = fd;
 	} else {
 		msg.msg_control = NULL;
 		msg.msg_controllen = 0;
@@ -85,7 +110,6 @@ ssize_t recvMessage(int sock, enum RapConstant * mID, int * fd, int * bufferCoun
 	int dummyBufferCount = 0;
 	// TODO refactor to remove the need for static
 	static char incomingBuffer[INCOMING_BUFFER_SIZE + 1];
-	static char incomingBuffer2[INCOMING_BUFFER_SIZE + 1];
 
 	if (!bufferCount) {
 		bufferCount = &dummyBufferCount;
@@ -102,7 +126,7 @@ ssize_t recvMessage(int sock, enum RapConstant * mID, int * fd, int * bufferCoun
 
 	memset(incomingBuffer, 0, INCOMING_BUFFER_SIZE);
 
-	size = recvmsg(sock, &msg, 0);
+	size = recvmsg(sock, &msg, MSG_CMSG_CLOEXEC);
 	if (size < 0) {
 		perror("recvmsg");
 		return -1;
@@ -111,19 +135,17 @@ ssize_t recvMessage(int sock, enum RapConstant * mID, int * fd, int * bufferCoun
 		return 0;
 	}
 
-	hexWrite(size, incomingBuffer);
-
 	// Null terminate the buffer to avoid buffer overread
 	incomingBuffer[size] = '\0';
 
 	struct cmsghdr * cmsg = CMSG_FIRSTHDR(&msg);
 	if (cmsg && cmsg->cmsg_len == CMSG_LEN(sizeof(int)) && cmsg->cmsg_level == SOL_SOCKET
-			&& cmsg->cmsg_type != SCM_RIGHTS) {
+			&& cmsg->cmsg_type == SCM_RIGHTS) {
 		int recievedFd = *((int *) CMSG_DATA(cmsg));
 		if (fd) {
 			*fd = recievedFd;
 		} else {
-			fprintf(stderr, "Warning: closing ignored fd\n");
+			stdLogError(0, "closing ignored fd");
 			close(recievedFd);
 		}
 	} else if (fd) {
@@ -134,7 +156,7 @@ ssize_t recvMessage(int sock, enum RapConstant * mID, int * fd, int * bufferCoun
 	struct MessageHeader * messageHeader = (struct MessageHeader *) (&incomingBuffer);
 	if (size < sizeof(struct MessageHeader) || messageHeader->partCount > *bufferCount
 			|| messageHeader->partCount < 0) {
-		fprintf(stderr, "Invalid message recieved\n");
+		stdLogError(0, "Invalid message recieved");
 		if (fd || *fd != -1) {
 			close(*fd);
 		}
@@ -143,18 +165,18 @@ ssize_t recvMessage(int sock, enum RapConstant * mID, int * fd, int * bufferCoun
 
 	*mID = messageHeader->mID;
 	*bufferCount = messageHeader->partCount;
-	char * partPtr = incomingBuffer + sizeof(messageHeader);
+	char * partPtr = &incomingBuffer[sizeof(struct MessageHeader)];
 	for (int i = 0; i < messageHeader->partCount; i++) {
-		if (partPtr >= incomingBuffer + size) {
-			fprintf(stderr, "Invalid message recieved: parts too long\n");
+		buffers[i].iov_base = partPtr;
+		buffers[i].iov_len = messageHeader->partLengths[i];
+		partPtr += messageHeader->partLengths[i];
+		if (partPtr > incomingBuffer + size) {
+			stdLogError(0, "Invalid message recieved: parts too long\n");
 			if (fd || *fd != -1) {
 				close(*fd);
 			}
 			return -1;
 		}
-		buffers[i].iov_base = partPtr;
-		buffers[i].iov_len = messageHeader->partLengths[i];
-		partPtr += messageHeader->partLengths[i];
 	}
 
 	return size;
