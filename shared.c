@@ -28,18 +28,18 @@ static char * timeNow() {
 }
 
 void stdLog(const char * str, ...) {
-	flockfile(stderr);
+	//flockfile(stderr);
 	fprintf(stderr, "%s [%d] ", timeNow(), getpid());
 	va_list ap;
 	va_start(ap, str);
 	vfprintf(stderr, str, ap);
 	va_end(ap);
 	fprintf(stderr, "\n");
-	funlockfile(stderr);
+	//funlockfile(stderr);
 }
 
 void stdLogError(int errorNumber, const char * str, ...) {
-	flockfile(stderr);
+	//flockfile(stderr);
 	fprintf(stderr, "%s [%d] Error: \n", timeNow(), getpid());
 	va_list ap;
 	va_start(ap, str);
@@ -48,7 +48,7 @@ void stdLogError(int errorNumber, const char * str, ...) {
 	fprintf(stderr, "\n");
 	if (errorNumber)
 		fprintf(stderr, "%s [%d] Error: %s\n", timeNow(), getpid(), strerror(errorNumber));
-	funlockfile(stderr);
+	//funlockfile(stderr);
 }
 
 struct MessageHeader {

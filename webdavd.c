@@ -201,7 +201,6 @@ static int createRestrictedAccessProcessor(struct MHD_Connection *request,
 	size_t readResult = recvMessage(processor->socketFd, &responseCode, NULL, &bufferCount, message);
 	if (readResult <= 0 || responseCode != RAP_SUCCESS) {
 		destroyRestrictedAccessProcessor(processor);
-		free(processor);
 		*newProcessor = NULL;
 		if (readResult < 0) {
 			stdLogError(errno, "Could not read result from RAP ");
