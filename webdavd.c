@@ -1,4 +1,5 @@
-#include <sys/stat.h>
+#include "shared.h"
+
 #include <signal.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -10,11 +11,14 @@
 #include <sys/types.h>
 #include <sys/select.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <microhttpd.h>
+#include <pwd.h>
 #include <errno.h>
+#include <dirent.h>
 
-#include "shared.h"
+#define RAP_PATH "/usr/sbin/rap"
 
 static struct MHD_Daemon **daemons;
 static int daemonPorts[] = { 8888 };
@@ -35,6 +39,11 @@ struct WriteHandle {
 struct Header {
 	const char * headerKey;
 	const char * headerValue;
+};
+
+struct MainHeaderInfo {
+	char * host;
+	int dataSent;
 };
 
 static int queueStringResponse(struct MHD_Connection *request, int httpResponseCode, char * string, int headerCount,
@@ -74,15 +83,51 @@ static int queueInternalServerError(struct MHD_Connection * request) {
 	return queueSimpleStringResponse(request, MHD_HTTP_INTERNAL_SERVER_ERROR, "Internal Error!");
 }
 
-static int fdContentReader(int *fd, uint64_t pos, char *buf, size_t max) {
+static ssize_t directoryReader(DIR * directory, uint64_t pos, char *buf, size_t max) {
+	struct dirent *dp;
+	ssize_t written = 0;
+
+	while (written < max - 257 && (dp = readdir(directory)) != NULL) {
+		int newlyWritten = sprintf(buf, "%s\n", dp->d_name);
+		written += newlyWritten;
+		buf += newlyWritten;
+	}
+
+	if (written == 0) {
+		written = MHD_CONTENT_READER_END_OF_STREAM;
+	}
+	return written;
+}
+
+static void directoryReaderCleanup(DIR * directory) {
+	closedir(directory);
+}
+
+static struct MHD_Response * directoryReaderCreate(size_t size, int fd) {
+	DIR * dir = fdopendir(fd);
+	if (!dir) {
+		close(fd);
+		stdLogError(errno, "Could not list directory from fd");
+		return NULL;
+	}
+	struct MHD_Response * response = MHD_create_response_from_callback(-1, 4096,
+			(MHD_ContentReaderCallback) &directoryReader, dir,
+			(MHD_ContentReaderFreeCallback) & directoryReaderCleanup);
+	if (!response) {
+		closedir(dir);
+		return NULL;
+	} else {
+		return response;
+	}
+}
+
+static ssize_t fdContentReader(int *fd, uint64_t pos, char *buf, size_t max) {
 	size_t bytesRead = read(*fd, buf, max);
 	if (bytesRead < 0) {
-		// error
-		return -2;
+		return MHD_CONTENT_READER_END_WITH_ERROR;
 	}
 	if (bytesRead == 0) {
-		// End of stream
-		return -1;
+		return MHD_CONTENT_READER_END_OF_STREAM;
 	}
 	return bytesRead;
 }
@@ -93,32 +138,72 @@ static void fdContentReaderCleanup(int *fd) {
 	void *MHD_ContentReaderFreeCallback(void *cls);
 }
 
-static int queueFdResponse(struct MHD_Connection *request, int fd) {
-	struct stat statBuffer;
-	if (!fstat(fd, &statBuffer) && (statBuffer.st_mode | S_IFMT == S_IFREG)) {
-		struct MHD_Response * response = MHD_create_response_from_fd((uint64_t) statBuffer.st_size, fd);
-		if (!response)
-			return MHD_NO;
-		int ret = MHD_queue_response(request, MHD_HTTP_OK, response);
-		MHD_destroy_response(response);
-		return ret;
+static struct MHD_Response * fdContentReaderCreate(size_t size, int fd) {
+	int * fdAllocated = mallocSafe(sizeof(int));
+	*fdAllocated = fd;
+	struct MHD_Response * response = MHD_create_response_from_callback(-1, 4096,
+			(MHD_ContentReaderCallback) &fdContentReader, fdAllocated,
+			(MHD_ContentReaderFreeCallback) & fdContentReaderCleanup);
+	if (!response) {
+		free(fdAllocated);
+		return NULL;
 	} else {
-		int * fdAllocated = mallocSafe(sizeof(int));
-		*fdAllocated = fd;
-		struct MHD_Response * response = MHD_create_response_from_callback(-1, 4096,
-				(MHD_ContentReaderCallback) &fdContentReader, fdAllocated,
-				(MHD_ContentReaderFreeCallback) & fdContentReaderCleanup);
-		if (!response)
-			return MHD_NO;
-		int ret = MHD_queue_response(request, MHD_HTTP_OK, response);
-		MHD_destroy_response(response);
-		return ret;
+		return response;
 	}
 }
 
-static int filterHostHeader(const char ** host, enum MHD_ValueKind kind, const char *key, const char *value) {
+static struct MHD_Response * fdFileContentReaderCreate(size_t size, int fd) {
+	struct MHD_Response * response = MHD_create_response_from_fd(size, fd);
+	if (!response) {
+		close(fd);
+		return NULL;
+	} else {
+		return response;
+	}
+}
+
+static int queueFdResponse(struct MHD_Connection *request, int fd) {
+	struct stat statBuffer;
+	if (fstat(fd, &statBuffer)) {
+		close(fd);
+		return queueInternalServerError(request);
+	}
+
+	typedef struct MHD_Response * (*ResponseCreator)(size_t, int fd);
+	ResponseCreator responseCreator;
+	size_t size;
+
+	switch (statBuffer.st_mode & S_IFMT) {
+	case S_IFREG:
+		responseCreator = &fdFileContentReaderCreate;
+		size = statBuffer.st_size;
+		break;
+
+	case S_IFDIR:
+		responseCreator = &directoryReaderCreate;
+		size = -1;
+		break;
+
+	default:
+		responseCreator = &fdContentReaderCreate;
+		size = -1;
+	}
+
+	struct MHD_Response * response = responseCreator(size, fd);
+	if (!response) {
+		return queueInternalServerError(request);
+	}
+	int ret = MHD_queue_response(request, MHD_HTTP_OK, response);
+	MHD_destroy_response(response);
+	return ret;
+}
+
+static int filterMainHeaderInfo(struct MainHeaderInfo * mainHeaderInfo, enum MHD_ValueKind kind, const char *key,
+		const char *value) {
 	if (!strcmp(key, "Host")) {
-		*host = value;
+		mainHeaderInfo->host = (char *) value;
+	} else if (!strcmp(key, "Content-Length") || (!strcmp(key, "Transfer-Encoding") && !strcmp(value, "chunked"))) {
+		mainHeaderInfo->dataSent = 1;
 	}
 	return MHD_YES;
 }
@@ -128,7 +213,7 @@ static int forkSockExec(const char * path, int * newSockFd) {
 	int sockFd[2];
 	int result = socketpair(PF_LOCAL, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, sockFd);
 	if (result != 0) {
-		perror("socketpair() failed");
+		stdLogError(errno, "Could not create socket pair");
 		return 0;
 	}
 
@@ -143,21 +228,20 @@ static int forkSockExec(const char * path, int * newSockFd) {
 		} else {
 			// fork failed so close parent pipes and return non-zero
 			close(sockFd[0]);
+			stdLogError(errno, "Could not fork");
 			return 0;
 		}
 	} else {
 		// child
 		// Sort out socket
+		stdLog("Starting rap: %s", path);
 		if (dup2(sockFd[1], STDIN_FILENO) == -1 || dup2(sockFd[1], STDOUT_FILENO) == -1) {
 			stdLogError(errno, "Could not assign new socket (%d) to stdin/stdout", newSockFd[1]);
 			exit(255);
 		}
-
-		//close(newSockFd[0]);
-		//close(newSockFd[1]);
 		char * argv[] = { NULL };
 		execv(path, argv);
-		perror("Could not run program");
+		stdLogError(errno, "Could not start rap: %s", path);
 		exit(255);
 	}
 }
@@ -176,7 +260,6 @@ static int createRestrictedAccessProcessor(struct MHD_Connection *request,
 	if (!processor->pid) {
 		free(processor);
 		*newProcessor = NULL;
-		perror("Could not fork ");
 		return queueInternalServerError(request);
 	}
 	size_t userLen = strlen(user) + 1;
@@ -192,7 +275,6 @@ static int createRestrictedAccessProcessor(struct MHD_Connection *request,
 		destroyRestrictedAccessProcessor(processor);
 		free(processor);
 		*newProcessor = NULL;
-		perror("sendmsg auth");
 		return queueInternalServerError(request);
 	}
 	// TODO implement timeout ... possibly using "select"
@@ -237,7 +319,7 @@ static void releaseRap(struct RestrictedAccessProcessor * processor) {
 }
 
 static enum RapConstant selectRAPAction(const char * method) {
-// TODO analyse method to give the correct response;
+	// TODO analyse method to give the correct response;
 	if (!strcmp("GET", method))
 		return RAP_READ_FILE;
 	else
@@ -246,22 +328,14 @@ static enum RapConstant selectRAPAction(const char * method) {
 
 static int processNewRequest(struct MHD_Connection *request, const char *url, const char *method,
 		struct WriteHandle **writeHandle) {
-	// TODO handle put requests!
 
 	// Interpret the method
 	enum RapConstant mID = selectRAPAction(method);
 	if (mID == RAP_INVALID_METHOD) {
-		// TODO handle bad responses to bulky PUT requests.
 		struct Header headers[0];
 		headers[0].headerKey = "Allow";
 		headers[0].headerValue = "GET, HEAD, PUT";
 		return queueStringResponse(request, MHD_HTTP_METHOD_NOT_ACCEPTABLE, "Method Not Supported", 1, headers);
-	}
-
-	// Get the host header
-	char * host;
-	if (!MHD_get_connection_values(request, MHD_HEADER_KIND, (MHD_KeyValueIterator) &filterHostHeader, &host)) {
-		return queueInternalServerError(request);
 	}
 
 	// Get a RAP
@@ -276,13 +350,37 @@ static int processNewRequest(struct MHD_Connection *request, const char *url, co
 	if (!rapSocketSession)
 		return MHD_YES;
 
+	// Get the host header and determine if data is to be sent
+	struct MainHeaderInfo mainHeaderInfo = { .dataSent = 0, .host = NULL };
+	if (!MHD_get_connection_values(request, MHD_HEADER_KIND, (MHD_KeyValueIterator) &filterMainHeaderInfo,
+			&mainHeaderInfo)) {
+		return queueInternalServerError(request);
+	}
+	if (mainHeaderInfo.dataSent) {
+		*writeHandle = mallocSafe(sizeof(struct WriteHandle));
+		(*writeHandle)->failed = 1; // Initialise it so that nothing is saved unless otherwise set
+		(*writeHandle)->fd = -1; // we have nothing to write to until we have something to write to.
+	}
+
+	// Format the url.
+	struct passwd * pw = getpwnam(rapSocketSession->user);
+	size_t urlLen = strlen(mainHeaderInfo.host) + strlen(pw->pw_dir) + 1;
+	char stackBuffer[2048];
+	char * newUrl = urlLen < 2048 ? stackBuffer : mallocSafe(urlLen + 1);
+	sprintf(newUrl, "%s%s", pw->pw_dir, url);
+
 	// Send the request to the RAP
-	struct iovec message[MAX_BUFFER_PARTS] = { { .iov_len = strlen(host) + 1, .iov_base = host }, { .iov_len = strlen(
-			url) + 1, .iov_base = (void *) url } };
+	struct iovec message[MAX_BUFFER_PARTS] = { { .iov_len = strlen(mainHeaderInfo.host) + 1, .iov_base =
+			(void*) mainHeaderInfo.host }, { .iov_len = strlen(newUrl) + 1, .iov_base = newUrl } };
 
 	if (sendMessage(rapSocketSession->socketFd, mID, -1, 2, message) < 0) {
-		perror("Sending request to RAP");
+		if (newUrl != stackBuffer) {
+			free(newUrl);
+		}
 		return queueInternalServerError(request);
+	}
+	if (newUrl != stackBuffer) {
+		free(newUrl);
 	}
 
 	// Get result from RAP
@@ -301,8 +399,12 @@ static int processNewRequest(struct MHD_Connection *request, const char *url, co
 
 	// Queue the response
 	switch (mID) {
-	case RAP_SUCCESS:
+	case RAP_SUCCESS_SOURCE_DATA:
 		return queueFdResponse(request, fd);
+	case RAP_SUCCESS_SINK_DATA:
+		(*writeHandle)->fd = fd;
+		(*writeHandle)->failed = 0;
+		return MHD_YES;
 	case RAP_ACCESS_DENIED:
 		return queueSimpleStringResponse(request, MHD_HTTP_FORBIDDEN, "Access denied");
 	case RAP_NOT_FOUND:
@@ -340,13 +442,12 @@ static int completeUpload(struct MHD_Connection *request, struct WriteHandle ** 
 	if (!(*writeHandle)->failed) {
 		close((*writeHandle)->fd);
 		free(*writeHandle);
-		return queueSimpleStringResponse(request, MHD_HTTP_OK, "Upload failed!");
+		return queueSimpleStringResponse(request, MHD_HTTP_OK, "Upload Complete!");
 	}
-
 	return MHD_YES;
 }
 
-static int answerToRequest(void *cls, struct MHD_Connection *request, const char *url, const char *method,
+static int answerToRequest(void *cls, struct MHD_Connection *request, char *url, const char *method,
 		const char *version, const char *upload_data, size_t *upload_data_size, struct WriteHandle ** writeHandle) {
 
 	// We can only accept http 1.1 sessions
@@ -385,17 +486,17 @@ static void cleanupZombyChildren(int sig, siginfo_t *siginfo, void *context) {
 }
 
 int main(int argCount, char ** args) {
-	// Avoid zombie children
+// Avoid zombie children
 	struct sigaction act;
 	memset(&act, 0, sizeof(act));
 	act.sa_sigaction = &cleanupZombyChildren;
 	act.sa_flags = SA_SIGINFO;
 	if (sigaction(SIGCHLD, &act, NULL) < 0) {
-		perror("sigaction");
+		stdLogError(errno, "Could not set handler method for finished child threads");
 		return 255;
 	}
 
-	// Start up the daemons
+// Start up the daemons
 	daemons = mallocSafe(sizeof(struct MHD_Daemon *) * daemonCount);
 	for (int i = 0; i < daemonCount; i++) {
 		initializeDaemin(daemonPorts[i], &(daemons[i]));

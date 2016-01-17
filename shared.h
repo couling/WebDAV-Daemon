@@ -5,8 +5,6 @@
 #include <sys/socket.h>
 #include <stdarg.h>
 
-#define RAP_PATH "/usr/sbin/rap"
-
 enum RapConstant {
 	RAP_INVALID_METHOD,
 
@@ -16,6 +14,8 @@ enum RapConstant {
 	RAP_LIST_FOLDER,
 
 	RAP_SUCCESS,
+	RAP_SUCCESS_SOURCE_DATA,
+	RAP_SUCCESS_SINK_DATA,
 	RAP_NOT_FOUND,
 	RAP_ACCESS_DENIED,
 	RAP_AUTH_FAILLED,
@@ -41,7 +41,5 @@ void stdLogError(int errorNumber, const char * str, ...);
 
 ssize_t sendMessage(int sock, enum RapConstant mID, int fd, int bufferCount, struct iovec buffer[]);
 ssize_t recvMessage(int sock, enum RapConstant * mID, int * fd, int * bufferCount, struct iovec * buffers);
-
-
 
 #endif

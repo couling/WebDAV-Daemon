@@ -1,21 +1,13 @@
+#include "shared.h"
+
 #include <stdlib.h>
 #include <stdio.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <errno.h>
 #include <time.h>
-#include "shared.h"
-
-void * mallocSafe(size_t size) {
-	void * allocatedMemory = malloc(size);
-	if (allocatedMemory) {
-		return allocatedMemory;
-	} else {
-		perror("Could not allocate memory! Exiting!");
-		exit(255);
-	}
-}
 
 static char * timeNow() {
 	time_t rawtime;
@@ -50,7 +42,7 @@ void stdLogError(int errorNumber, const char * str, ...) {
 	char buffer[10240];
 	int remaining = 10240;
 	char * ptr = buffer;
-	int written = snprintf(ptr, remaining, "%s [%d] Error: \n", timeNow(), getpid());
+	int written = snprintf(ptr, remaining, "%s [%d] Error: ", timeNow(), getpid());
 	ptr += written;
 	remaining -= written;
 	va_list ap;
@@ -68,6 +60,16 @@ void stdLogError(int errorNumber, const char * str, ...) {
 		//remaining -= written;
 	}
 	size_t ignored = write(STDERR_FILENO, buffer, ptr - buffer);
+}
+
+void * mallocSafe(size_t size) {
+	void * allocatedMemory = malloc(size);
+	if (allocatedMemory) {
+		return allocatedMemory;
+	} else {
+		stdLogError(errno, "Could not allocation %zd bytes of memory", size);
+		exit(255);
+	}
 }
 
 struct MessageHeader {
@@ -114,7 +116,7 @@ ssize_t sendMessage(int sock, enum RapConstant mID, int fd, int bufferCount, str
 
 	size = sendmsg(sock, &msg, 0);
 	if (size < 0) {
-		perror("sendmsg");
+		stdLogError(errno, "Could not send socket message");
 	}
 	return size;
 }
@@ -147,7 +149,7 @@ ssize_t recvMessage(int sock, enum RapConstant * mID, int * fd, int * bufferCoun
 
 	size = recvmsg(sock, &msg, MSG_CMSG_CLOEXEC);
 	if (size < 0) {
-		perror("recvmsg");
+		stdLogError(errno, "Could not receive socket message");
 		return -1;
 	}
 	if (size == 0) {
