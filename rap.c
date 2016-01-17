@@ -5,6 +5,9 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <string.h>
+#include <pwd.h>
+#include <security/pam_appl.h>
+// #include <security/openpam.h>	/* for openpam_ttyconv() */
 
 #define BUFFER_SIZE 4096
 
@@ -12,12 +15,6 @@ static int authenticated = 0;
 static const char * authenticatedUser;
 
 #define respond(result, fd) sendMessage(STDOUT_FILENO, result, fd, 0, NULL)
-
-static char * iovecToString(struct iovec * iovec) {
-	char * buffer = iovec->iov_base;
-	buffer[iovec->iov_len - 1] = '\0';
-	return buffer;
-}
 
 static size_t listFolder(int bufferCount, struct iovec * bufferHeaders) {
 	return respond(RAP_BAD_REQUEST, -1);
@@ -58,10 +55,73 @@ static size_t readFile(int bufferCount, struct iovec * bufferHeaders) {
 	}
 }
 
+static int pamConverse(int n, const struct pam_message **msg, struct pam_response **resp, void *data) {
+	return 0;
+}
+
+static pam_handle_t *pamh;
+
+static void pamCleanup() {
+	int pamResult = pam_close_session(pamh, 0);
+	pam_end(pamh, pamResult);
+}
+
 static int pamAuthenticate(const char * user, const char * password) {
 	// TODO PAM authenticate
-	// TODO lock down user
-	return strcmp("philip", user) && !strcmp("BBB", password);
+	char hostname[] = "localhost";
+	static struct pam_conv pamc = { .conv = &pamConverse };
+	struct passwd * pwd;
+	char ** envList;
+
+	// TODO setup multiple PAM services
+	if (pam_start("webdavd", user, &pamc, &pamh) != PAM_SUCCESS) {
+		stdLogError(0, "Could not start PAM");
+		return 0;
+	}
+
+	// Authenticate and start session
+	int pamResult;
+	if ((pamResult = pam_set_item(pamh, PAM_RHOST, hostname)) != PAM_SUCCESS
+			|| (pamResult = pam_set_item(pamh, PAM_RUSER, user)) != PAM_SUCCESS
+			|| (pamResult = pam_set_item(pamh, PAM_AUTHTOK, password)) != PAM_SUCCESS
+			|| (pamResult = pam_authenticate(pamh, PAM_SILENT | PAM_DISALLOW_NULL_AUTHTOK)) != PAM_SUCCESS
+			|| (pamResult = pam_acct_mgmt(pamh, PAM_SILENT | PAM_DISALLOW_NULL_AUTHTOK)) != PAM_SUCCESS || (pamResult =
+					pam_setcred(pamh, PAM_ESTABLISH_CRED)) != PAM_SUCCESS
+			|| (pamResult = pam_open_session(pamh, 0)) != PAM_SUCCESS) {
+		pam_end(pamh, pamResult);
+		stdLogError(0, "Could not Authenticate");
+		return 0;
+	}
+
+	// Get user details
+	if ((pamResult = pam_get_item(pamh, PAM_USER, (const void **) &user)) != PAM_SUCCESS
+			|| (pwd = getpwnam(authenticatedUser)) == NULL || (envList = pam_getenvlist(pamh)) == NULL) {
+		pam_close_session(pamh, 0);
+		pam_end(pamh, pamResult);
+		stdLogError(0, "Could not get user details from PAM");
+		return 0;
+	}
+
+	// Set up environment and switch user
+	clearenv();
+	for (char ** pam_env = envList; *pam_env != NULL; ++pam_env) {
+		putenv(*pam_env);
+		free(*pam_env);
+	}
+	free(envList);
+
+	if (setgid(pwd->pw_gid) == -1 || setuid(pwd->pw_uid) == -1) {
+		stdLogError(errno, "Could not set uid or gid");
+		pam_close_session(pamh, 0);
+		pam_end(pamh, pamResult);
+		return 0;
+	}
+
+	atexit(&pamCleanup);
+
+	authenticated = 1;
+
+	return 1;
 }
 
 static size_t authenticate(int bufferCount, struct iovec * bufferHeaders) {
@@ -81,12 +141,8 @@ static size_t authenticate(int bufferCount, struct iovec * bufferHeaders) {
 	password[bufferHeaders[RAP_PASSWORD_INDEX].iov_len - 1] = '\0'; // Guarantee a null terminated string
 
 	int authResult;
-	if (!pamAuthenticate(user, password)) {
+	if (pamAuthenticate(user, password)) {
 		//stdLog("Login accepted for %s", user);
-		authenticated = 1;
-		char * aUser = mallocSafe(userBufferSize);
-		memcpy(aUser, user, userBufferSize);
-		authenticatedUser = aUser;
 		return respond(RAP_SUCCESS, -1);
 	} else {
 		stdLogError(0, "Login denied for %s", user);

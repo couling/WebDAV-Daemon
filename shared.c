@@ -202,3 +202,9 @@ ssize_t recvMessage(int sock, enum RapConstant * mID, int * fd, int * bufferCoun
 
 	return size;
 }
+
+char * iovecToString(struct iovec * iovec) {
+	char * buffer = iovec->iov_base;
+	buffer[iovec->iov_len - 1] = '\0';
+	return buffer;
+}
