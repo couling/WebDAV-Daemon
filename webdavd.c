@@ -154,6 +154,8 @@ static struct MHD_Response * fdContentReaderCreate(size_t size, int fd) {
 
 static struct MHD_Response * fdFileContentReaderCreate(size_t size, int fd) {
 	struct MHD_Response * response = MHD_create_response_from_fd(size, fd);
+	// TODO date header
+	// TODO mime header
 	if (!response) {
 		close(fd);
 		return NULL;
@@ -234,7 +236,7 @@ static int forkSockExec(const char * path, int * newSockFd) {
 	} else {
 		// child
 		// Sort out socket
-		stdLog("Starting rap: %s", path);
+		// stdLog("Starting rap: %s", path);
 		if (dup2(sockFd[1], STDIN_FILENO) == -1 || dup2(sockFd[1], STDOUT_FILENO) == -1) {
 			stdLogError(errno, "Could not assign new socket (%d) to stdin/stdout", newSockFd[1]);
 			exit(255);
@@ -303,6 +305,7 @@ static int createRestrictedAccessProcessor(struct MHD_Connection *request,
 }
 
 static int authLookup(struct MHD_Connection *request, struct RestrictedAccessProcessor ** processor) {
+	// TODO reuse RAP
 	char * user;
 	char * password;
 	user = MHD_basic_auth_get_username_password(request, &(password));
@@ -482,11 +485,11 @@ static void initializeDaemin(int port, struct MHD_Daemon **newDaemon) {
 static void cleanupZombyChildren(int sig, siginfo_t *siginfo, void *context) {
 	int status;
 	waitpid(siginfo->si_pid, &status, 0);
-	stdLog("Child finished PID: %d staus: %d", siginfo->si_pid, status);
+	//stdLog("Child finished PID: %d staus: %d", siginfo->si_pid, status);
 }
 
 int main(int argCount, char ** args) {
-// Avoid zombie children
+	// Avoid zombie children
 	struct sigaction act;
 	memset(&act, 0, sizeof(act));
 	act.sa_sigaction = &cleanupZombyChildren;
@@ -496,7 +499,7 @@ int main(int argCount, char ** args) {
 		return 255;
 	}
 
-// Start up the daemons
+	// Start up the daemons
 	daemons = mallocSafe(sizeof(struct MHD_Daemon *) * daemonCount);
 	for (int i = 0; i < daemonCount; i++) {
 		initializeDaemin(daemonPorts[i], &(daemons[i]));

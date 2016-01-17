@@ -15,7 +15,7 @@ static const char * authenticatedUser;
 
 static char * iovecToString(struct iovec * iovec) {
 	char * buffer = iovec->iov_base;
-	buffer[iovec->iov_len -1] = '\0';
+	buffer[iovec->iov_len - 1] = '\0';
 	return buffer;
 }
 
@@ -59,6 +59,8 @@ static size_t readFile(int bufferCount, struct iovec * bufferHeaders) {
 }
 
 static int pamAuthenticate(const char * user, const char * password) {
+	// TODO PAM authenticate
+	// TODO lock down user
 	return strcmp("philip", user) && !strcmp("BBB", password);
 }
 
@@ -80,7 +82,7 @@ static size_t authenticate(int bufferCount, struct iovec * bufferHeaders) {
 
 	int authResult;
 	if (!pamAuthenticate(user, password)) {
-		stdLog("Login accepted for %s", user);
+		//stdLog("Login accepted for %s", user);
 		authenticated = 1;
 		char * aUser = mallocSafe(userBufferSize);
 		memcpy(aUser, user, userBufferSize);
