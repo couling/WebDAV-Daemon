@@ -1,5 +1,6 @@
 #include "shared.h"
 
+#include <fcntl.h>
 #include <signal.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -21,7 +22,7 @@
 #define RAP_PATH "/usr/sbin/rap"
 
 static struct MHD_Daemon **daemons;
-static int daemonPorts[] = { 8888 };
+static int daemonPorts[] = { 80 };
 static int daemonCount = sizeof(daemonPorts) / sizeof(daemonPorts[0]);
 
 struct RestrictedAccessProcessor {
@@ -88,9 +89,16 @@ static ssize_t directoryReader(DIR * directory, uint64_t pos, char *buf, size_t 
 	ssize_t written = 0;
 
 	while (written < max - 257 && (dp = readdir(directory)) != NULL) {
-		int newlyWritten = sprintf(buf, "%s\n", dp->d_name);
-		written += newlyWritten;
-		buf += newlyWritten;
+		int newlyWritten;
+		if (dp->d_name[0] != '.' || (dp->d_name[1] != '\0' && (dp->d_name[1] != '.' || dp->d_name[2] != '\0'))) {
+			if (dp->d_type == DT_DIR) {
+				newlyWritten = sprintf(buf, "%s/\n", dp->d_name);
+			} else {
+				newlyWritten = sprintf(buf, "%s\n", dp->d_name);
+			}
+			written += newlyWritten;
+			buf += newlyWritten;
+		}
 	}
 
 	if (written == 0) {
@@ -198,6 +206,28 @@ static int queueFdResponse(struct MHD_Connection *request, int fd) {
 	int ret = MHD_queue_response(request, MHD_HTTP_OK, response);
 	MHD_destroy_response(response);
 	return ret;
+}
+
+static int queueFileResponse(struct MHD_Connection *request, const char * file, int responseCode) {
+	int fd = open(file, O_RDONLY);
+
+	if (fd == -1) {
+		return queueInternalServerError(request);
+	}
+
+	struct stat statBuffer;
+	if (fstat(fd, &statBuffer)) {
+		close(fd);
+		return queueInternalServerError(request);
+	}
+
+	struct MHD_Response * response = fdFileContentReaderCreate(statBuffer.st_size, fd);
+	if (!response) {
+		return MHD_NO;
+	}
+	int result = MHD_queue_response(request, responseCode, response);
+	MHD_destroy_response(response);
+	return result;
 }
 
 static int filterMainHeaderInfo(struct MainHeaderInfo * mainHeaderInfo, enum MHD_ValueKind kind, const char *key,
@@ -409,9 +439,9 @@ static int processNewRequest(struct MHD_Connection *request, const char *url, co
 		(*writeHandle)->failed = 0;
 		return MHD_YES;
 	case RAP_ACCESS_DENIED:
-		return queueSimpleStringResponse(request, MHD_HTTP_FORBIDDEN, "Access denied");
+		return queueFileResponse(request, "HTTP_FORBIDDEN.html", MHD_HTTP_FORBIDDEN);
 	case RAP_NOT_FOUND:
-		return queueSimpleStringResponse(request, MHD_HTTP_NOT_FOUND, "File not found");
+		return queueFileResponse(request, "HTTP_NOT_FOUND.html", MHD_HTTP_NOT_FOUND);
 	case RAP_BAD_REQUEST:
 		stdLogError(0, "RAP reported bad request");
 		return queueInternalServerError(request);
@@ -485,7 +515,7 @@ static void initializeDaemin(int port, struct MHD_Daemon **newDaemon) {
 static void cleanupZombyChildren(int sig, siginfo_t *siginfo, void *context) {
 	int status;
 	waitpid(siginfo->si_pid, &status, 0);
-	//stdLog("Child finished PID: %d staus: %d", siginfo->si_pid, status);
+	stdLog("Child finished PID: %d staus: %d", siginfo->si_pid, status);
 }
 
 int main(int argCount, char ** args) {

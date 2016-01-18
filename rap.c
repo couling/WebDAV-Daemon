@@ -6,6 +6,7 @@
 #include <fcntl.h>
 #include <string.h>
 #include <pwd.h>
+#include <grp.h>
 #include <security/pam_appl.h>
 // #include <security/openpam.h>	/* for openpam_ttyconv() */
 
@@ -36,7 +37,6 @@ static size_t readFile(int bufferCount, struct iovec * bufferHeaders) {
 
 	char * host = iovecToString(&bufferHeaders[RAP_HOST_INDEX]);
 	char * file = iovecToString(&bufferHeaders[RAP_FILE_INDEX]);
-
 	int fd = open(file, O_RDONLY);
 	if (fd == -1) {
 		int e = errno;
@@ -91,30 +91,25 @@ static int pamAuthenticate(const char * user, const char * password) {
 	int pamResult;
 	if ((pamResult = pam_set_item(pamh, PAM_RHOST, hostname)) != PAM_SUCCESS
 			|| (pamResult = pam_set_item(pamh, PAM_RUSER, user)) != PAM_SUCCESS
+
 			|| (pamResult = pam_authenticate(pamh, PAM_SILENT | PAM_DISALLOW_NULL_AUTHTOK)) != PAM_SUCCESS
 			|| (pamResult = pam_acct_mgmt(pamh, PAM_SILENT | PAM_DISALLOW_NULL_AUTHTOK)) != PAM_SUCCESS || (pamResult =
 					pam_setcred(pamh, PAM_ESTABLISH_CRED)) != PAM_SUCCESS
 			|| (pamResult = pam_open_session(pamh, 0)) != PAM_SUCCESS) {
 		pam_end(pamh, pamResult);
-		stdLogError(0, "Could not Authenticate: %s", pam_strerror(pamh, pamResult));
 		return 0;
 	}
-
-	stdLog("Getting pam user");
 
 	// Get user details
 	if ((pamResult = pam_get_item(pamh, PAM_USER, (const void **) &user)) != PAM_SUCCESS
-			|| (pwd = getpwnam(authenticatedUser)) == NULL || (envList = pam_getenvlist(pamh)) == NULL) {
+			|| (pwd = getpwnam(user)) == NULL || (envList = pam_getenvlist(pamh)) == NULL) {
 
-		pam_close_session(pamh, 0);
+		pamResult = pam_close_session(pamh, 0);
 		pam_end(pamh, pamResult);
 
-		stdLogError(0, "Could not get user details from PAM");
 		return 0;
 	}
 
-	stdLog("Got pam user");
-	stdLog("Authentication %s", authenticatedUser);
 	// Set up environment and switch user
 	clearenv();
 	for (char ** pam_env = envList; *pam_env != NULL; ++pam_env) {
@@ -123,7 +118,7 @@ static int pamAuthenticate(const char * user, const char * password) {
 	}
 	free(envList);
 
-	if (setgid(pwd->pw_gid) == -1 || setuid(pwd->pw_uid) == -1) {
+	if (initgroups(user, pwd->pw_gid) || setgid(pwd->pw_gid) || setuid(pwd->pw_uid)) {
 		stdLogError(errno, "Could not set uid or gid");
 		pam_close_session(pamh, 0);
 		pam_end(pamh, pamResult);
@@ -131,6 +126,9 @@ static int pamAuthenticate(const char * user, const char * password) {
 	}
 
 	atexit(&pamCleanup);
+	size_t userLen = strlen(user) + 1;
+	authenticatedUser = mallocSafe(userLen);
+	memcpy((char *) authenticatedUser, user, userLen);
 
 	authenticated = 1;
 
