@@ -293,7 +293,7 @@ static int createRestrictedAccessProcessor(struct MHD_Connection *request,
 			stdLogError(0, "RAP closed socket unexpectedly");
 			return queueInternalServerError(request);
 		} else {
-			stdLogError(0, "Access deined for user %s", user);
+			stdLogError(0, "Access denied for user %s", user);
 			return queueAuthRequiredResponse(request);
 		}
 

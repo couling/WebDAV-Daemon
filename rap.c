@@ -55,8 +55,14 @@ static size_t readFile(int bufferCount, struct iovec * bufferHeaders) {
 	}
 }
 
-static int pamConverse(int n, const struct pam_message **msg, struct pam_response **resp, void *data) {
-	return 0;
+static int pamConverse(int n, const struct pam_message **msg, struct pam_response **resp, char * password) {
+	struct pam_response * response = mallocSafe(sizeof(struct pam_response));
+	response->resp_retcode = 0;
+	size_t passSize = strlen(password) + 1;
+	response->resp = mallocSafe(passSize);
+	memcpy(response->resp, password, passSize);
+	*resp = response;
+	return PAM_SUCCESS;
 }
 
 static pam_handle_t *pamh;
@@ -69,7 +75,9 @@ static void pamCleanup() {
 static int pamAuthenticate(const char * user, const char * password) {
 	// TODO PAM authenticate
 	char hostname[] = "localhost";
-	static struct pam_conv pamc = { .conv = &pamConverse };
+	static struct pam_conv pamc = { .conv = (int (*)(int num_msg, const struct pam_message **msg,
+			struct pam_response **resp, void *appdata_ptr)) &pamConverse };
+	pamc.appdata_ptr = (void *) password;
 	struct passwd * pwd;
 	char ** envList;
 
@@ -83,25 +91,30 @@ static int pamAuthenticate(const char * user, const char * password) {
 	int pamResult;
 	if ((pamResult = pam_set_item(pamh, PAM_RHOST, hostname)) != PAM_SUCCESS
 			|| (pamResult = pam_set_item(pamh, PAM_RUSER, user)) != PAM_SUCCESS
-			|| (pamResult = pam_set_item(pamh, PAM_AUTHTOK, password)) != PAM_SUCCESS
 			|| (pamResult = pam_authenticate(pamh, PAM_SILENT | PAM_DISALLOW_NULL_AUTHTOK)) != PAM_SUCCESS
 			|| (pamResult = pam_acct_mgmt(pamh, PAM_SILENT | PAM_DISALLOW_NULL_AUTHTOK)) != PAM_SUCCESS || (pamResult =
 					pam_setcred(pamh, PAM_ESTABLISH_CRED)) != PAM_SUCCESS
 			|| (pamResult = pam_open_session(pamh, 0)) != PAM_SUCCESS) {
 		pam_end(pamh, pamResult);
-		stdLogError(0, "Could not Authenticate");
+		stdLogError(0, "Could not Authenticate: %s", pam_strerror(pamh, pamResult));
 		return 0;
 	}
+
+	stdLog("Getting pam user");
 
 	// Get user details
 	if ((pamResult = pam_get_item(pamh, PAM_USER, (const void **) &user)) != PAM_SUCCESS
 			|| (pwd = getpwnam(authenticatedUser)) == NULL || (envList = pam_getenvlist(pamh)) == NULL) {
+
 		pam_close_session(pamh, 0);
 		pam_end(pamh, pamResult);
+
 		stdLogError(0, "Could not get user details from PAM");
 		return 0;
 	}
 
+	stdLog("Got pam user");
+	stdLog("Authentication %s", authenticatedUser);
 	// Set up environment and switch user
 	clearenv();
 	for (char ** pam_env = envList; *pam_env != NULL; ++pam_env) {
@@ -145,7 +158,6 @@ static size_t authenticate(int bufferCount, struct iovec * bufferHeaders) {
 		//stdLog("Login accepted for %s", user);
 		return respond(RAP_SUCCESS, -1);
 	} else {
-		stdLogError(0, "Login denied for %s", user);
 		return respond(RAP_AUTH_FAILLED, -1);
 	}
 }
