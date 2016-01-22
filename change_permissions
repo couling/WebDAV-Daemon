@@ -1,0 +1,4 @@
+#!/bin/bash
+chown root:root build/rap build/webdavd
+chmod o+rx build/rap build/webdavd
+chmod ug+s build/rap build/webdavd

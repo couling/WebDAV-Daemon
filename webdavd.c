@@ -9,6 +9,7 @@
 #include <time.h>
 #include <limits.h>
 #include <unistd.h>
+#include <sys/mman.h>
 #include <sys/types.h>
 #include <sys/select.h>
 #include <sys/socket.h>
@@ -20,6 +21,7 @@
 #include <dirent.h>
 
 #define RAP_PATH "/usr/sbin/rap"
+#define MIME_FILE_PATH "/etc/mime.types"
 
 static struct MHD_Daemon **daemons;
 static int daemonPorts[] = { 80 };
@@ -46,6 +48,127 @@ struct MainHeaderInfo {
 	char * host;
 	int dataSent;
 };
+
+struct MimeType {
+	const char * ext;
+	const char * type;
+};
+
+char * mimeFileBuffer;
+struct MimeType * mimeTypes = NULL;
+int mimeTypeCount = 0;
+
+static int compareExt(const void * a, const void * b) {
+	return strcmp(((struct MimeType *) a)->ext, ((struct MimeType *) b)->ext);
+}
+
+static struct MimeType * findMimeType(const char * file) {
+	struct MimeType type;
+	type.ext = file + strlen(file) - 1;
+	while (1) {
+		if (*type.ext == '/') {
+			return NULL;
+		} else if (*type.ext == '.') {
+			type.ext++;
+			break;
+		} else {
+			type.ext--;
+			if (type.ext < file) {
+				return NULL;
+			}
+		}
+	}
+
+	return bsearch(&type, mimeTypes, mimeTypeCount, sizeof(struct MimeType), &compareExt);
+}
+
+static int initializeMimeTypes() {
+	// Load Mime file into memory
+	int mimeTypeFd = open(MIME_FILE_PATH, O_RDONLY);
+	struct stat mimeStat;
+	if (mimeTypeFd == -1 || fstat(mimeTypeFd, &mimeStat) || mimeStat.st_size == 0) {
+		if (mimeStat.st_size == 0) {
+			stdLogError(0, "Could not determine size of %s", MIME_FILE_PATH);
+		} else {
+			stdLogError(errno, "Could not open mime type file %s", MIME_FILE_PATH);
+		}
+		return 0;
+	}
+
+	mimeFileBuffer = mallocSafe(mimeStat.st_size);
+	size_t bytesRead = read(mimeTypeFd, mimeFileBuffer, mimeStat.st_size);
+	if (bytesRead != mimeStat.st_size) {
+		stdLogError(bytesRead < 0 ? errno : 0, "Could not read whole mime file %s", MIME_FILE_PATH);
+		free(mimeFileBuffer);
+		return 0;
+	}
+
+	// Parse mimeFile;
+	char * partStartPtr = mimeFileBuffer;
+	int found;
+	char * type = NULL;
+	do {
+		found = 0;
+		// find the start of the part
+		while (partStartPtr < mimeFileBuffer + mimeStat.st_size && !found) {
+			switch (*partStartPtr) {
+			case '#':
+				// skip to the end of the line
+				while (partStartPtr < mimeFileBuffer + mimeStat.st_size && *partStartPtr != '\n') {
+					partStartPtr++;
+				}
+				// Fall through to incrementing partStartPtr
+				partStartPtr++;
+				break;
+			case ' ':
+			case '\t':
+			case '\r':
+			case '\n':
+				if (*partStartPtr == '\n') {
+					type = NULL;
+				}
+				partStartPtr++;
+				break;
+			default:
+				found = 1;
+				break;
+			}
+		}
+
+		// Find the end of the part
+		char * partEndPtr = partStartPtr + 1;
+		found = 0;
+		while (partEndPtr < mimeFileBuffer + mimeStat.st_size && !found) {
+			switch (*partEndPtr) {
+			case ' ':
+			case '\t':
+			case '\r':
+			case '\n':
+				if (type == NULL) {
+					type = partStartPtr;
+				} else {
+					mimeTypes = reallocSafe(mimeTypes, sizeof(struct MimeType) * (mimeTypeCount + 1));
+					mimeTypes[mimeTypeCount].type = type;
+					mimeTypes[mimeTypeCount].ext = partStartPtr;
+					mimeTypeCount++;
+				}
+				if (*partEndPtr == '\n') {
+					type = NULL;
+				}
+				*partEndPtr = '\0';
+				found = 1;
+				break;
+			default:
+				partEndPtr++;
+				break;
+			}
+		}
+		partStartPtr = partEndPtr + 1;
+	} while (partStartPtr < mimeFileBuffer + mimeStat.st_size);
+
+	qsort(mimeTypes, mimeTypeCount, sizeof(struct MimeType), &compareExt);
+	return 1;
+}
 
 static int queueStringResponse(struct MHD_Connection *request, int httpResponseCode, char * string, int headerCount,
 		struct Header * headers) {
@@ -162,8 +285,8 @@ static struct MHD_Response * fdContentReaderCreate(size_t size, int fd) {
 
 static struct MHD_Response * fdFileContentReaderCreate(size_t size, int fd) {
 	struct MHD_Response * response = MHD_create_response_from_fd(size, fd);
-	// TODO date header
-	// TODO mime header
+// TODO date header
+// TODO mime header
 	if (!response) {
 		close(fd);
 		return NULL;
@@ -172,7 +295,7 @@ static struct MHD_Response * fdFileContentReaderCreate(size_t size, int fd) {
 	}
 }
 
-static int queueFdResponse(struct MHD_Connection *request, int fd) {
+static int queueFdResponse(struct MHD_Connection *request, int fd, struct MimeType * mimeType) {
 	struct stat statBuffer;
 	if (fstat(fd, &statBuffer)) {
 		close(fd);
@@ -202,6 +325,11 @@ static int queueFdResponse(struct MHD_Connection *request, int fd) {
 	struct MHD_Response * response = responseCreator(size, fd);
 	if (!response) {
 		return queueInternalServerError(request);
+	}
+	if (mimeType) {
+		if (MHD_add_response_header(response, "Content-Type", mimeType->type) != MHD_YES) {
+			return queueInternalServerError(request);
+		}
 	}
 	int ret = MHD_queue_response(request, MHD_HTTP_OK, response);
 	MHD_destroy_response(response);
@@ -309,7 +437,7 @@ static int createRestrictedAccessProcessor(struct MHD_Connection *request,
 		*newProcessor = NULL;
 		return queueInternalServerError(request);
 	}
-	// TODO implement timeout ... possibly using "select"
+// TODO implement timeout ... possibly using "select"
 	int bufferCount = MAX_BUFFER_PARTS;
 	enum RapConstant responseCode;
 	size_t readResult = recvMessage(processor->socketFd, &responseCode, NULL, &bufferCount, message);
@@ -335,7 +463,7 @@ static int createRestrictedAccessProcessor(struct MHD_Connection *request,
 }
 
 static int authLookup(struct MHD_Connection *request, struct RestrictedAccessProcessor ** processor) {
-	// TODO reuse RAP
+// TODO reuse RAP
 	char * user;
 	char * password;
 	user = MHD_basic_auth_get_username_password(request, &(password));
@@ -433,7 +561,7 @@ static int processNewRequest(struct MHD_Connection *request, const char *url, co
 	// Queue the response
 	switch (mID) {
 	case RAP_SUCCESS_SOURCE_DATA:
-		return queueFdResponse(request, fd);
+		return queueFdResponse(request, fd, findMimeType(newUrl));
 	case RAP_SUCCESS_SINK_DATA:
 		(*writeHandle)->fd = fd;
 		(*writeHandle)->failed = 0;
@@ -520,6 +648,7 @@ static void cleanupZombyChildren(int sig, siginfo_t *siginfo, void *context) {
 
 int main(int argCount, char ** args) {
 	// Avoid zombie children
+	initializeMimeTypes();
 	struct sigaction act;
 	memset(&act, 0, sizeof(act));
 	act.sa_sigaction = &cleanupZombyChildren;

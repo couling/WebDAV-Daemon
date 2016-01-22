@@ -34,6 +34,8 @@ enum RapConstant {
 #define RAP_FILE_INDEX 1
 
 void * mallocSafe(size_t size);
+void * reallocSafe(void * mem, size_t newSize);
+
 void stdLog(const char * str, ...);
 void stdLogError(int errorNumber, const char * str, ...);
 

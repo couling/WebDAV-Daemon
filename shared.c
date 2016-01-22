@@ -72,6 +72,19 @@ void * mallocSafe(size_t size) {
 	}
 }
 
+void * reallocSafe(void * mem, size_t newSize) {
+	if (mem == NULL) {
+		return mallocSafe(newSize);
+	}
+	void * allocatedMemory = realloc(mem, newSize);
+	if (allocatedMemory) {
+		return allocatedMemory;
+	} else {
+		stdLogError(errno, "Could not allocation %zd bytes of memory", newSize);
+		exit(255);
+	}
+}
+
 struct MessageHeader {
 	enum RapConstant mID;
 	int partCount;
