@@ -43,6 +43,6 @@ control:control
 
 file:build/webdavd:usr/sbin/webdavd:755
 file:build/rap:usr/sbin/rap:4755
-file:share:usr/share/webdav:755
+file:share:usr/share/webdavd:755
 
 #libgcrypt, libgnutls

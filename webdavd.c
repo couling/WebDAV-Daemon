@@ -5,6 +5,7 @@
 // TODO XML?
 // TODO etags
 // TODO correct failure codes on collections
+// TODO access logging
 
 #include "shared.h"
 
