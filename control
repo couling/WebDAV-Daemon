@@ -1,0 +1,11 @@
+Package: couling-webdavd
+Version: 0.1
+Section: devel
+Priority: optional
+Architecture: all
+Depends: libmicrohttpd10, libc6, libpam0g
+Suggests:
+Conflicts:
+Replaces:
+Maintainer: Philip Couling <couling@gmail.com>
+Description: File server using webdavd and PAM authentication 

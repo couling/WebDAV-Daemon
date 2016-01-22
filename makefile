@@ -11,7 +11,7 @@ build/%: %.c | build
 
 build:
 	mkdir $@
-    
+	
 clean:
 	rm -rf build
 
