@@ -3,7 +3,7 @@ Version: 0.1
 Section: devel
 Priority: optional
 Architecture: all
-Depends: libmicrohttpd10, libc6, libpam0g
+Depends: libmicrohttpd10, libc6, libpam0g, libxml2
 Suggests:
 Conflicts:
 Replaces:

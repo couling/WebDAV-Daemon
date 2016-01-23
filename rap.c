@@ -17,6 +17,51 @@ static const char * authenticatedUser;
 
 #define respond(result, fd) sendMessage(STDOUT_FILENO, result, fd, 0, NULL)
 
+/*static ssize_t directoryReader(DIR * directory, uint64_t pos, char *buf, size_t max) {
+	struct dirent *dp;
+	ssize_t written = 0;
+
+	while (written < max - 257 && (dp = readdir(directory)) != NULL) {
+		int newlyWritten;
+		if (dp->d_name[0] != '.' || (dp->d_name[1] != '\0' && (dp->d_name[1] != '.' || dp->d_name[2] != '\0'))) {
+			if (dp->d_type == DT_DIR) {
+				newlyWritten = sprintf(buf, "%s/\n", dp->d_name);
+			} else {
+				newlyWritten = sprintf(buf, "%s\n", dp->d_name);
+			}
+			written += newlyWritten;
+			buf += newlyWritten;
+		}
+	}
+
+	if (written == 0) {
+		written = MHD_CONTENT_READER_END_OF_STREAM;
+	}
+	return written;
+}
+
+static void directoryReaderCleanup(DIR * directory) {
+	closedir(directory);
+}
+
+static struct MHD_Response * directoryReaderCreate(size_t size, int fd) {
+	DIR * dir = fdopendir(fd);
+	if (!dir) {
+		close(fd);
+		stdLogError(errno, "Could not list directory from fd");
+		return NULL;
+	}
+	struct MHD_Response * response = MHD_create_response_from_callback(-1, 4096,
+			(MHD_ContentReaderCallback) &directoryReader, dir,
+			(MHD_ContentReaderFreeCallback) & directoryReaderCleanup);
+	if (!response) {
+		closedir(dir);
+		return NULL;
+	} else {
+		return response;
+	}
+}*/
+
 static size_t listFolder(int bufferCount, struct iovec * bufferHeaders) {
 	return respond(RAP_BAD_REQUEST, -1);
 }
@@ -51,7 +96,7 @@ static size_t readFile(int bufferCount, struct iovec * bufferHeaders) {
 		}
 	} else {
 		stdLog("GET success %s %s %s", authenticatedUser, host, file);
-		return respond(RAP_SUCCESS_SOURCE_DATA, fd);
+		return respond(RAP_SUCCESS_STATIC_DATA_FD, fd);
 	}
 }
 
@@ -73,7 +118,6 @@ static void pamCleanup() {
 }
 
 static int pamAuthenticate(const char * user, const char * password) {
-	// TODO PAM authenticate
 	char hostname[] = "localhost";
 	static struct pam_conv pamc = { .conv = (int (*)(int num_msg, const struct pam_message **msg,
 			struct pam_response **resp, void *appdata_ptr)) &pamConverse };
@@ -154,7 +198,7 @@ static size_t authenticate(int bufferCount, struct iovec * bufferHeaders) {
 	int authResult;
 	if (pamAuthenticate(user, password)) {
 		//stdLog("Login accepted for %s", user);
-		return respond(RAP_SUCCESS, -1);
+		return respond(RAP_SUCCESS_NO_DATA, -1);
 	} else {
 		return respond(RAP_AUTH_FAILLED, -1);
 	}

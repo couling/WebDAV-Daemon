@@ -11,8 +11,8 @@
 
 static char * timeNow() {
 	time_t rawtime;
-	struct tm * timeinfo;
 	time(&rawtime);
+	struct tm * timeinfo;
 	timeinfo = localtime(&rawtime);
 	static char t[100];
 	strftime(t, 100, "%a %b %d %H:%M:%S %Y", timeinfo);
@@ -128,6 +128,9 @@ ssize_t sendMessage(int sock, enum RapConstant mID, int fd, int bufferCount, str
 	}
 
 	size = sendmsg(sock, &msg, 0);
+	if (fd != -1) {
+		close(fd);
+	}
 	if (size < 0) {
 		stdLogError(errno, "Could not send socket message");
 	}
