@@ -185,7 +185,12 @@ static int queueRapResponse(struct MHD_Connection *request, enum RapConstant mID
 		struct iovec * message) {
 
 	// Get Mime type and date
-	const char * mimeType = RAP_FILE_INDEX < messageParts ? (char *) message[RAP_FILE_INDEX].iov_base : NULL;
+	const char * mimeType;
+	if (RAP_FILE_INDEX < messageParts) {
+		mimeType = (char *) message[RAP_FILE_INDEX].iov_base;
+	} else {
+		mimeType = NULL;
+	}
 	time_t date;
 	if (RAP_DATE_INDEX < messageParts) {
 		date = *((time_t *) message[RAP_DATE_INDEX].iov_base);
