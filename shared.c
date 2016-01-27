@@ -186,14 +186,14 @@ ssize_t recvMessage(int sock, enum RapConstant * mID, int * fd, int * bufferCoun
 			close(recievedFd);
 		}
 	} else if (fd) {
-		// report back to the calling method that no FD was recieved.
+		// report back to the calling method that no FD was received.
 		*fd = -1;
 	}
 
 	struct MessageHeader * messageHeader = (struct MessageHeader *) (&incomingBuffer);
 	if (size < sizeof(struct MessageHeader) || messageHeader->partCount > *bufferCount
 			|| messageHeader->partCount < 0) {
-		stdLogError(0, "Invalid message recieved");
+		stdLogError(0, "Invalid message received");
 		if (fd || *fd != -1) {
 			close(*fd);
 		}
@@ -208,7 +208,7 @@ ssize_t recvMessage(int sock, enum RapConstant * mID, int * fd, int * bufferCoun
 		buffers[i].iov_len = messageHeader->partLengths[i];
 		partPtr += messageHeader->partLengths[i];
 		if (partPtr > incomingBuffer + size) {
-			stdLogError(0, "Invalid message recieved: parts too long\n");
+			stdLogError(0, "Invalid message received: parts too long\n");
 			if (fd || *fd != -1) {
 				close(*fd);
 			}

@@ -11,18 +11,17 @@ enum RapConstant {
 	RAP_WRITE_FILE,
 	RAP_LIST_FOLDER,
 
-	RAP_SUCCESS_STATIC_DATA_FD,
-	RAP_SUCCESS_DYNAMIC_DATA_FD,
-	RAP_SUCCESS_NO_DATA,
+	RAP_SUCCESS,
 	RAP_CONTINUE,
 	RAP_NOT_FOUND,
 	RAP_ACCESS_DENIED,
 	RAP_AUTH_FAILLED,
+	RAP_INTERNAL_ERROR,
 	RAP_BAD_REQUEST,
 
 	RAP_MIN_REQUEST = RAP_AUTHENTICATE,
 	RAP_MAX_REQUEST = RAP_LIST_FOLDER,
-	RAP_MIN_RESPONSE = RAP_SUCCESS_STATIC_DATA_FD,
+	RAP_MIN_RESPONSE = RAP_SUCCESS,
 	RAP_MAX_RESPONSE = RAP_BAD_REQUEST
 };
 
@@ -32,8 +31,12 @@ enum RapConstant {
 #define RAP_HOST_INDEX 0
 #define RAP_FILE_INDEX 1
 
-#define RAP_DATE_INDEX 0
-#define RAP_FILE_INDEX 1
+#define RAP_DATE_INDEX     0
+#define RAP_FILE_INDEX     1
+#define RAP_LOCATION_INDEX 2
+
+#define PIPE_READ      0
+#define PIPE_WRITE     1
 
 void * mallocSafe(size_t size);
 void * reallocSafe(void * mem, size_t newSize);
@@ -41,7 +44,7 @@ void * reallocSafe(void * mem, size_t newSize);
 void stdLog(const char * str, ...);
 void stdLogError(int errorNumber, const char * str, ...);
 
-#define MAX_BUFFER_PARTS 2
+#define MAX_BUFFER_PARTS 3
 
 ssize_t sendMessage(int sock, enum RapConstant mID, int fd, int bufferCount, struct iovec buffer[]);
 ssize_t recvMessage(int sock, enum RapConstant * mID, int * fd, int * bufferCount, struct iovec * buffers);

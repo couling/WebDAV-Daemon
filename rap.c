@@ -7,6 +7,9 @@
 #include <string.h>
 #include <pwd.h>
 #include <grp.h>
+#include <time.h>
+#include <sys/stat.h>
+#include <dirent.h>
 #include <security/pam_appl.h>
 // #include <security/openpam.h>	/* for openpam_ttyconv() */
 
@@ -18,59 +21,63 @@ static const char * authenticatedUser;
 #define respond(result, fd) sendMessage(STDOUT_FILENO, result, fd, 0, NULL)
 
 /*static ssize_t directoryReader(DIR * directory, uint64_t pos, char *buf, size_t max) {
-	struct dirent *dp;
-	ssize_t written = 0;
+ struct dirent *dp;
+ ssize_t written = 0;
 
-	while (written < max - 257 && (dp = readdir(directory)) != NULL) {
-		int newlyWritten;
-		if (dp->d_name[0] != '.' || (dp->d_name[1] != '\0' && (dp->d_name[1] != '.' || dp->d_name[2] != '\0'))) {
-			if (dp->d_type == DT_DIR) {
-				newlyWritten = sprintf(buf, "%s/\n", dp->d_name);
-			} else {
-				newlyWritten = sprintf(buf, "%s\n", dp->d_name);
-			}
-			written += newlyWritten;
-			buf += newlyWritten;
-		}
-	}
+ while (written < max - 257 && (dp = readdir(directory)) != NULL) {
+ int newlyWritten;
+ if (dp->d_name[0] != '.' || (dp->d_name[1] != '\0' && (dp->d_name[1] != '.' || dp->d_name[2] != '\0'))) {
+ if (dp->d_type == DT_DIR) {
+ newlyWritten = sprintf(buf, "%s/\n", dp->d_name);
+ } else {
+ newlyWritten = sprintf(buf, "%s\n", dp->d_name);
+ }
+ written += newlyWritten;
+ buf += newlyWritten;
+ }
+ }
 
-	if (written == 0) {
-		written = MHD_CONTENT_READER_END_OF_STREAM;
-	}
-	return written;
-}
+ if (written == 0) {
+ written = MHD_CONTENT_READER_END_OF_STREAM;
+ }
+ return written;
+ }
 
-static void directoryReaderCleanup(DIR * directory) {
-	closedir(directory);
-}
+ static void directoryReaderCleanup(DIR * directory) {
+ closedir(directory);
+ }
 
-static struct MHD_Response * directoryReaderCreate(size_t size, int fd) {
-	DIR * dir = fdopendir(fd);
-	if (!dir) {
-		close(fd);
-		stdLogError(errno, "Could not list directory from fd");
-		return NULL;
-	}
-	struct MHD_Response * response = MHD_create_response_from_callback(-1, 4096,
-			(MHD_ContentReaderCallback) &directoryReader, dir,
-			(MHD_ContentReaderFreeCallback) & directoryReaderCleanup);
-	if (!response) {
-		closedir(dir);
-		return NULL;
-	} else {
-		return response;
-	}
-}*/
+ static struct MHD_Response * directoryReaderCreate(size_t size, int fd) {
+ DIR * dir = fdopendir(fd);
+ if (!dir) {
+ close(fd);
+ stdLogError(errno, "Could not list directory from fd");
+ return NULL;
+ }
+ struct MHD_Response * response = MHD_create_response_from_callback(-1, 4096,
+ (MHD_ContentReaderCallback) &directoryReader, dir,
+ (MHD_ContentReaderFreeCallback) & directoryReaderCleanup);
+ if (!response) {
+ closedir(dir);
+ return NULL;
+ } else {
+ return response;
+ }
+ }*/
 
-static size_t listFolder(int bufferCount, struct iovec * bufferHeaders) {
+static size_t listFolder(int bufferCount, struct iovec * bufferHeaders, int fd) {
 	return respond(RAP_BAD_REQUEST, -1);
 }
 
-static size_t writeFile(int bufferCount, struct iovec * bufferHeaders) {
+static size_t writeFile(int bufferCount, struct iovec * bufferHeaders, int fd) {
 	return respond(RAP_BAD_REQUEST, -1);
 }
 
-static size_t readFile(int bufferCount, struct iovec * bufferHeaders) {
+static size_t readFile(int bufferCount, struct iovec * bufferHeaders, int incomingFd) {
+	if (incomingFd != -1) {
+		stdLogError(0, "read file request send incoming data!");
+		close(incomingFd);
+	}
 	if (!authenticated || bufferCount != 2) {
 		if (!authenticated) {
 			stdLogError(0, "Not authenticated RAP");
@@ -95,8 +102,74 @@ static size_t readFile(int bufferCount, struct iovec * bufferHeaders) {
 			return respond(RAP_NOT_FOUND, -1);
 		}
 	} else {
-		stdLog("GET success %s %s %s", authenticatedUser, host, file);
-		return respond(RAP_SUCCESS_STATIC_DATA_FD, fd);
+		struct iovec message[2];
+		struct stat statinfo;
+		fstat(fd, &statinfo);
+
+		if ((statinfo.st_mode & S_IFMT) == S_IFDIR) {
+			int pipeEnds[2];
+			if (pipe(pipeEnds)) {
+				stdLogError(errno, "Could not create pipe to write content");
+				close(fd);
+				return respond(RAP_INTERNAL_ERROR, -1);
+			}
+
+			time_t fileTime;
+			time(&fileTime);
+			message[RAP_DATE_INDEX].iov_base = &fileTime;
+			message[RAP_DATE_INDEX].iov_len = sizeof(fileTime);
+			message[RAP_FILE_INDEX].iov_base = "text/html";
+			message[RAP_FILE_INDEX].iov_len = sizeof("text/html");
+			size_t fileNameSize = bufferHeaders[RAP_FILE_INDEX].iov_len;
+			message[RAP_LOCATION_INDEX].iov_base = mallocSafe(fileNameSize + 1);
+			memcpy(message[RAP_LOCATION_INDEX].iov_base, file, fileNameSize);
+			if (file[fileNameSize - 2] != '/') {
+				((char *) message[RAP_LOCATION_INDEX].iov_base)[fileNameSize - 1] = '/';
+				((char *) message[RAP_LOCATION_INDEX].iov_base)[fileNameSize] = '\0';
+				message[RAP_LOCATION_INDEX].iov_len = fileNameSize + 1;
+			} else {
+				message[RAP_LOCATION_INDEX].iov_len = fileNameSize;
+			}
+			stdLog("GET dir success %s %s %s", authenticatedUser, host, file);
+			int messageResult = sendMessage(STDOUT_FILENO, RAP_SUCCESS, pipeEnds[PIPE_READ], 3, message);
+			free(message[RAP_LOCATION_INDEX].iov_base);
+			if (messageResult <= 0) {
+				close(fd);
+				close(pipeEnds[PIPE_WRITE]);
+				return messageResult;
+			}
+
+			// We've set up the pipe and sent read end across so now write the result
+			DIR * dir = fdopendir(fd);
+			FILE * outPipe = fdopen(pipeEnds[PIPE_WRITE], "w");
+			char * sep = (file[fileNameSize - 2] == '/' ? "" : "/");
+			fprintf(outPipe, "<html><head><title>%s%s</title></head><body><h1>%s%s</h1><ul>", file, sep, file, sep);
+			struct dirent * dp;
+			while ((dp = readdir(dir)) != NULL) {
+				if (dp->d_name[0] != '.') {
+					if (dp->d_type == DT_DIR) {
+
+						fprintf(outPipe, "<li><a href=\"%s%s%s/\">%s/</a></li>", file, sep, dp->d_name, dp->d_name);
+					}
+					else {
+						fprintf(outPipe, "<li><a href=\"%s%s%s\">%s</a></li>", file, sep, dp->d_name, dp->d_name);
+					}
+				}
+			}
+			fprintf(outPipe, "</ul></body></html>");
+			closedir(dir);
+			fclose(outPipe);
+			return messageResult;
+		} else {
+			message[RAP_DATE_INDEX].iov_base = &statinfo.st_mtime;
+			message[RAP_DATE_INDEX].iov_len = sizeof(statinfo.st_mtime);
+			message[RAP_FILE_INDEX].iov_base = file;
+			message[RAP_FILE_INDEX].iov_len = strlen(file) + 1;
+			message[RAP_LOCATION_INDEX].iov_base = bufferHeaders[RAP_FILE_INDEX].iov_base;
+			message[RAP_LOCATION_INDEX].iov_len = bufferHeaders[RAP_FILE_INDEX].iov_len;
+			stdLog("GET success %s %s %s", authenticatedUser, host, file);
+			return sendMessage(STDOUT_FILENO, RAP_SUCCESS, fd, 2, message);
+		}
 	}
 }
 
@@ -179,7 +252,11 @@ static int pamAuthenticate(const char * user, const char * password) {
 	return 1;
 }
 
-static size_t authenticate(int bufferCount, struct iovec * bufferHeaders) {
+static size_t authenticate(int bufferCount, struct iovec * bufferHeaders, int fd) {
+	if (fd != -1) {
+		stdLogError(0, "authenticate request send incoming data!");
+		close(fd);
+	}
 	if (authenticated || bufferCount != 2) {
 		if (authenticated) {
 			stdLogError(0, "Login for already logged in RAP");
@@ -198,13 +275,13 @@ static size_t authenticate(int bufferCount, struct iovec * bufferHeaders) {
 	int authResult;
 	if (pamAuthenticate(user, password)) {
 		//stdLog("Login accepted for %s", user);
-		return respond(RAP_SUCCESS_NO_DATA, -1);
+		return respond(RAP_SUCCESS, -1);
 	} else {
 		return respond(RAP_AUTH_FAILLED, -1);
 	}
 }
 
-typedef size_t (*handlerMethod)(int bufferCount, struct iovec * bufferHeaders);
+typedef size_t (*handlerMethod)(int bufferCount, struct iovec * bufferHeaders, int fd);
 static handlerMethod handlerMethods[] = { authenticate, readFile, writeFile, listFolder };
 
 int main(int argCount, char ** args) {
@@ -212,11 +289,12 @@ int main(int argCount, char ** args) {
 	struct iovec bufferHeaders[MAX_BUFFER_PARTS];
 	enum RapConstant mID;
 	size_t ioResult;
+	int incomingFd;
 	do {
 		bufferCount = MAX_BUFFER_PARTS;
 
 		// Read a message
-		ioResult = recvMessage(STDIN_FILENO, &mID, NULL, &bufferCount, bufferHeaders);
+		ioResult = recvMessage(STDIN_FILENO, &mID, &incomingFd, &bufferCount, bufferHeaders);
 		if (ioResult <= 0) {
 			if (ioResult < 0) {
 				exit(1);
@@ -230,7 +308,7 @@ int main(int argCount, char ** args) {
 			ioResult = respond(RAP_BAD_REQUEST, -1);
 			continue;
 		}
-		ioResult = handlerMethods[mID - RAP_MIN_REQUEST](bufferCount, bufferHeaders);
+		ioResult = handlerMethods[mID - RAP_MIN_REQUEST](bufferCount, bufferHeaders, incomingFd);
 		if (ioResult < 0) {
 			ioResult = 0;
 		}

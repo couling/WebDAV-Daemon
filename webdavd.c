@@ -26,7 +26,6 @@
 #include <sys/wait.h>
 #include <microhttpd.h>
 #include <errno.h>
-#include <dirent.h>
 
 #define RAP_PATH "/usr/sbin/rap"
 #define MIME_FILE_PATH "/etc/mime.types"
@@ -136,6 +135,7 @@ static struct MHD_Response * fdContentReaderCreate(int fd, const char * mimeType
 	if ((MHD_add_response_header(response, "Date", dateBuf) != MHD_YES)
 			|| (mimeType && MHD_add_response_header(response, "Content-Type", mimeType) != MHD_YES)) {
 		MHD_destroy_response(response);
+		return NULL;
 	}
 	return response;
 
@@ -152,6 +152,7 @@ static struct MHD_Response * fdFileContentReaderCreate(size_t size, int fd, cons
 	if ((MHD_add_response_header(response, "Date", dateBuf) != MHD_YES)
 			|| (mimeType && MHD_add_response_header(response, "Content-Type", mimeType) != MHD_YES)) {
 		MHD_destroy_response(response);
+		return NULL;
 	}
 	return response;
 }
@@ -187,7 +188,7 @@ static int queueRapResponse(struct MHD_Connection *request, enum RapConstant mID
 	// Get Mime type and date
 	const char * mimeType;
 	if (RAP_FILE_INDEX < messageParts) {
-		mimeType = (char *) message[RAP_FILE_INDEX].iov_base;
+		mimeType = iovecToString(&message[RAP_FILE_INDEX]);
 	} else {
 		mimeType = NULL;
 	}
@@ -199,27 +200,32 @@ static int queueRapResponse(struct MHD_Connection *request, enum RapConstant mID
 	}
 
 	// Queue the response
-
 	switch (mID) {
-	case RAP_SUCCESS_STATIC_DATA_FD: {
-		struct MimeType * found = findMimeType(mimeType);
-		mimeType = found ? found->type : NULL;
+	case RAP_SUCCESS: {
 		struct stat stat;
 		fstat(fd, &stat);
-		struct MHD_Response * response = fdFileContentReaderCreate(stat.st_size, fd, mimeType, date);
+		struct MHD_Response * response;
+		if ((stat.st_mode & S_IFMT) == S_IFREG) {
+			struct MimeType * found = findMimeType(mimeType);
+			mimeType = found ? found->type : NULL;
+			response = fdFileContentReaderCreate(stat.st_size, fd, mimeType, date);
+		} else {
+			response = fdContentReaderCreate(fd, mimeType, date);
+		}
+
+		if (RAP_LOCATION_INDEX
+				< messageParts&& MHD_add_response_header(response, "Location", iovecToString(&message[RAP_LOCATION_INDEX])) != MHD_YES) {
+			MHD_destroy_response(response);
+			queueInternalServerError(request);
+		}
+
 		int ret = MHD_queue_response(request, MHD_HTTP_OK, response);
 		MHD_destroy_response(response);
 		return ret;
 	}
 
-	case RAP_SUCCESS_DYNAMIC_DATA_FD: {
-		struct MimeType * found = findMimeType(mimeType);
-		mimeType = found ? found->type : NULL;
-		struct MHD_Response * response = fdContentReaderCreate(fd, mimeType, date);
-		int ret = MHD_queue_response(request, MHD_HTTP_OK, response);
-		MHD_destroy_response(response);
-		return ret;
-	}
+	case RAP_INTERNAL_ERROR:
+		return queueInternalServerError(request);
 
 	case RAP_ACCESS_DENIED:
 		return queueFileResponse(request, MHD_HTTP_FORBIDDEN, "/usr/share/webdavd/HTTP_FORBIDDEN.html");
@@ -319,7 +325,7 @@ static int createRap(struct MHD_Connection *request, struct RestrictedAccessProc
 	int bufferCount = MAX_BUFFER_PARTS;
 	enum RapConstant responseCode;
 	size_t readResult = recvMessage(processor->socketFd, &responseCode, NULL, &bufferCount, message);
-	if (readResult <= 0 || responseCode != RAP_SUCCESS_STATIC_DATA_FD) {
+	if (readResult <= 0 || responseCode != RAP_SUCCESS) {
 		destroyRap(processor);
 		*newProcessor = NULL;
 		if (readResult < 0) {
@@ -353,6 +359,7 @@ static int acquireRap(struct MHD_Connection *request, struct RestrictedAccessPro
 		return createRap(request, processor, user, password);
 	} else {
 		*processor = NULL;
+		stdLogError(errno, "Rejecting request without auth");
 		return queueAuthRequiredResponse(request);
 	}
 }
@@ -427,6 +434,14 @@ static int completeUpload(struct MHD_Connection *request, struct WriteHandle * w
 	}
 }
 
+static void abortSession(struct WriteHandle * writeHandle, struct RestrictedAccessProcessor * rapSession) {
+	if (writeHandle) {
+		close(writeHandle->fd);
+		writeHandle->failed = 1;
+	}
+	releaseRap(rapSession);
+}
+
 static int processUploadData(struct MHD_Connection * request, const char * upload_data, size_t * upload_data_size,
 		struct WriteHandle * writeHandle) {
 	if (writeHandle->failed) {
@@ -439,9 +454,7 @@ static int processUploadData(struct MHD_Connection * request, const char * uploa
 		// the operation has now failed. There's nothing we can do now but report the error
 		// We will still return MHD_YES and so spool through the data provided
 		// This may not actually be desirable and so we need to consider slamming closed the connection.
-		writeHandle->failed = 1;
-		close(writeHandle->fd);
-		releaseRap(writeHandle->rap);
+		abortSession(writeHandle, writeHandle->rap);
 		return queueFileResponse(request, MHD_HTTP_INSUFFICIENT_STORAGE,
 				"/usr/share/webdavd/HTTP_INSUFFICIENT_STORAGE.html");
 	}
@@ -462,53 +475,55 @@ static int processNewRequest(struct MHD_Connection * request, const char * url, 
 	enum RapConstant mID = selectRAPAction(method);
 	if (mID == 0) {
 		// TODO add "Allow" header
+		stdLogError(0, "Can not cope with method: %s", method);
 		return queueFileResponse(request, MHD_HTTP_METHOD_NOT_ACCEPTABLE,
 				"/usr/share/webdavd/HTTP_METHOD_NOT_SUPPORTED.html");
 	}
 
+	// If we have data to send then create a pipe to pump it through
+	int fd;
+	if (writeHandle) {
+		int pipeEnds[2];
+		if (pipe(pipeEnds)) {
+			stdLogError(errno, "Could not create write pipe");
+			return queueInternalServerError(request);
+		}
+		writeHandle->fd = pipeEnds[PIPE_WRITE];
+		fd = pipeEnds[PIPE_READ];
+		writeHandle->failed = 0;
+		writeHandle->rap = rapSession;
+	} else {
+		fd = -1;
+	}
+
 	// Send the request to the RAP
-	int fd = -1;
 	int messageParts = 2;
 	struct iovec message[MAX_BUFFER_PARTS] = { { .iov_len = strlen(host) + 1, .iov_base = (void *) host }, { .iov_len =
 			strlen(url) + 1, .iov_base = (void *) url } };
 
 	if (sendMessage(rapSession->socketFd, mID, fd, messageParts, message) < 0) {
-		releaseRap(rapSession);
+		abortSession(writeHandle, rapSession);
 		return queueInternalServerError(request);
 	}
 
 	// Get result from RAP
+	messageParts = MAX_BUFFER_PARTS;
 	int readResult = recvMessage(rapSession->socketFd, &mID, &fd, &messageParts, message);
 	if (readResult <= 0) {
 		if (readResult == 0) {
 			stdLogError(0, "RAP closed socket unexpectedly while waiting for response");
 		}
-		releaseRap(rapSession);
+		abortSession(writeHandle, rapSession);
 		return queueInternalServerError(request);
 	}
 
 	if (mID == RAP_CONTINUE) {
-		// Don't queue a response, libmicrohttp will queue a continue response
-		// Instead set up the write handle to continue reading data
-		if (writeHandle) {
-			writeHandle->fd = fd;
-			writeHandle->failed = 0;
-			writeHandle->rap = rapSession;
-		} else {
-			writeHandle = mallocSafe(sizeof(struct WriteHandle));
-			writeHandle->failed = 0;
-			writeHandle->fd = fd;
-			writeHandle->rap = rapSession;
-			return completeUpload(request, writeHandle);
+		if (!writeHandle) {
+			stdLogError(0, "RAP returned RAP_CONTINUE when no data was sent");
 		}
 		return MHD_YES;
 	} else {
-		// We had an immediate response and so we should stop sending data immediately.
-		if (writeHandle && !writeHandle->failed) {
-			close(writeHandle->fd);
-			writeHandle->failed = 1;
-		}
-		releaseRap(rapSession);
+		abortSession(writeHandle, rapSession);
 		return queueRapResponse(request, mID, fd, messageParts, message);
 	}
 }
