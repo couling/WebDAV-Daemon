@@ -63,6 +63,7 @@ int mimeTypeCount = 0;
 
 static struct MHD_Response * INTERNAL_SERVER_ERROR_PAGE;
 static struct MHD_Response * UNAUTHORIZED_PAGE;
+static struct MHD_Response * OPTIONS_PAGE;
 
 ///////////////////////
 // Response Queueing //
@@ -388,24 +389,6 @@ static int filterMainHeaderInfo(struct MainHeaderInfo * mainHeaderInfo, enum MHD
 	return MHD_YES;
 }
 
-static enum RapConstant selectRAPAction(const char * method) {
-	// TODO PUT
-	// TODO PROPFIND
-	// TODO PROPPATCH
-	// TODO MKCOL
-	// TODO HEAD
-	// TODO DELETE
-	// TODO COPY
-	// TODO MOVE
-	// TODO LOCK
-	// TODO UNLOCK
-	// TODO OPTIONS????
-	if (!strcmp("GET", method))
-		return RAP_READ_FILE;
-	else
-		return 0;
-}
-
 static int completeUpload(struct MHD_Connection *request, struct WriteHandle * writeHandle) {
 	if (!writeHandle->failed) {
 		close(writeHandle->fd);
@@ -472,10 +455,29 @@ static int processNewRequest(struct MHD_Connection * request, const char * url, 
 	}
 
 	// Interpret the method
-	enum RapConstant mID = selectRAPAction(method);
-	if (mID == 0) {
+	int messageParts = 2;
+	struct iovec message[MAX_BUFFER_PARTS] = { { .iov_len = strlen(host) + 1, .iov_base = (void *) host }, { .iov_len =
+			strlen(url) + 1, .iov_base = (void *) url } };
+	enum RapConstant mID;
+	// TODO PUT
+	// TODO PROPFIND
+	// TODO PROPPATCH
+	// TODO MKCOL
+	// TODO HEAD
+	// TODO DELETE
+	// TODO COPY
+	// TODO MOVE
+	// TODO LOCK
+	// TODO UNLOCK
+	// TODO OPTIONS????
+	if (!strcmp("GET", method)) {
+		mID = RAP_READ_FILE;
+	} else if (!strcmp("OPTIONS", method)) {
+		releaseRap(rapSession);
+		return MHD_queue_response(request, MHD_HTTP_OK, OPTIONS_PAGE);
+	} else {
 		// TODO add "Allow" header
-		stdLogError(0, "Can not cope with method: %s", method);
+		stdLogError(0, "Can not cope with method: %s (%s data)", method, (writeHandle ? "with" : "without"));
 		return queueFileResponse(request, MHD_HTTP_METHOD_NOT_ACCEPTABLE,
 				"/usr/share/webdavd/HTTP_METHOD_NOT_SUPPORTED.html");
 	}
@@ -497,10 +499,6 @@ static int processNewRequest(struct MHD_Connection * request, const char * url, 
 	}
 
 	// Send the request to the RAP
-	int messageParts = 2;
-	struct iovec message[MAX_BUFFER_PARTS] = { { .iov_len = strlen(host) + 1, .iov_base = (void *) host }, { .iov_len =
-			strlen(url) + 1, .iov_base = (void *) url } };
-
 	if (sendMessage(rapSession->socketFd, mID, fd, messageParts, message) < 0) {
 		abortSession(writeHandle, rapSession);
 		return queueInternalServerError(request);
@@ -702,11 +700,17 @@ static void initializeStaticResponses() {
 		stdLogError(errno, "Could not initialize pages");
 		exit(255);
 	}
+	initializeStaticResponse(&OPTIONS_PAGE, "/usr/share/webdavd/OPTIONS.html");
+	if (MHD_add_response_header(OPTIONS_PAGE, "Dav", "1") != MHD_YES
+			|| MHD_add_response_header(OPTIONS_PAGE, "Allow",
+					"OPTIONS, GET, HEAD, DELETE, PROPFIND, PUT, PROPPATCH, COPY, MOVE, LOCK, UNLOCK") != MHD_YES) {
+
+	}
 }
 
 ////////////////////////
 // End Initialisation //
-////////////////////////
+////////////////////////z
 
 //////////
 // Main //
