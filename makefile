@@ -1,13 +1,14 @@
 -include build/*.d
 
-all: build/webdavd build/rap build/testrap
-
-build/webdavd build/rap build/testrap: shared.c
+all: build/webdavd build/rap
 
 #-O3
 
-build/%: %.c | build
-	gcc -std=gnu99 -Werror -o $@ -g $(filter %.c,$^) -MMD -lmicrohttpd -lpam
+build/webdavd: webdavd.c shared.c | build
+	gcc -std=gnu99 -Werror -o $@ -g $(filter %.c,$^) -MMD -lmicrohttpd
+
+build/rap: rap.c shared.c | build
+	gcc -std=gnu99 -Werror -o $@ -g -I/usr/include/libxml2 $(filter %.c,$^) -MMD -lpam -lxml2
 
 build:
 	mkdir $@

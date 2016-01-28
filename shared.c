@@ -92,6 +92,7 @@ struct MessageHeader {
 };
 
 ssize_t sendMessage(int sock, enum RapConstant mID, int fd, int bufferCount, struct iovec buffer[]) {
+	//stdLog("sendm %d", sock);
 	ssize_t size;
 	struct msghdr msg;
 	char ctrl_buf[CMSG_SPACE(sizeof(int))];
@@ -137,16 +138,14 @@ ssize_t sendMessage(int sock, enum RapConstant mID, int fd, int bufferCount, str
 	return size;
 }
 
-#define INCOMING_BUFFER_SIZE 10239
-
-ssize_t recvMessage(int sock, enum RapConstant * mID, int * fd, int * bufferCount, struct iovec * buffers) {
+ssize_t recvMessage(int sock, enum RapConstant * mID, int * fd, int * bufferCount, struct iovec * buffers,
+		char * incomingBuffer, size_t incomingBufferSize) {
+	//stdLog("recvm %d", sock);
 	ssize_t size;
 	struct msghdr msg;
 	char ctrl_buf[CMSG_SPACE(sizeof(int))];
 	struct iovec iovec[2];
 	int dummyBufferCount = 0;
-	// TODO refactor to remove the need for static
-	static char incomingBuffer[INCOMING_BUFFER_SIZE + 1];
 
 	if (!bufferCount) {
 		bufferCount = &dummyBufferCount;
@@ -159,9 +158,9 @@ ssize_t recvMessage(int sock, enum RapConstant * mID, int * fd, int * bufferCoun
 	msg.msg_control = &ctrl_buf;
 	msg.msg_controllen = sizeof(ctrl_buf);
 	iovec[0].iov_base = incomingBuffer;
-	iovec[0].iov_len = INCOMING_BUFFER_SIZE;
+	iovec[0].iov_len = incomingBufferSize - 1;
 
-	memset(incomingBuffer, 0, INCOMING_BUFFER_SIZE);
+	memset(incomingBuffer, 0, incomingBufferSize);
 
 	size = recvmsg(sock, &msg, MSG_CMSG_CLOEXEC);
 	if (size < 0) {
@@ -190,10 +189,10 @@ ssize_t recvMessage(int sock, enum RapConstant * mID, int * fd, int * bufferCoun
 		*fd = -1;
 	}
 
-	struct MessageHeader * messageHeader = (struct MessageHeader *) (&incomingBuffer);
+	struct MessageHeader * messageHeader = (struct MessageHeader *) (incomingBuffer);
 	if (size < sizeof(struct MessageHeader) || messageHeader->partCount > *bufferCount
 			|| messageHeader->partCount < 0) {
-		stdLogError(0, "Invalid message received");
+		stdLogError(0, "Invalid message received %d %d", messageHeader->partCount, *bufferCount);
 		if (fd || *fd != -1) {
 			close(*fd);
 		}

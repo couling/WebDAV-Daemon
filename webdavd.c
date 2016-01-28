@@ -53,8 +53,13 @@ struct MimeType {
 	const char * type;
 };
 
+struct Header {
+	const char * key;
+	const char * value;
+};
+
 static struct MHD_Daemon **daemons;
-static int daemonPorts[] = { 80 };
+static int daemonPorts[] = { 8080 };
 static int daemonCount = sizeof(daemonPorts) / sizeof(daemonPorts[0]);
 size_t mimeFileBufferSize;
 char * mimeFileBuffer;
@@ -107,10 +112,18 @@ static struct MimeType * findMimeType(const char * file) {
 static ssize_t fdContentReader(int *fd, uint64_t pos, char *buf, size_t max) {
 	size_t bytesRead = read(*fd, buf, max);
 	if (bytesRead < 0) {
+		stdLogError(errno, "Could not read content from fd");
 		return MHD_CONTENT_READER_END_WITH_ERROR;
 	}
 	if (bytesRead == 0) {
 		return MHD_CONTENT_READER_END_OF_STREAM;
+	}
+	while (bytesRead < max) {
+		size_t newBytesRead = read(*fd, buf + bytesRead, max - bytesRead);
+		if (newBytesRead <= 0) {
+			break;
+		}
+		bytesRead += newBytesRead;
 	}
 	return bytesRead;
 }
@@ -269,6 +282,7 @@ static int forkRapProcess(const char * path, int * newSockFd) {
 		close(sockFd[1]);
 		if (result != -1) {
 			*newSockFd = sockFd[0];
+			//stdLog("New RAP %d %d", result, sockFd[0]);
 			return result;
 		} else {
 			// fork failed so close parent pipes and return non-zero
@@ -325,7 +339,9 @@ static int createRap(struct MHD_Connection *request, struct RestrictedAccessProc
 	// TODO implement timeout ... possibly using "select"
 	int bufferCount = MAX_BUFFER_PARTS;
 	enum RapConstant responseCode;
-	size_t readResult = recvMessage(processor->socketFd, &responseCode, NULL, &bufferCount, message);
+	char incomingBuffer[INCOMING_BUFFER_SIZE];
+	size_t readResult = recvMessage(processor->socketFd, &responseCode, NULL, &bufferCount, message, incomingBuffer,
+	INCOMING_BUFFER_SIZE);
 	if (readResult <= 0 || responseCode != RAP_SUCCESS) {
 		destroyRap(processor);
 		*newProcessor = NULL;
@@ -379,6 +395,22 @@ static void cleanupAfterRap(int sig, siginfo_t *siginfo, void *context) {
 // Low Level HTTP handling (Signpost //
 ///////////////////////////////////////
 
+static int filterGetHeader(struct Header * header, enum MHD_ValueKind kind, const char *key, const char *value) {
+	if (!strcmp(key, header->key)) {
+		header->value = value;
+	}
+	return MHD_YES;
+}
+
+static const char * getHeader(struct MHD_Connection *request, const char * headerKey) {
+	struct Header header = { .key = headerKey, .value = NULL };
+	if (MHD_get_connection_values(request, MHD_HEADER_KIND, (MHD_KeyValueIterator) &filterGetHeader, &header) == MHD_YES) {
+		return header.key;
+	} else {
+		return NULL;
+	}
+}
+
 static int filterMainHeaderInfo(struct MainHeaderInfo * mainHeaderInfo, enum MHD_ValueKind kind, const char *key,
 		const char *value) {
 	if (!strcmp(key, "Host")) {
@@ -390,6 +422,7 @@ static int filterMainHeaderInfo(struct MainHeaderInfo * mainHeaderInfo, enum MHD
 }
 
 static int completeUpload(struct MHD_Connection *request, struct WriteHandle * writeHandle) {
+	//stdLog("Upload completed");
 	if (!writeHandle->failed) {
 		close(writeHandle->fd);
 
@@ -397,7 +430,9 @@ static int completeUpload(struct MHD_Connection *request, struct WriteHandle * w
 		int fd;
 		int messageParts = MAX_BUFFER_PARTS;
 		struct iovec message[MAX_BUFFER_PARTS];
-		int readResult = recvMessage(writeHandle->fd, &mID, &fd, &messageParts, message);
+		char incomingBuffer[INCOMING_BUFFER_SIZE];
+		int readResult = recvMessage(writeHandle->rap->socketFd, &mID, &fd, &messageParts, message, incomingBuffer,
+		INCOMING_BUFFER_SIZE);
 		if (readResult <= 0) {
 			if (readResult == 0) {
 				stdLogError(0, "RAP closed socket unexpectedly while waiting for response");
@@ -430,7 +465,7 @@ static int processUploadData(struct MHD_Connection * request, const char * uploa
 	if (writeHandle->failed) {
 		return MHD_YES;
 	}
-
+	size_t ignore = write(STDERR_FILENO, upload_data, *upload_data_size);
 	size_t bytesWritten = write(writeHandle->fd, upload_data, *upload_data_size);
 	if (bytesWritten < *upload_data_size) {
 		// not all data could be written to the file handle and therefore
@@ -440,8 +475,11 @@ static int processUploadData(struct MHD_Connection * request, const char * uploa
 		abortSession(writeHandle, writeHandle->rap);
 		return queueFileResponse(request, MHD_HTTP_INSUFFICIENT_STORAGE,
 				"/usr/share/webdavd/HTTP_INSUFFICIENT_STORAGE.html");
+	} else {
+		*upload_data_size = 0;
+		return MHD_YES;
 	}
-	return MHD_YES;
+
 }
 
 static int processNewRequest(struct MHD_Connection * request, const char * url, const char * host, const char * method,
@@ -456,8 +494,11 @@ static int processNewRequest(struct MHD_Connection * request, const char * url, 
 
 	// Interpret the method
 	int messageParts = 2;
-	struct iovec message[MAX_BUFFER_PARTS] = { { .iov_len = strlen(host) + 1, .iov_base = (void *) host }, { .iov_len =
-			strlen(url) + 1, .iov_base = (void *) url } };
+	struct iovec message[MAX_BUFFER_PARTS];
+	message[RAP_HOST_INDEX].iov_len = strlen(host) + 1;
+	message[RAP_HOST_INDEX].iov_base = (void *) host;
+	message[RAP_FILE_INDEX].iov_len = strlen(url) + 1;
+	message[RAP_FILE_INDEX].iov_base = (void *) url;
 	enum RapConstant mID;
 	// TODO PUT
 	// TODO PROPFIND
@@ -469,17 +510,27 @@ static int processNewRequest(struct MHD_Connection * request, const char * url, 
 	// TODO MOVE
 	// TODO LOCK
 	// TODO UNLOCK
-	stdLog("%s %s data", method, writeHandle ? "with" : "without");
+	//stdLog("%s %s data", method, writeHandle ? "with" : "without");
 	if (!strcmp("GET", method)) {
 		mID = RAP_READ_FILE;
 	} else if (!strcmp("PROPFIND", method)) {
 		mID = RAP_PROPFIND;
+		const char * depth = getHeader(request, "Depth");
+		if (depth) {
+			message[RAP_DEPTH_INDEX].iov_base = (void *) depth;
+			message[RAP_DEPTH_INDEX].iov_len = strlen(depth) + 1;
+		} else {
+			message[RAP_DEPTH_INDEX].iov_base = "";
+			message[RAP_DEPTH_INDEX].iov_len = sizeof("");
+		}
+		messageParts = 3;
 	} else if (!strcmp("OPTIONS", method)) {
 		releaseRap(rapSession);
 		return MHD_queue_response(request, MHD_HTTP_OK, OPTIONS_PAGE);
 	} else {
 		// TODO add "Allow" header
 		stdLogError(0, "Can not cope with method: %s (%s data)", method, (writeHandle ? "with" : "without"));
+		releaseRap(rapSession);
 		return queueFileResponse(request, MHD_HTTP_METHOD_NOT_ACCEPTABLE,
 				"/usr/share/webdavd/HTTP_METHOD_NOT_SUPPORTED.html");
 	}
@@ -508,7 +559,9 @@ static int processNewRequest(struct MHD_Connection * request, const char * url, 
 
 	// Get result from RAP
 	messageParts = MAX_BUFFER_PARTS;
-	int readResult = recvMessage(rapSession->socketFd, &mID, &fd, &messageParts, message);
+	char incomingBuffer[INCOMING_BUFFER_SIZE];
+	int readResult = recvMessage(rapSession->socketFd, &mID, &fd, &messageParts, message, incomingBuffer,
+	INCOMING_BUFFER_SIZE);
 	if (readResult <= 0) {
 		if (readResult == 0) {
 			stdLogError(0, "RAP closed socket unexpectedly while waiting for response");

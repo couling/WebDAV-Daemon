@@ -11,7 +11,7 @@
 #include <sys/stat.h>
 #include <dirent.h>
 #include <security/pam_appl.h>
-// #include <security/openpam.h>	/* for openpam_ttyconv() */
+#include <libxml/xmlreader.h>
 
 #define BUFFER_SIZE 4096
 
@@ -20,64 +20,33 @@ static const char * authenticatedUser;
 
 #define respond(result, fd) sendMessage(STDOUT_FILENO, result, fd, 0, NULL)
 
-/*static ssize_t directoryReader(DIR * directory, uint64_t pos, char *buf, size_t max) {
- struct dirent *dp;
- ssize_t written = 0;
-
- while (written < max - 257 && (dp = readdir(directory)) != NULL) {
- int newlyWritten;
- if (dp->d_name[0] != '.' || (dp->d_name[1] != '\0' && (dp->d_name[1] != '.' || dp->d_name[2] != '\0'))) {
- if (dp->d_type == DT_DIR) {
- newlyWritten = sprintf(buf, "%s/\n", dp->d_name);
- } else {
- newlyWritten = sprintf(buf, "%s\n", dp->d_name);
- }
- written += newlyWritten;
- buf += newlyWritten;
- }
- }
-
- if (written == 0) {
- written = MHD_CONTENT_READER_END_OF_STREAM;
- }
- return written;
- }
-
- static void directoryReaderCleanup(DIR * directory) {
- closedir(directory);
- }
-
- static struct MHD_Response * directoryReaderCreate(size_t size, int fd) {
- DIR * dir = fdopendir(fd);
- if (!dir) {
- close(fd);
- stdLogError(errno, "Could not list directory from fd");
- return NULL;
- }
- struct MHD_Response * response = MHD_create_response_from_callback(-1, 4096,
- (MHD_ContentReaderCallback) &directoryReader, dir,
- (MHD_ContentReaderFreeCallback) & directoryReaderCleanup);
- if (!response) {
- closedir(dir);
- return NULL;
- } else {
- return response;
- }
- }*/
-
 static size_t propfind(int bufferCount, struct iovec * bufferHeaders, int fd) {
+	if (fd == -1) {
+		stdLogError(0, "No body sent in propfind request");
+		return respond(RAP_BAD_REQUEST, -1);
+	}
+
 	int ret = respond(RAP_CONTINUE, -1);
-	if (fd != -1) {
-		char buffer[4096];
-		size_t bytesRead;
-		while ((bytesRead = read(fd, buffer, 4096)) > 0) {
-			write(STDERR_FILENO, buffer, bytesRead);
+
+	stdLog("Reading %d", fd);
+	xmlTextReaderPtr reader = xmlReaderForFd(fd, NULL, NULL, XML_PARSE_NOENT);
+	if (!reader) {
+		stdLogError(0, "could not create reader");
+	}
+	while (xmlTextReaderRead(reader) == 1) {
+		const xmlChar *name, *value;
+		name = xmlTextReaderConstName(reader);
+		if (name == NULL) {
+			name = BAD_CAST
+			"--";
 		}
-		fprintf(stderr, "\n");
+		value = xmlTextReaderConstValue(reader);
+		stdLog("%d %d %s %d %d %s", xmlTextReaderDepth(reader), xmlTextReaderNodeType(reader), name,
+				xmlTextReaderIsEmptyElement(reader), xmlTextReaderHasValue(reader), value);
 	}
-	else  {
-		stdLog("No data");
-	}
+	xmlFreeTextReader(reader);
+	stdLog("finished Reading");
+
 	return respond(RAP_BAD_REQUEST, -1);
 }
 
@@ -277,13 +246,13 @@ static size_t authenticate(int bufferCount, struct iovec * bufferHeaders, int fd
 		return respond(RAP_BAD_REQUEST, -1);
 	}
 
-	char * user = (char *) bufferHeaders[RAP_USER_INDEX].iov_base;
-	char * password = (char *) bufferHeaders[RAP_PASSWORD_INDEX].iov_base;
-	size_t userBufferSize = bufferHeaders[RAP_USER_INDEX].iov_len;
-	user[userBufferSize - 1] = '\0'; // Guarantee a null terminated string
-	password[bufferHeaders[RAP_PASSWORD_INDEX].iov_len - 1] = '\0'; // Guarantee a null terminated string
+	char * user = iovecToString(&bufferHeaders[RAP_USER_INDEX]);
+	char * password = iovecToString(&bufferHeaders[RAP_PASSWORD_INDEX]);
 
-	int authResult;
+	// TODO REMOVE THIS!
+	authenticated = 1;
+	authenticatedUser = "philip";
+	return respond(RAP_SUCCESS, -1);
 	if (pamAuthenticate(user, password)) {
 		//stdLog("Login accepted for %s", user);
 		return respond(RAP_SUCCESS, -1);
@@ -305,7 +274,9 @@ int main(int argCount, char ** args) {
 		bufferCount = MAX_BUFFER_PARTS;
 
 		// Read a message
-		ioResult = recvMessage(STDIN_FILENO, &mID, &incomingFd, &bufferCount, bufferHeaders);
+		char incomingBuffer[INCOMING_BUFFER_SIZE];
+		ioResult = recvMessage(STDIN_FILENO, &mID, &incomingFd, &bufferCount, bufferHeaders, incomingBuffer,
+				INCOMING_BUFFER_SIZE);
 		if (ioResult <= 0) {
 			if (ioResult < 0) {
 				exit(1);
@@ -325,5 +296,7 @@ int main(int argCount, char ** args) {
 		}
 
 	} while (ioResult);
+	close(STDIN_FILENO);
+	close(STDOUT_FILENO);
 	return 0;
 }
