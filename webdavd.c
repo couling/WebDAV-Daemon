@@ -469,9 +469,11 @@ static int processNewRequest(struct MHD_Connection * request, const char * url, 
 	// TODO MOVE
 	// TODO LOCK
 	// TODO UNLOCK
-	// TODO OPTIONS????
+	stdLog("%s %s data", method, writeHandle ? "with" : "without");
 	if (!strcmp("GET", method)) {
 		mID = RAP_READ_FILE;
+	} else if (!strcmp("PROPFIND", method)) {
+		mID = RAP_PROPFIND;
 	} else if (!strcmp("OPTIONS", method)) {
 		releaseRap(rapSession);
 		return MHD_queue_response(request, MHD_HTTP_OK, OPTIONS_PAGE);
@@ -581,20 +583,18 @@ static void initializeDaemin(int port, struct MHD_Daemon **newDaemon) {
 static char * loadFileToBuffer(const char * file, size_t * size) {
 	int fd = open(file, O_RDONLY);
 	struct stat stat;
-	if (fd == -1 || fstat(fd, &stat) || stat.st_size == 0) {
-		if (stat.st_size == 0) {
-			stdLogError(0, "Could not determine size of %s", file);
-		} else {
-			stdLogError(errno, "Could not open file %s", file);
-		}
+	if (fd == -1 || fstat(fd, &stat)) {
+		stdLogError(errno, "Could not open file %s", file);
 		return NULL;
 	}
 	char * buffer = mallocSafe(stat.st_size);
-	size_t bytesRead = read(fd, buffer, stat.st_size);
-	if (bytesRead != stat.st_size) {
-		stdLogError(bytesRead < 0 ? errno : 0, "Could not read whole file %s", MIME_FILE_PATH);
-		free(mimeFileBuffer);
-		return NULL;
+	if (stat.st_size != 0) {
+		size_t bytesRead = read(fd, buffer, stat.st_size);
+		if (bytesRead != stat.st_size) {
+			stdLogError(bytesRead < 0 ? errno : 0, "Could not read whole file %s", MIME_FILE_PATH);
+			free(mimeFileBuffer);
+			return NULL;
+		}
 	}
 	*size = stat.st_size;
 	return buffer;

@@ -65,7 +65,19 @@ static const char * authenticatedUser;
  }
  }*/
 
-static size_t listFolder(int bufferCount, struct iovec * bufferHeaders, int fd) {
+static size_t propfind(int bufferCount, struct iovec * bufferHeaders, int fd) {
+	int ret = respond(RAP_CONTINUE, -1);
+	if (fd != -1) {
+		char buffer[4096];
+		size_t bytesRead;
+		while ((bytesRead = read(fd, buffer, 4096)) > 0) {
+			write(STDERR_FILENO, buffer, bytesRead);
+		}
+		fprintf(stderr, "\n");
+	}
+	else  {
+		stdLog("No data");
+	}
 	return respond(RAP_BAD_REQUEST, -1);
 }
 
@@ -150,8 +162,7 @@ static size_t readFile(int bufferCount, struct iovec * bufferHeaders, int incomi
 					if (dp->d_type == DT_DIR) {
 
 						fprintf(outPipe, "<li><a href=\"%s%s%s/\">%s/</a></li>", file, sep, dp->d_name, dp->d_name);
-					}
-					else {
+					} else {
 						fprintf(outPipe, "<li><a href=\"%s%s%s\">%s</a></li>", file, sep, dp->d_name, dp->d_name);
 					}
 				}
@@ -282,7 +293,7 @@ static size_t authenticate(int bufferCount, struct iovec * bufferHeaders, int fd
 }
 
 typedef size_t (*handlerMethod)(int bufferCount, struct iovec * bufferHeaders, int fd);
-static handlerMethod handlerMethods[] = { authenticate, readFile, writeFile, listFolder };
+static handlerMethod handlerMethods[] = { authenticate, readFile, writeFile, propfind };
 
 int main(int argCount, char ** args) {
 	int bufferCount;
