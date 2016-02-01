@@ -20,34 +20,234 @@ static const char * authenticatedUser;
 
 #define respond(result, fd) sendMessage(STDOUT_FILENO, result, fd, 0, NULL)
 
+/*const char * nodeTypeToName(int nodeType) {
+ switch (nodeType) {
+ case XML_READER_TYPE_NONE:
+ return "XML_READER_TYPE_NONE";
+ case XML_READER_TYPE_ELEMENT:
+ return "XML_READER_TYPE_ELEMENT";
+ case XML_READER_TYPE_ATTRIBUTE:
+ return "XML_READER_TYPE_ATTRIBUTE";
+ case XML_READER_TYPE_TEXT:
+ return "XML_READER_TYPE_TEXT";
+ case XML_READER_TYPE_CDATA:
+ return "XML_READER_TYPE_CDATA";
+ case XML_READER_TYPE_ENTITY_REFERENCE:
+ return "XML_READER_TYPE_ENTITY_REFERENCE";
+ case XML_READER_TYPE_ENTITY:
+ return "XML_READER_TYPE_ENTITY";
+ case XML_READER_TYPE_PROCESSING_INSTRUCTION:
+ return "XML_READER_TYPE_PROCESSING_INSTRUCTION";
+ case XML_READER_TYPE_COMMENT:
+ return "XML_READER_TYPE_COMMENT";
+ case XML_READER_TYPE_DOCUMENT:
+ return "XML_READER_TYPE_DOCUMENT";
+ case XML_READER_TYPE_DOCUMENT_TYPE:
+ return "XML_READER_TYPE_DOCUMENT_TYPE";
+ case XML_READER_TYPE_DOCUMENT_FRAGMENT:
+ return "XML_READER_TYPE_DOCUMENT_FRAGMENT";
+ case XML_READER_TYPE_NOTATION:
+ return "XML_READER_TYPE_NOTATION";
+ case XML_READER_TYPE_WHITESPACE:
+ return "XML_READER_TYPE_WHITESPACE";
+ case XML_READER_TYPE_SIGNIFICANT_WHITESPACE:
+ return "XML_READER_TYPE_SIGNIFICANT_WHITESPACE";
+ case XML_READER_TYPE_END_ELEMENT:
+ return "XML_READER_TYPE_END_ELEMENT";
+ case XML_READER_TYPE_END_ENTITY:
+ return "XML_READER_TYPE_END_ENTITY";
+ case XML_READER_TYPE_XML_DECLARATION:
+ return "XML_READER_TYPE_XML_DECLARATION";
+ default:
+ return NULL;
+ }
+ }*/
+
+static size_t respondWithHeaders(int responseCode, int fd, time_t fileTime, const char * fileName,
+		const char * mimeType, int isDir) {
+	struct iovec message[MAX_BUFFER_PARTS];
+	message[RAP_DATE_INDEX].iov_base = &fileTime;
+	message[RAP_DATE_INDEX].iov_len = sizeof(fileTime);
+	message[RAP_MIME_INDEX].iov_base = (void *) mimeType;
+	message[RAP_MIME_INDEX].iov_len = strlen(mimeType) + 1;
+	size_t fileNameSize = strlen(fileName) + 1;
+	if (fileName[fileNameSize - 2] != '/') {
+		message[RAP_LOCATION_INDEX].iov_base = mallocSafe(fileNameSize + 1);
+		memcpy(message[RAP_LOCATION_INDEX].iov_base, fileName, fileNameSize);
+		((char *) message[RAP_LOCATION_INDEX].iov_base)[fileNameSize - 1] = '/';
+		((char *) message[RAP_LOCATION_INDEX].iov_base)[fileNameSize] = '\0';
+		message[RAP_LOCATION_INDEX].iov_len = fileNameSize + 1;
+	} else {
+		message[RAP_LOCATION_INDEX].iov_base = (void *) fileName;
+		message[RAP_LOCATION_INDEX].iov_len = fileNameSize;
+	}
+	size_t messageResult = sendMessage(STDOUT_FILENO, responseCode, fd, 3, message);
+	if (message[RAP_LOCATION_INDEX].iov_base == fileName) {
+		free(message[RAP_LOCATION_INDEX].iov_base);
+	}
+	return messageResult;
+}
+
+static int stepInto(xmlTextReaderPtr reader) {
+	// Skip all significant white space
+	int result;
+	do {
+		result = xmlTextReaderRead(reader);
+	} while (result && xmlTextReaderNodeType(reader) == XML_READER_TYPE_SIGNIFICANT_WHITESPACE);
+	return result;
+}
+
+static int stepOver(xmlTextReaderPtr reader) {
+	int depth = xmlTextReaderDepth(reader);
+	do {
+		if (!stepInto(reader)) {
+			return 0;
+		}
+	} while (xmlTextReaderDepth(reader) > depth);
+	return 1;
+}
+
+static int elementMatches(xmlTextReaderPtr reader, const char * namespace, const char * nodeName) {
+	return xmlTextReaderNodeType(reader) == XML_READER_TYPE_ELEMENT
+			&& !strcmp(xmlTextReaderConstNamespaceUri(reader), namespace)
+			&& !strcmp(xmlTextReaderConstLocalName(reader), nodeName);
+}
+
+struct PropertySet {
+	char resourceType;
+};
+
+static int parsePropFind(int fd, struct PropertySet * properties) {
+	memset(properties, 0, sizeof(struct PropertySet));
+	xmlTextReaderPtr reader = xmlReaderForFd(fd, NULL, NULL, XML_PARSE_NOENT);
+	int readResult;
+	if (!reader) {
+		stdLogError(0, "could not create xml reader");
+		close(fd);
+		return 0;
+	}
+
+	if (!elementMatches(reader, "DAV:", "propfind")) {
+		stdLogError(0, "Request body was not a propfind document");
+		readResult = 0;
+		goto CLEANUP;
+	}
+
+	readResult = stepInto(reader);
+	while (readResult && xmlTextReaderDepth(reader) > 0 && !elementMatches(reader, "DAV:", "prop")) {
+		stepOver(reader);
+	}
+
+	if (!readResult) {
+		goto CLEANUP;
+	}
+
+	readResult = stepInto(reader);
+	while (readResult && xmlTextReaderDepth(reader) > 1) {
+		if (!strcmp(xmlTextReaderConstNamespaceUri(reader), "DAV:")) {
+			if (!strcmp(xmlTextReaderConstLocalName(reader), "resourcetype")) {
+				properties->resourceType = 1;
+			}
+		}
+		stepOver(reader);
+	}
+
+	if (!readResult) {
+		goto CLEANUP;
+	}
+
+	// finish up
+	while (stepOver(reader))
+		// consume the rest of the input
+		;
+
+	CLEANUP: xmlFreeTextReader(reader);
+	close(fd);
+	return readResult;
+}
+
+static int respondToPropFind(const char * file, const char * host, struct PropertySet * properties, int depth) {
+	struct stat fileStat;
+
+	if (stat(file, &fileStat)) {
+		int e = errno;
+		switch (e) {
+		case EACCES:
+			stdLogError(e, "GET access denied %s %s %s", authenticatedUser, host, file);
+			return respond(RAP_ACCESS_DENIED, -1);
+		case ENOENT:
+		default:
+			stdLogError(e, "GET not found %s %s %s", authenticatedUser, host, file);
+			return respond(RAP_NOT_FOUND, -1);
+		}
+	}
+
+	int pipeEnds[2];
+	if (pipe(pipeEnds)) {
+		stdLogError(errno, "Could not create pipe to write content");
+		return respond(RAP_INTERNAL_ERROR, -1);
+	}
+	time_t fileTime;
+	time(&fileTime);
+
+	size_t messageResult = respondWithHeaders(RAP_MULTISTATUS, pipeEnds[PIPE_READ], fileTime, file, "application/xml",
+			(fileStat.st_mode & S_IFMT) == S_IFDIR);
+
+	if (messageResult <= 0) {
+		close(pipeEnds[PIPE_WRITE]);
+		return messageResult;
+	}
+
+	// We've set up the pipe and sent read end across so now write the result
+	FILE * outPipe = fdopen(pipeEnds[PIPE_WRITE], "w");
+	char * sep = ((fileStat.st_mode & S_IFMT) == S_IFDIR && file[strlen(file) - 1] == '/' ? "" : "/");
+	fprintf(outPipe, "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<d:multistatus xmlns:d=\"DAV:\">");
+	fprintf(outPipe, "</d:multistatus>");
+
+	/*fprintf(outPipe, "<html><head><title>%s%s</title></head><body><h1>%s%s</h1><ul>", file, sep, file, sep);
+	struct dirent * dp;
+	while ((dp = readdir(dir)) != NULL) {
+		if (dp->d_name[0] != '.') {
+			if (dp->d_type == DT_DIR) {
+
+				fprintf(outPipe, "<li><a href=\"%s%s%s/\">%s/</a></li>", file, sep, dp->d_name, dp->d_name);
+			} else {
+				fprintf(outPipe, "<li><a href=\"%s%s%s\">%s</a></li>", file, sep, dp->d_name, dp->d_name);
+			}
+		}
+	}
+	closedir(dir);*/
+	fclose(outPipe);
+	return messageResult;
+
+}
+
 static size_t propfind(int bufferCount, struct iovec * bufferHeaders, int fd) {
 	if (fd == -1) {
 		stdLogError(0, "No body sent in propfind request");
 		return respond(RAP_BAD_REQUEST, -1);
 	}
 
+	if (!authenticated || bufferCount != 3) {
+		if (!authenticated) {
+			stdLogError(0, "Not authenticated RAP");
+		} else {
+			stdLogError(0, "Get request did not provide correct buffers: %d buffer(s)", bufferCount);
+		}
+		close(fd);
+		return respond(RAP_BAD_REQUEST, -1);
+	}
+
 	int ret = respond(RAP_CONTINUE, -1);
 
-	stdLog("Reading %d", fd);
-	xmlTextReaderPtr reader = xmlReaderForFd(fd, NULL, NULL, XML_PARSE_NOENT);
-	if (!reader) {
-		stdLogError(0, "could not create reader");
+	struct PropertySet properties;
+	if (!parsePropFind(fd, &properties)) {
+		return respond(RAP_BAD_REQUEST, -1);
 	}
-	while (xmlTextReaderRead(reader) == 1) {
-		const xmlChar *name, *value;
-		name = xmlTextReaderConstName(reader);
-		if (name == NULL) {
-			name = BAD_CAST
-			"--";
-		}
-		value = xmlTextReaderConstValue(reader);
-		stdLog("%d %d %s %d %d %s", xmlTextReaderDepth(reader), xmlTextReaderNodeType(reader), name,
-				xmlTextReaderIsEmptyElement(reader), xmlTextReaderHasValue(reader), value);
-	}
-	xmlFreeTextReader(reader);
-	stdLog("finished Reading");
 
-	return respond(RAP_BAD_REQUEST, -1);
+	return respondToPropFind(iovecToString(&bufferHeaders[RAP_FILE_INDEX]),
+			iovecToString(&bufferHeaders[RAP_HOST_INDEX]), &properties,
+			*((int *) bufferHeaders[RAP_DEPTH_INDEX].iov_base));
 }
 
 static size_t writeFile(int bufferCount, struct iovec * bufferHeaders, int fd) {
@@ -83,7 +283,6 @@ static size_t readFile(int bufferCount, struct iovec * bufferHeaders, int incomi
 			return respond(RAP_NOT_FOUND, -1);
 		}
 	} else {
-		struct iovec message[2];
 		struct stat statinfo;
 		fstat(fd, &statinfo);
 
@@ -97,23 +296,8 @@ static size_t readFile(int bufferCount, struct iovec * bufferHeaders, int incomi
 
 			time_t fileTime;
 			time(&fileTime);
-			message[RAP_DATE_INDEX].iov_base = &fileTime;
-			message[RAP_DATE_INDEX].iov_len = sizeof(fileTime);
-			message[RAP_FILE_INDEX].iov_base = "text/html";
-			message[RAP_FILE_INDEX].iov_len = sizeof("text/html");
-			size_t fileNameSize = bufferHeaders[RAP_FILE_INDEX].iov_len;
-			message[RAP_LOCATION_INDEX].iov_base = mallocSafe(fileNameSize + 1);
-			memcpy(message[RAP_LOCATION_INDEX].iov_base, file, fileNameSize);
-			if (file[fileNameSize - 2] != '/') {
-				((char *) message[RAP_LOCATION_INDEX].iov_base)[fileNameSize - 1] = '/';
-				((char *) message[RAP_LOCATION_INDEX].iov_base)[fileNameSize] = '\0';
-				message[RAP_LOCATION_INDEX].iov_len = fileNameSize + 1;
-			} else {
-				message[RAP_LOCATION_INDEX].iov_len = fileNameSize;
-			}
 			stdLog("GET dir success %s %s %s", authenticatedUser, host, file);
-			int messageResult = sendMessage(STDOUT_FILENO, RAP_SUCCESS, pipeEnds[PIPE_READ], 3, message);
-			free(message[RAP_LOCATION_INDEX].iov_base);
+			size_t messageResult = respondWithHeaders(RAP_SUCCESS, pipeEnds[PIPE_READ], fileTime, file, "text/html", 1);
 			if (messageResult <= 0) {
 				close(fd);
 				close(pipeEnds[PIPE_WRITE]);
@@ -123,13 +307,12 @@ static size_t readFile(int bufferCount, struct iovec * bufferHeaders, int incomi
 			// We've set up the pipe and sent read end across so now write the result
 			DIR * dir = fdopendir(fd);
 			FILE * outPipe = fdopen(pipeEnds[PIPE_WRITE], "w");
-			char * sep = (file[fileNameSize - 2] == '/' ? "" : "/");
+			char * sep = (file[strlen(file) - 1] == '/' ? "" : "/");
 			fprintf(outPipe, "<html><head><title>%s%s</title></head><body><h1>%s%s</h1><ul>", file, sep, file, sep);
 			struct dirent * dp;
 			while ((dp = readdir(dir)) != NULL) {
 				if (dp->d_name[0] != '.') {
 					if (dp->d_type == DT_DIR) {
-
 						fprintf(outPipe, "<li><a href=\"%s%s%s/\">%s/</a></li>", file, sep, dp->d_name, dp->d_name);
 					} else {
 						fprintf(outPipe, "<li><a href=\"%s%s%s\">%s</a></li>", file, sep, dp->d_name, dp->d_name);
@@ -141,14 +324,8 @@ static size_t readFile(int bufferCount, struct iovec * bufferHeaders, int incomi
 			fclose(outPipe);
 			return messageResult;
 		} else {
-			message[RAP_DATE_INDEX].iov_base = &statinfo.st_mtime;
-			message[RAP_DATE_INDEX].iov_len = sizeof(statinfo.st_mtime);
-			message[RAP_FILE_INDEX].iov_base = file;
-			message[RAP_FILE_INDEX].iov_len = strlen(file) + 1;
-			message[RAP_LOCATION_INDEX].iov_base = bufferHeaders[RAP_FILE_INDEX].iov_base;
-			message[RAP_LOCATION_INDEX].iov_len = bufferHeaders[RAP_FILE_INDEX].iov_len;
 			stdLog("GET success %s %s %s", authenticatedUser, host, file);
-			return sendMessage(STDOUT_FILENO, RAP_SUCCESS, fd, 2, message);
+			return respondWithHeaders(RAP_SUCCESS, fd, statinfo.st_mtime, file, "", 0);
 		}
 	}
 }
@@ -276,7 +453,7 @@ int main(int argCount, char ** args) {
 		// Read a message
 		char incomingBuffer[INCOMING_BUFFER_SIZE];
 		ioResult = recvMessage(STDIN_FILENO, &mID, &incomingFd, &bufferCount, bufferHeaders, incomingBuffer,
-				INCOMING_BUFFER_SIZE);
+		INCOMING_BUFFER_SIZE);
 		if (ioResult <= 0) {
 			if (ioResult < 0) {
 				exit(1);

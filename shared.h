@@ -12,6 +12,7 @@ enum RapConstant {
 	RAP_PROPFIND,
 
 	RAP_SUCCESS,
+	RAP_MULTISTATUS,
 	RAP_CONTINUE,
 	RAP_NOT_FOUND,
 	RAP_ACCESS_DENIED,
@@ -33,11 +34,13 @@ enum RapConstant {
 #define RAP_DEPTH_INDEX 2
 
 #define RAP_DATE_INDEX     0
-#define RAP_FILE_INDEX     1
+#define RAP_MIME_INDEX     1
 #define RAP_LOCATION_INDEX 2
 
 #define PIPE_READ      0
 #define PIPE_WRITE     1
+
+#define WEBDAV_NAMESPACE "DAV:"
 
 void * mallocSafe(size_t size);
 void * reallocSafe(void * mem, size_t newSize);

@@ -424,6 +424,8 @@ static int filterMainHeaderInfo(struct MainHeaderInfo * mainHeaderInfo, enum MHD
 static int completeUpload(struct MHD_Connection *request, struct WriteHandle * writeHandle) {
 	//stdLog("Upload completed");
 	if (!writeHandle->failed) {
+		char a='\n';
+		size_t ignore = write(STDERR_FILENO, &a, 1);
 		close(writeHandle->fd);
 
 		enum RapConstant mID;
