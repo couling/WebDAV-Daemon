@@ -98,12 +98,13 @@ static int parsePropFind(int fd, struct PropertySet * properties) {
 	memset(properties, 0, sizeof(struct PropertySet));
 	xmlTextReaderPtr reader = xmlReaderForFd(fd, NULL, NULL, XML_PARSE_NOENT);
 	int readResult;
-	if (!reader) {
+	if (!reader /*|| !stepInto(reader)*/) {
 		stdLogError(0, "could not create xml reader");
 		close(fd);
 		return 0;
 	}
 
+	stdLog("%s %s", xmlTextReaderConstNamespaceUri(reader), xmlTextReaderConstLocalName(reader));
 	if (!elementMatches(reader, "DAV:", "propfind")) {
 		stdLogError(0, "Request body was not a propfind document");
 		readResult = 0;
@@ -162,6 +163,7 @@ static void writePropFindResponsePart(const char * fileName, struct PropertySet 
 }
 
 static int respondToPropFind(const char * file, const char * host, struct PropertySet * properties, int depth) {
+	stdLog("propfind respnd");
 	struct stat fileStat;
 
 	if (stat(file, &fileStat)) {
@@ -251,7 +253,7 @@ static int respondToPropFind(const char * file, const char * host, struct Proper
 static size_t propfind(int bufferCount, struct iovec * bufferHeaders, int fd) {
 	if (fd == -1) {
 		stdLogError(0, "No body sent in propfind request");
-		return respond(RAP_BAD_REQUEST, -1);
+		return respond(RAP_BAD_RAP_REQUEST, -1);
 	}
 
 	if (!authenticated || bufferCount != 3) {
@@ -261,14 +263,15 @@ static size_t propfind(int bufferCount, struct iovec * bufferHeaders, int fd) {
 			stdLogError(0, "Get request did not provide correct buffers: %d buffer(s)", bufferCount);
 		}
 		close(fd);
-		return respond(RAP_BAD_REQUEST, -1);
+		return respond(RAP_BAD_RAP_REQUEST, -1);
 	}
 
 	int ret = respond(RAP_CONTINUE, -1);
 
 	struct PropertySet properties;
 	if (!parsePropFind(fd, &properties)) {
-		return respond(RAP_BAD_REQUEST, -1);
+		stdLog("responding bad request");
+		return respond(RAP_BAD_RAP_REQUEST, -1);
 	}
 
 	return respondToPropFind(iovecToString(&bufferHeaders[RAP_FILE_INDEX]),
@@ -277,7 +280,7 @@ static size_t propfind(int bufferCount, struct iovec * bufferHeaders, int fd) {
 }
 
 static size_t writeFile(int bufferCount, struct iovec * bufferHeaders, int fd) {
-	return respond(RAP_BAD_REQUEST, -1);
+	return respond(RAP_BAD_RAP_REQUEST, -1);
 }
 
 static size_t readFile(int bufferCount, struct iovec * bufferHeaders, int incomingFd) {
@@ -291,7 +294,7 @@ static size_t readFile(int bufferCount, struct iovec * bufferHeaders, int incomi
 		} else {
 			stdLogError(0, "Get request did not provide correct buffers: %d buffer(s)", bufferCount);
 		}
-		return respond(RAP_BAD_REQUEST, -1);
+		return respond(RAP_BAD_RAP_REQUEST, -1);
 	}
 
 	char * host = iovecToString(&bufferHeaders[RAP_HOST_INDEX]);
@@ -329,8 +332,8 @@ static size_t readFile(int bufferCount, struct iovec * bufferHeaders, int incomi
 			message[RAP_DATE_INDEX].iov_len = sizeof(fileTime);
 			message[RAP_MIME_INDEX].iov_base = "text/html";
 			message[RAP_MIME_INDEX].iov_len = sizeof("text/html");
-			message[RAP_LOCATION_INDEX] = bufferHeaders[RAP_HOST_INDEX];
-			size_t messageResult = sendMessage(STDOUT_FILENO, RAP_SUCCESS, fd, 2, message);
+			message[RAP_LOCATION_INDEX] = bufferHeaders[RAP_FILE_INDEX];
+			size_t messageResult = sendMessage(STDOUT_FILENO, RAP_SUCCESS, pipeEnds[PIPE_READ], 3, message);
 			if (messageResult <= 0) {
 				close(fd);
 				close(pipeEnds[PIPE_WRITE]);
@@ -361,10 +364,10 @@ static size_t readFile(int bufferCount, struct iovec * bufferHeaders, int incomi
 			struct iovec message[MAX_BUFFER_PARTS];
 			message[RAP_DATE_INDEX].iov_base = &statinfo.st_mtime;
 			message[RAP_DATE_INDEX].iov_len = sizeof(statinfo.st_mtime);
-			message[RAP_MIME_INDEX].iov_base = "text/html";
-			message[RAP_MIME_INDEX].iov_len = sizeof("text/html");
-			message[RAP_LOCATION_INDEX] = bufferHeaders[RAP_HOST_INDEX];
-			return sendMessage(STDOUT_FILENO, RAP_SUCCESS, fd, 2, message);
+			message[RAP_MIME_INDEX].iov_base = "";
+			message[RAP_MIME_INDEX].iov_len = sizeof("");
+			message[RAP_LOCATION_INDEX] = bufferHeaders[RAP_FILE_INDEX];
+			return sendMessage(STDOUT_FILENO, RAP_SUCCESS, fd, 3, message);
 		}
 	}
 }
@@ -459,7 +462,7 @@ static size_t authenticate(int bufferCount, struct iovec * bufferHeaders, int fd
 		} else {
 			stdLogError(0, "Login did not provide both user and password and gave %d buffer(s)", bufferCount);
 		}
-		return respond(RAP_BAD_REQUEST, -1);
+		return respond(RAP_BAD_RAP_REQUEST, -1);
 	}
 
 	char * user = iovecToString(&bufferHeaders[RAP_USER_INDEX]);
@@ -503,7 +506,7 @@ int main(int argCount, char ** args) {
 
 		// Handle the message
 		if (mID > RAP_MAX_REQUEST || mID < RAP_MIN_REQUEST) {
-			ioResult = respond(RAP_BAD_REQUEST, -1);
+			ioResult = respond(RAP_BAD_RAP_REQUEST, -1);
 			continue;
 		}
 		ioResult = handlerMethods[mID - RAP_MIN_REQUEST](bufferCount, bufferHeaders, incomingFd);

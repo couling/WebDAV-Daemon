@@ -193,14 +193,16 @@ static int queueFileResponse(struct MHD_Connection *request, int responseCode, c
 static int queueRapResponse(struct MHD_Connection *request, enum RapConstant mID, int fd, int messageParts,
 		struct iovec * message) {
 
-	// Get Mime type and date
-	const char * mimeType = iovecToString(&message[RAP_FILE_INDEX]);
-	time_t date = *((time_t *) message[RAP_DATE_INDEX].iov_base);
-	const char * location = iovecToString(&message[RAP_LOCATION_INDEX]);
-
 	// Queue the response
+	stdLog("queueRapResponse %d", (int) mID);
 	switch (mID) {
+	case RAP_MULTISTATUS:
 	case RAP_SUCCESS: {
+		// Get Mime type and date
+		const char * mimeType = iovecToString(&message[RAP_FILE_INDEX]);
+		time_t date = *((time_t *) message[RAP_DATE_INDEX].iov_base);
+		const char * location = iovecToString(&message[RAP_LOCATION_INDEX]);
+
 		struct stat stat;
 		fstat(fd, &stat);
 		struct MHD_Response * response;
@@ -212,12 +214,12 @@ static int queueRapResponse(struct MHD_Connection *request, enum RapConstant mID
 			response = fdContentReaderCreate(fd, mimeType, date);
 		}
 
-		if (MHD_add_response_header(response, "Location", location)) {
+		if (!MHD_add_response_header(response, "Location", location)) {
 			MHD_destroy_response(response);
 			queueInternalServerError(request);
 		}
 
-		int ret = MHD_queue_response(request, MHD_HTTP_OK, response);
+		int ret = MHD_queue_response(request, (mID == RAP_SUCCESS ? MHD_HTTP_OK : 207), response);
 		MHD_destroy_response(response);
 		return ret;
 	}
@@ -231,7 +233,10 @@ static int queueRapResponse(struct MHD_Connection *request, enum RapConstant mID
 	case RAP_NOT_FOUND:
 		return queueFileResponse(request, MHD_HTTP_NOT_FOUND, "/usr/share/webdavd/HTTP_NOT_FOUND.html");
 
-	case RAP_BAD_REQUEST:
+	case RAP_BAD_CLIENT_REQUEST:
+		return queueFileResponse(request, MHD_HTTP_BAD_REQUEST, "/usr/share/webdavd/HTTP_BAD_REQUEST.html");
+
+	case RAP_BAD_RAP_REQUEST:
 		stdLogError(0, "RAP reported bad request");
 		return queueInternalServerError(request);
 
@@ -368,7 +373,7 @@ static int acquireRap(struct MHD_Connection *request, struct RestrictedAccessPro
 static void cleanupAfterRap(int sig, siginfo_t *siginfo, void *context) {
 	int status;
 	waitpid(siginfo->si_pid, &status, 0);
-	//stdLog("Child finished PID: %d staus: %d", siginfo->si_pid, status);
+	stdLog("Child finished PID: %d staus: %d", siginfo->si_pid, status);
 }
 
 ////////////////////////
@@ -406,12 +411,11 @@ static int filterMainHeaderInfo(struct MainHeaderInfo * mainHeaderInfo, enum MHD
 }
 
 static int completeUpload(struct MHD_Connection *request, struct WriteHandle * writeHandle) {
-	//stdLog("Upload completed");
 	if (!writeHandle->failed) {
 		char a = '\n';
 		size_t ignore = write(STDERR_FILENO, &a, 1);
-		close(writeHandle->fd);
 
+		close(writeHandle->fd);
 		enum RapConstant mID;
 		int fd;
 		int messageParts = MAX_BUFFER_PARTS;
@@ -433,6 +437,7 @@ static int completeUpload(struct MHD_Connection *request, struct WriteHandle * w
 			return queueInternalServerError(request);
 		}
 	} else {
+		stdLog("M");
 		free(writeHandle);
 		return MHD_YES;
 	}
@@ -487,7 +492,6 @@ static int processNewRequest(struct MHD_Connection * request, const char * url, 
 	message[RAP_FILE_INDEX].iov_base = (void *) url;
 	enum RapConstant mID;
 	// TODO PUT
-	// TODO PROPFIND
 	// TODO PROPPATCH
 	// TODO MKCOL
 	// TODO HEAD
