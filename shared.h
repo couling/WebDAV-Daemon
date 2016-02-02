@@ -53,4 +53,5 @@ void stdLogError(int errorNumber, const char * str, ...);
 ssize_t sendMessage(int sock, enum RapConstant mID, int fd, int bufferCount, struct iovec buffer[]);
 ssize_t recvMessage(int sock, enum RapConstant * mID, int * fd, int * bufferCount, struct iovec * buffers, char * incomingBuffer, size_t incomingBufferSize);
 char * iovecToString(struct iovec * iovec);
+size_t getWebDate(time_t rawtime, char * buf, size_t bufSize);
 #endif

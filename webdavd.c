@@ -81,11 +81,6 @@ static int compareExt(const void * a, const void * b) {
 	return strcmp(((struct MimeType *) a)->ext, ((struct MimeType *) b)->ext);
 }
 
-static size_t getWebDate(time_t rawtime, char * buf, size_t bufSize) {
-	struct tm * timeinfo = localtime(&rawtime);
-	return strftime(buf, bufSize, "%a, %d %b %Y %H:%M:%S %Z", timeinfo);
-}
-
 static struct MimeType * findMimeType(const char * file) {
 	if (!file) {
 		return NULL;
@@ -131,7 +126,6 @@ static ssize_t fdContentReader(int *fd, uint64_t pos, char *buf, size_t max) {
 static void fdContentReaderCleanup(int *fd) {
 	close(*fd);
 	free(fd);
-	void *MHD_ContentReaderFreeCallback(void *cls);
 }
 
 static struct MHD_Response * fdContentReaderCreate(int fd, const char * mimeType, time_t date) {
@@ -139,7 +133,7 @@ static struct MHD_Response * fdContentReaderCreate(int fd, const char * mimeType
 	*fdAllocated = fd;
 	struct MHD_Response * response = MHD_create_response_from_callback(-1, 4096,
 			(MHD_ContentReaderCallback) &fdContentReader, fdAllocated,
-			(MHD_ContentReaderFreeCallback) & fdContentReaderCleanup);
+			(MHD_ContentReaderFreeCallback) &fdContentReaderCleanup);
 	if (!response) {
 		free(fdAllocated);
 		return NULL;
@@ -200,18 +194,9 @@ static int queueRapResponse(struct MHD_Connection *request, enum RapConstant mID
 		struct iovec * message) {
 
 	// Get Mime type and date
-	const char * mimeType;
-	if (RAP_FILE_INDEX < messageParts) {
-		mimeType = iovecToString(&message[RAP_FILE_INDEX]);
-	} else {
-		mimeType = NULL;
-	}
-	time_t date;
-	if (RAP_DATE_INDEX < messageParts) {
-		date = *((time_t *) message[RAP_DATE_INDEX].iov_base);
-	} else {
-		time(&date);
-	}
+	const char * mimeType = iovecToString(&message[RAP_FILE_INDEX]);
+	time_t date = *((time_t *) message[RAP_DATE_INDEX].iov_base);
+	const char * location = iovecToString(&message[RAP_LOCATION_INDEX]);
 
 	// Queue the response
 	switch (mID) {
@@ -220,15 +205,14 @@ static int queueRapResponse(struct MHD_Connection *request, enum RapConstant mID
 		fstat(fd, &stat);
 		struct MHD_Response * response;
 		if ((stat.st_mode & S_IFMT) == S_IFREG) {
-			struct MimeType * found = findMimeType(mimeType);
+			struct MimeType * found = findMimeType(location);
 			mimeType = found ? found->type : NULL;
 			response = fdFileContentReaderCreate(stat.st_size, fd, mimeType, date);
 		} else {
 			response = fdContentReaderCreate(fd, mimeType, date);
 		}
 
-		if (RAP_LOCATION_INDEX
-				< messageParts&& MHD_add_response_header(response, "Location", iovecToString(&message[RAP_LOCATION_INDEX])) != MHD_YES) {
+		if (MHD_add_response_header(response, "Location", location)) {
 			MHD_destroy_response(response);
 			queueInternalServerError(request);
 		}
@@ -424,7 +408,7 @@ static int filterMainHeaderInfo(struct MainHeaderInfo * mainHeaderInfo, enum MHD
 static int completeUpload(struct MHD_Connection *request, struct WriteHandle * writeHandle) {
 	//stdLog("Upload completed");
 	if (!writeHandle->failed) {
-		char a='\n';
+		char a = '\n';
 		size_t ignore = write(STDERR_FILENO, &a, 1);
 		close(writeHandle->fd);
 

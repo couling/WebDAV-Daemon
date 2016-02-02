@@ -18,8 +18,6 @@
 static int authenticated = 0;
 static const char * authenticatedUser;
 
-#define respond(result, fd) sendMessage(STDOUT_FILENO, result, fd, 0, NULL)
-
 /*const char * nodeTypeToName(int nodeType) {
  switch (nodeType) {
  case XML_READER_TYPE_NONE:
@@ -63,29 +61,8 @@ static const char * authenticatedUser;
  }
  }*/
 
-static size_t respondWithHeaders(int responseCode, int fd, time_t fileTime, const char * fileName,
-		const char * mimeType, int isDir) {
-	struct iovec message[MAX_BUFFER_PARTS];
-	message[RAP_DATE_INDEX].iov_base = &fileTime;
-	message[RAP_DATE_INDEX].iov_len = sizeof(fileTime);
-	message[RAP_MIME_INDEX].iov_base = (void *) mimeType;
-	message[RAP_MIME_INDEX].iov_len = strlen(mimeType) + 1;
-	size_t fileNameSize = strlen(fileName) + 1;
-	if (fileName[fileNameSize - 2] != '/') {
-		message[RAP_LOCATION_INDEX].iov_base = mallocSafe(fileNameSize + 1);
-		memcpy(message[RAP_LOCATION_INDEX].iov_base, fileName, fileNameSize);
-		((char *) message[RAP_LOCATION_INDEX].iov_base)[fileNameSize - 1] = '/';
-		((char *) message[RAP_LOCATION_INDEX].iov_base)[fileNameSize] = '\0';
-		message[RAP_LOCATION_INDEX].iov_len = fileNameSize + 1;
-	} else {
-		message[RAP_LOCATION_INDEX].iov_base = (void *) fileName;
-		message[RAP_LOCATION_INDEX].iov_len = fileNameSize;
-	}
-	size_t messageResult = sendMessage(STDOUT_FILENO, responseCode, fd, 3, message);
-	if (message[RAP_LOCATION_INDEX].iov_base == fileName) {
-		free(message[RAP_LOCATION_INDEX].iov_base);
-	}
-	return messageResult;
+static size_t respond(enum RapConstant result, int fd) {
+	return sendMessage(STDOUT_FILENO, result, fd, 0, NULL);
 }
 
 static int stepInto(xmlTextReaderPtr reader) {
@@ -99,12 +76,12 @@ static int stepInto(xmlTextReaderPtr reader) {
 
 static int stepOver(xmlTextReaderPtr reader) {
 	int depth = xmlTextReaderDepth(reader);
+	int result;
 	do {
-		if (!stepInto(reader)) {
-			return 0;
-		}
-	} while (xmlTextReaderDepth(reader) > depth);
-	return 1;
+		result = xmlTextReaderRead(reader);
+	} while (result && xmlTextReaderDepth(reader) > depth
+			&& xmlTextReaderNodeType(reader) == XML_READER_TYPE_SIGNIFICANT_WHITESPACE);
+	return result;
 }
 
 static int elementMatches(xmlTextReaderPtr reader, const char * namespace, const char * nodeName) {
@@ -161,9 +138,27 @@ static int parsePropFind(int fd, struct PropertySet * properties) {
 		// consume the rest of the input
 		;
 
-	CLEANUP: xmlFreeTextReader(reader);
+	CLEANUP:
+
+	xmlFreeTextReader(reader);
 	close(fd);
 	return readResult;
+}
+
+static void writePropFindResponsePart(const char * fileName, struct PropertySet * properties, struct stat * fileStat,
+		FILE * writeHandle) {
+	fprintf(writeHandle, "<d:response><d:href>%s</d:href><d:propstat><d:prop>", fileName);
+	if (properties->resourceType) {
+		if ((fileStat->st_mode & S_IFMT) == S_IFDIR) {
+			fprintf(writeHandle, "<d:resourcetype><d:collection /></d:resourcetype>");
+		} else {
+			fprintf(writeHandle, "<d:resourcetype></d:resourcetype>");
+		}
+	}
+	fprintf(writeHandle, "</d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>");
+
+	//<d:getetag>"56a341a7873fd"</d:getetag>
+	//<d:getlastmodified>Sat, 23 Jan 2016 09:02:31 GMT</d:getlastmodified>
 }
 
 static int respondToPropFind(const char * file, const char * host, struct PropertySet * properties, int depth) {
@@ -187,37 +182,68 @@ static int respondToPropFind(const char * file, const char * host, struct Proper
 		stdLogError(errno, "Could not create pipe to write content");
 		return respond(RAP_INTERNAL_ERROR, -1);
 	}
+
+	char * filePath;
+	size_t filePathSize = strlen(file);
+	if ((fileStat.st_mode & S_IFMT) == S_IFDIR && file[filePathSize - 1] != '/') {
+		filePath = mallocSafe(filePathSize + 2);
+		memcpy(filePath, file, filePathSize);
+		filePath[filePathSize - 2] = '/';
+		filePath[filePathSize - 1] = '\0';
+		filePathSize++;
+	}
+
 	time_t fileTime;
 	time(&fileTime);
-
-	size_t messageResult = respondWithHeaders(RAP_MULTISTATUS, pipeEnds[PIPE_READ], fileTime, file, "application/xml",
-			(fileStat.st_mode & S_IFMT) == S_IFDIR);
-
+	struct iovec message[MAX_BUFFER_PARTS];
+	message[RAP_DATE_INDEX].iov_base = &fileTime;
+	message[RAP_DATE_INDEX].iov_len = sizeof(fileTime);
+	message[RAP_MIME_INDEX].iov_base = "application/xml";
+	message[RAP_MIME_INDEX].iov_len = sizeof("application/xml");
+	message[RAP_LOCATION_INDEX].iov_base = filePath;
+	message[RAP_LOCATION_INDEX].iov_len = filePathSize + 1;
+	size_t messageResult = sendMessage(STDOUT_FILENO, RAP_MULTISTATUS, pipeEnds[PIPE_READ], 2, message);
 	if (messageResult <= 0) {
+		if (filePath != file) {
+			free(filePath);
+		}
 		close(pipeEnds[PIPE_WRITE]);
 		return messageResult;
 	}
 
 	// We've set up the pipe and sent read end across so now write the result
 	FILE * outPipe = fdopen(pipeEnds[PIPE_WRITE], "w");
-	char * sep = ((fileStat.st_mode & S_IFMT) == S_IFDIR && file[strlen(file) - 1] == '/' ? "" : "/");
+	DIR * dir;
 	fprintf(outPipe, "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<d:multistatus xmlns:d=\"DAV:\">");
-	fprintf(outPipe, "</d:multistatus>");
-
-	/*fprintf(outPipe, "<html><head><title>%s%s</title></head><body><h1>%s%s</h1><ul>", file, sep, file, sep);
-	struct dirent * dp;
-	while ((dp = readdir(dir)) != NULL) {
-		if (dp->d_name[0] != '.') {
-			if (dp->d_type == DT_DIR) {
-
-				fprintf(outPipe, "<li><a href=\"%s%s%s/\">%s/</a></li>", file, sep, dp->d_name, dp->d_name);
-			} else {
-				fprintf(outPipe, "<li><a href=\"%s%s%s\">%s</a></li>", file, sep, dp->d_name, dp->d_name);
+	writePropFindResponsePart(filePath, properties, &fileStat, outPipe);
+	if (depth > 1 && (fileStat.st_mode & S_IFMT) == S_IFDIR && (dir = opendir(filePath))) {
+		struct dirent * dp;
+		char * childFileName = mallocSafe(filePathSize + 257);
+		size_t maxSize = 255;
+		strcpy(childFileName, filePath);
+		while ((dp = readdir(dir)) != NULL) {
+			if (dp->d_name[0] != '.' || (dp->d_name[1] != '\0' && dp->d_name[1] != '.') || dp->d_name[2] != '\0') {
+				size_t nameSize = strlen(dp->d_name);
+				if (nameSize > maxSize) {
+					childFileName = reallocSafe(childFileName, filePathSize + nameSize + 2);
+					maxSize = nameSize;
+				}
+				strcpy(childFileName + filePathSize, dp->d_name);
+				if (!stat(childFileName, &fileStat)) {
+					if ((fileStat.st_mode & S_IFMT) == S_IFDIR && childFileName[filePathSize + nameSize - 1] != '/') {
+						childFileName[filePathSize + nameSize] = '\0';
+					}
+					writePropFindResponsePart(childFileName, properties, &fileStat, outPipe);
+				}
 			}
 		}
+		free(childFileName);
 	}
-	closedir(dir);*/
+	fprintf(outPipe, "</d:multistatus>");
 	fclose(outPipe);
+	if (filePath != file) {
+		free(filePath);
+	}
 	return messageResult;
 
 }
@@ -297,7 +323,14 @@ static size_t readFile(int bufferCount, struct iovec * bufferHeaders, int incomi
 			time_t fileTime;
 			time(&fileTime);
 			stdLog("GET dir success %s %s %s", authenticatedUser, host, file);
-			size_t messageResult = respondWithHeaders(RAP_SUCCESS, pipeEnds[PIPE_READ], fileTime, file, "text/html", 1);
+
+			struct iovec message[MAX_BUFFER_PARTS];
+			message[RAP_DATE_INDEX].iov_base = &fileTime;
+			message[RAP_DATE_INDEX].iov_len = sizeof(fileTime);
+			message[RAP_MIME_INDEX].iov_base = "text/html";
+			message[RAP_MIME_INDEX].iov_len = sizeof("text/html");
+			message[RAP_LOCATION_INDEX] = bufferHeaders[RAP_HOST_INDEX];
+			size_t messageResult = sendMessage(STDOUT_FILENO, RAP_SUCCESS, fd, 2, message);
 			if (messageResult <= 0) {
 				close(fd);
 				close(pipeEnds[PIPE_WRITE]);
@@ -325,7 +358,13 @@ static size_t readFile(int bufferCount, struct iovec * bufferHeaders, int incomi
 			return messageResult;
 		} else {
 			stdLog("GET success %s %s %s", authenticatedUser, host, file);
-			return respondWithHeaders(RAP_SUCCESS, fd, statinfo.st_mtime, file, "", 0);
+			struct iovec message[MAX_BUFFER_PARTS];
+			message[RAP_DATE_INDEX].iov_base = &statinfo.st_mtime;
+			message[RAP_DATE_INDEX].iov_len = sizeof(statinfo.st_mtime);
+			message[RAP_MIME_INDEX].iov_base = "text/html";
+			message[RAP_MIME_INDEX].iov_len = sizeof("text/html");
+			message[RAP_LOCATION_INDEX] = bufferHeaders[RAP_HOST_INDEX];
+			return sendMessage(STDOUT_FILENO, RAP_SUCCESS, fd, 2, message);
 		}
 	}
 }

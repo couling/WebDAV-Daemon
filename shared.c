@@ -223,3 +223,9 @@ char * iovecToString(struct iovec * iovec) {
 	buffer[iovec->iov_len - 1] = '\0';
 	return buffer;
 }
+
+size_t getWebDate(time_t rawtime, char * buf, size_t bufSize) {
+	struct tm * timeinfo = localtime(&rawtime);
+	return strftime(buf, bufSize, "%a, %d %b %Y %H:%M:%S %Z", timeinfo);
+}
+
