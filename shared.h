@@ -51,8 +51,16 @@ void stdLogError(int errorNumber, const char * str, ...);
 
 #define MAX_BUFFER_PARTS 3
 #define INCOMING_BUFFER_SIZE 4096
-ssize_t sendMessage(int sock, enum RapConstant mID, int fd, int bufferCount, struct iovec buffer[]);
-ssize_t recvMessage(int sock, enum RapConstant * mID, int * fd, int * bufferCount, struct iovec * buffers, char * incomingBuffer, size_t incomingBufferSize);
+
+struct Message {
+	enum RapConstant mID;
+	int fd;
+	int bufferCount;
+	struct iovec buffers[MAX_BUFFER_PARTS];
+};
+
+ssize_t sendMessage(int sock, struct Message * message);
+ssize_t recvMessage(int sock, struct Message * message, char * incomingBuffer, size_t incomingBufferSize);
 char * iovecToString(struct iovec * iovec);
 size_t getWebDate(time_t rawtime, char * buf, size_t bufSize);
 #endif

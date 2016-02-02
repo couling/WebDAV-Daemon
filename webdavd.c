@@ -77,6 +77,17 @@ static struct MHD_Response * OPTIONS_PAGE;
 #define queueAuthRequiredResponse(request) ( MHD_queue_response(request, MHD_HTTP_UNAUTHORIZED, UNAUTHORIZED_PAGE) )
 #define queueInternalServerError(request) ( MHD_queue_response(request, MHD_HTTP_INTERNAL_SERVER_ERROR, INTERNAL_SERVER_ERROR_PAGE) )
 
+static void addHeaderSafe(struct MHD_Response * response, const char * headerKey, const char * headerValue) {
+	if (headerValue == NULL) {
+		stdLogError(0, "Attempt to add null value as header %s:", headerKey);
+		return;
+	}
+	if (MHD_add_response_header(response, headerKey, headerValue) != MHD_YES) {
+		stdLogError(errno, "Could not add response header %s: %s", headerKey, headerValue);
+		exit(255);
+	}
+}
+
 static int compareExt(const void * a, const void * b) {
 	return strcmp(((struct MimeType *) a)->ext, ((struct MimeType *) b)->ext);
 }
@@ -113,17 +124,21 @@ static ssize_t fdContentReader(int *fd, uint64_t pos, char *buf, size_t max) {
 	if (bytesRead == 0) {
 		return MHD_CONTENT_READER_END_OF_STREAM;
 	}
+	// size_t ignored = write(STDERR_FILENO, buf, bytesRead);
 	while (bytesRead < max) {
 		size_t newBytesRead = read(*fd, buf + bytesRead, max - bytesRead);
 		if (newBytesRead <= 0) {
 			break;
 		}
+		// ignored = write(STDERR_FILENO, buf + bytesRead, newBytesRead);
 		bytesRead += newBytesRead;
 	}
 	return bytesRead;
 }
 
 static void fdContentReaderCleanup(int *fd) {
+	// char c = '\n';
+	// write(STDERR_FILENO, &c, 1);
 	close(*fd);
 	free(fd);
 }
@@ -140,11 +155,11 @@ static struct MHD_Response * fdContentReaderCreate(int fd, const char * mimeType
 	}
 	char dateBuf[100];
 	getWebDate(date, dateBuf, 100);
-	if ((MHD_add_response_header(response, "Date", dateBuf) != MHD_YES)
-			|| (mimeType && MHD_add_response_header(response, "Content-Type", mimeType) != MHD_YES)) {
-		MHD_destroy_response(response);
-		return NULL;
+	addHeaderSafe(response, "Date", dateBuf);
+	if (mimeType != NULL) {
+		addHeaderSafe(response, "Content-Type", mimeType);
 	}
+	addHeaderSafe(response, "Dav", "1");
 	return response;
 
 }
@@ -157,11 +172,11 @@ static struct MHD_Response * fdFileContentReaderCreate(size_t size, int fd, cons
 	}
 	char dateBuf[100];
 	getWebDate(date, dateBuf, 100);
-	if ((MHD_add_response_header(response, "Date", dateBuf) != MHD_YES)
-			|| (mimeType && MHD_add_response_header(response, "Content-Type", mimeType) != MHD_YES)) {
-		MHD_destroy_response(response);
-		return NULL;
+	addHeaderSafe(response, "Date", dateBuf);
+	if (mimeType != NULL) {
+		addHeaderSafe(response, "Content-Type", mimeType);
 	}
+	addHeaderSafe(response, "Dav", "1");
 	return response;
 }
 
@@ -190,36 +205,39 @@ static int queueFileResponse(struct MHD_Connection *request, int responseCode, c
 	return result;
 }
 
-static int queueRapResponse(struct MHD_Connection *request, enum RapConstant mID, int fd, int messageParts,
-		struct iovec * message) {
-
+static int queueRapResponse(struct MHD_Connection *request, struct Message * message) {
 	// Queue the response
-	stdLog("queueRapResponse %d", (int) mID);
-	switch (mID) {
+	switch (message->mID) {
 	case RAP_MULTISTATUS:
 	case RAP_SUCCESS: {
 		// Get Mime type and date
-		const char * mimeType = iovecToString(&message[RAP_FILE_INDEX]);
-		time_t date = *((time_t *) message[RAP_DATE_INDEX].iov_base);
-		const char * location = iovecToString(&message[RAP_LOCATION_INDEX]);
+		const char * mimeType = iovecToString(&message->buffers[RAP_FILE_INDEX]);
+		time_t date = *((time_t *) message->buffers[RAP_DATE_INDEX].iov_base);
+		const char * location =
+				message->bufferCount > RAP_LOCATION_INDEX ? iovecToString(&message->buffers[RAP_LOCATION_INDEX]) : NULL;
 
 		struct stat stat;
-		fstat(fd, &stat);
+		fstat(message->fd, &stat);
 		struct MHD_Response * response;
+		if (mimeType[0] == '\0') {
+			if (location) {
+				struct MimeType * found = findMimeType(location);
+				mimeType = found ? found->type : NULL;
+			} else {
+				mimeType = NULL;
+			}
+		}
 		if ((stat.st_mode & S_IFMT) == S_IFREG) {
-			struct MimeType * found = findMimeType(location);
-			mimeType = found ? found->type : NULL;
-			response = fdFileContentReaderCreate(stat.st_size, fd, mimeType, date);
+			response = fdFileContentReaderCreate(stat.st_size, message->fd, mimeType, date);
 		} else {
-			response = fdContentReaderCreate(fd, mimeType, date);
+			response = fdContentReaderCreate(message->fd, mimeType, date);
 		}
 
-		if (!MHD_add_response_header(response, "Location", location)) {
-			MHD_destroy_response(response);
-			queueInternalServerError(request);
+		if (location) {
+			addHeaderSafe(response, "Location", location);
 		}
 
-		int ret = MHD_queue_response(request, (mID == RAP_SUCCESS ? MHD_HTTP_OK : 207), response);
+		int ret = MHD_queue_response(request, (message->mID == RAP_SUCCESS ? MHD_HTTP_OK : 207), response);
 		MHD_destroy_response(response);
 		return ret;
 	}
@@ -241,7 +259,7 @@ static int queueRapResponse(struct MHD_Connection *request, enum RapConstant mID
 		return queueInternalServerError(request);
 
 	default:
-		stdLogError(0, "invalid response from RAP %d", (int) mID);
+		stdLogError(0, "invalid response from RAP %d", (int) message->mID);
 		return queueInternalServerError(request);
 	}
 
@@ -317,21 +335,17 @@ static int createRap(struct MHD_Connection *request, struct RestrictedAccessProc
 	processor->password = processor->user + userLen;
 	memcpy(processor->user, user, userLen);
 	memcpy(processor->password, password, passLen);
-	struct iovec message[MAX_BUFFER_PARTS] = { { .iov_len = userLen, .iov_base = processor->user }, {
-			.iov_len = passLen, .iov_base = processor->password } };
-	if (sendMessage(processor->socketFd, RAP_AUTHENTICATE, -1, 2, message) <= 0) {
+	struct Message message = { .mID = RAP_AUTHENTICATE, .fd = -1, .bufferCount = 2, .buffers = { { .iov_len = userLen,
+			.iov_base = processor->user }, { .iov_len = passLen, .iov_base = processor->password } } };
+	if (sendMessage(processor->socketFd, &message) <= 0) {
 		destroyRap(processor);
-		free(processor);
 		*newProcessor = NULL;
 		return queueInternalServerError(request);
 	}
 	// TODO implement timeout ... possibly using "select"
-	int bufferCount = MAX_BUFFER_PARTS;
-	enum RapConstant responseCode;
 	char incomingBuffer[INCOMING_BUFFER_SIZE];
-	size_t readResult = recvMessage(processor->socketFd, &responseCode, NULL, &bufferCount, message, incomingBuffer,
-	INCOMING_BUFFER_SIZE);
-	if (readResult <= 0 || responseCode != RAP_SUCCESS) {
+	size_t readResult = recvMessage(processor->socketFd, &message, incomingBuffer, INCOMING_BUFFER_SIZE);
+	if (readResult <= 0 || message.mID != RAP_SUCCESS) {
 		destroyRap(processor);
 		*newProcessor = NULL;
 		if (readResult < 0) {
@@ -365,7 +379,7 @@ static int acquireRap(struct MHD_Connection *request, struct RestrictedAccessPro
 		return createRap(request, processor, user, password);
 	} else {
 		*processor = NULL;
-		stdLogError(errno, "Rejecting request without auth");
+		stdLogError(0, "Rejecting request without auth");
 		return queueAuthRequiredResponse(request);
 	}
 }
@@ -373,7 +387,10 @@ static int acquireRap(struct MHD_Connection *request, struct RestrictedAccessPro
 static void cleanupAfterRap(int sig, siginfo_t *siginfo, void *context) {
 	int status;
 	waitpid(siginfo->si_pid, &status, 0);
-	stdLog("Child finished PID: %d staus: %d", siginfo->si_pid, status);
+	if (status == 139) {
+		stdLogError(0, "RAP %d failed with segmentation fault", siginfo->si_pid);
+	}
+	//stdLog("Child finished PID: %d staus: %d", siginfo->si_pid, status);
 }
 
 ////////////////////////
@@ -412,17 +429,13 @@ static int filterMainHeaderInfo(struct MainHeaderInfo * mainHeaderInfo, enum MHD
 
 static int completeUpload(struct MHD_Connection *request, struct WriteHandle * writeHandle) {
 	if (!writeHandle->failed) {
-		char a = '\n';
-		size_t ignore = write(STDERR_FILENO, &a, 1);
+		// char a = '\n';
+		// size_t ignore = write(STDERR_FILENO, &a, 1);
 
 		close(writeHandle->fd);
-		enum RapConstant mID;
-		int fd;
-		int messageParts = MAX_BUFFER_PARTS;
-		struct iovec message[MAX_BUFFER_PARTS];
+		struct Message message;
 		char incomingBuffer[INCOMING_BUFFER_SIZE];
-		int readResult = recvMessage(writeHandle->rap->socketFd, &mID, &fd, &messageParts, message, incomingBuffer,
-		INCOMING_BUFFER_SIZE);
+		int readResult = recvMessage(writeHandle->rap->socketFd, &message, incomingBuffer, INCOMING_BUFFER_SIZE);
 		if (readResult <= 0) {
 			if (readResult == 0) {
 				stdLogError(0, "RAP closed socket unexpectedly while waiting for response");
@@ -432,7 +445,7 @@ static int completeUpload(struct MHD_Connection *request, struct WriteHandle * w
 		releaseRap(writeHandle->rap);
 		free(writeHandle);
 		if (readResult > 0) {
-			return queueRapResponse(request, mID, fd, messageParts, message);
+			return queueRapResponse(request, &message);
 		} else {
 			return queueInternalServerError(request);
 		}
@@ -456,7 +469,7 @@ static int processUploadData(struct MHD_Connection * request, const char * uploa
 	if (writeHandle->failed) {
 		return MHD_YES;
 	}
-	size_t ignore = write(STDERR_FILENO, upload_data, *upload_data_size);
+	// size_t ignore = write(STDERR_FILENO, upload_data, *upload_data_size);
 	size_t bytesWritten = write(writeHandle->fd, upload_data, *upload_data_size);
 	if (bytesWritten < *upload_data_size) {
 		// not all data could be written to the file handle and therefore
@@ -484,13 +497,11 @@ static int processNewRequest(struct MHD_Connection * request, const char * url, 
 	}
 
 	// Interpret the method
-	int messageParts = 2;
-	struct iovec message[MAX_BUFFER_PARTS];
-	message[RAP_HOST_INDEX].iov_len = strlen(host) + 1;
-	message[RAP_HOST_INDEX].iov_base = (void *) host;
-	message[RAP_FILE_INDEX].iov_len = strlen(url) + 1;
-	message[RAP_FILE_INDEX].iov_base = (void *) url;
-	enum RapConstant mID;
+	struct Message message;
+	message.buffers[RAP_HOST_INDEX].iov_len = strlen(host) + 1;
+	message.buffers[RAP_HOST_INDEX].iov_base = (void *) host;
+	message.buffers[RAP_FILE_INDEX].iov_len = strlen(url) + 1;
+	message.buffers[RAP_FILE_INDEX].iov_base = (void *) url;
 	// TODO PUT
 	// TODO PROPPATCH
 	// TODO MKCOL
@@ -502,19 +513,21 @@ static int processNewRequest(struct MHD_Connection * request, const char * url, 
 	// TODO UNLOCK
 	//stdLog("%s %s data", method, writeHandle ? "with" : "without");
 	if (!strcmp("GET", method)) {
-		mID = RAP_READ_FILE;
+		message.mID = RAP_READ_FILE;
+		message.bufferCount = 2;
 	} else if (!strcmp("PROPFIND", method)) {
-		mID = RAP_PROPFIND;
+		message.mID = RAP_PROPFIND;
 		const char * depth = getHeader(request, "Depth");
 		if (depth) {
-			message[RAP_DEPTH_INDEX].iov_base = (void *) depth;
-			message[RAP_DEPTH_INDEX].iov_len = strlen(depth) + 1;
+			message.buffers[RAP_DEPTH_INDEX].iov_base = (void *) depth;
+			message.buffers[RAP_DEPTH_INDEX].iov_len = strlen(depth) + 1;
 		} else {
-			message[RAP_DEPTH_INDEX].iov_base = "";
-			message[RAP_DEPTH_INDEX].iov_len = sizeof("");
+			message.buffers[RAP_DEPTH_INDEX].iov_base = "infinity";
+			message.buffers[RAP_DEPTH_INDEX].iov_len = sizeof("infinity");
 		}
-		messageParts = 3;
+		message.bufferCount = 3;
 	} else if (!strcmp("OPTIONS", method)) {
+		stdLog("OPTIONS success %s %s %s", rapSession->user, host, url);
 		releaseRap(rapSession);
 		return MHD_queue_response(request, MHD_HTTP_OK, OPTIONS_PAGE);
 	} else {
@@ -526,7 +539,6 @@ static int processNewRequest(struct MHD_Connection * request, const char * url, 
 	}
 
 	// If we have data to send then create a pipe to pump it through
-	int fd;
 	if (writeHandle) {
 		int pipeEnds[2];
 		if (pipe(pipeEnds)) {
@@ -534,24 +546,22 @@ static int processNewRequest(struct MHD_Connection * request, const char * url, 
 			return queueInternalServerError(request);
 		}
 		writeHandle->fd = pipeEnds[PIPE_WRITE];
-		fd = pipeEnds[PIPE_READ];
+		message.fd = pipeEnds[PIPE_READ];
 		writeHandle->failed = 0;
 		writeHandle->rap = rapSession;
 	} else {
-		fd = -1;
+		message.fd = -1;
 	}
 
 	// Send the request to the RAP
-	if (sendMessage(rapSession->socketFd, mID, fd, messageParts, message) < 0) {
+	if (sendMessage(rapSession->socketFd, &message) < 0) {
 		abortSession(writeHandle, rapSession);
 		return queueInternalServerError(request);
 	}
 
 	// Get result from RAP
-	messageParts = MAX_BUFFER_PARTS;
 	char incomingBuffer[INCOMING_BUFFER_SIZE];
-	int readResult = recvMessage(rapSession->socketFd, &mID, &fd, &messageParts, message, incomingBuffer,
-	INCOMING_BUFFER_SIZE);
+	int readResult = recvMessage(rapSession->socketFd, &message, incomingBuffer, INCOMING_BUFFER_SIZE);
 	if (readResult <= 0) {
 		if (readResult == 0) {
 			stdLogError(0, "RAP closed socket unexpectedly while waiting for response");
@@ -560,14 +570,17 @@ static int processNewRequest(struct MHD_Connection * request, const char * url, 
 		return queueInternalServerError(request);
 	}
 
-	if (mID == RAP_CONTINUE) {
+	if (message.mID == RAP_CONTINUE) {
 		if (!writeHandle) {
 			stdLogError(0, "RAP returned RAP_CONTINUE when no data was sent");
+			return queueInternalServerError(request);
 		}
-		return MHD_YES;
+		else {
+			return MHD_YES;
+		}
 	} else {
 		abortSession(writeHandle, rapSession);
-		return queueRapResponse(request, mID, fd, messageParts, message);
+		return queueRapResponse(request, &message);
 	}
 }
 
@@ -612,16 +625,6 @@ static int answerToRequest(void *cls, struct MHD_Connection *request, char *url,
 ////////////////////
 // Initialisation //
 ////////////////////
-
-static void initializeDaemin(int port, struct MHD_Daemon **newDaemon) {
-	*newDaemon = MHD_start_daemon(MHD_USE_SELECT_INTERNALLY | MHD_USE_PEDANTIC_CHECKS, port, NULL, NULL,
-			(MHD_AccessHandlerCallback) &answerToRequest, NULL, MHD_OPTION_END);
-
-	if (!*newDaemon) {
-		stdLogError(errno, "Unable to initialise daemon on port %d", port);
-		exit(255);
-	}
-}
 
 static char * loadFileToBuffer(const char * file, size_t * size) {
 	int fd = open(file, O_RDONLY);
@@ -731,24 +734,19 @@ static void initializeStaticResponse(struct MHD_Response ** response, const char
 	}
 
 	struct MimeType * type = findMimeType(fileName);
-	if (type && MHD_add_response_header(*response, "Content-Type", type->type) != MHD_YES) {
-		exit(255);
+	if (type) {
+		addHeaderSafe(*response, "Content-Type", type->type);
 	}
 }
 
 static void initializeStaticResponses() {
 	initializeStaticResponse(&INTERNAL_SERVER_ERROR_PAGE, "/usr/share/webdavd/HTTP_INTERNAL_SERVER_ERROR.html");
 	initializeStaticResponse(&UNAUTHORIZED_PAGE, "/usr/share/webdavd/HTTP_UNAUTHORIZED.html");
-	if (MHD_add_response_header(UNAUTHORIZED_PAGE, "WWW-Authenticate", "Basic realm=\"My Server\"") != MHD_YES) {
-		stdLogError(errno, "Could not initialize pages");
-		exit(255);
-	}
+	addHeaderSafe(UNAUTHORIZED_PAGE, "WWW-Authenticate", "Basic realm=\"My Server\"");
 	initializeStaticResponse(&OPTIONS_PAGE, "/usr/share/webdavd/OPTIONS.html");
-	if (MHD_add_response_header(OPTIONS_PAGE, "Dav", "1") != MHD_YES
-			|| MHD_add_response_header(OPTIONS_PAGE, "Allow",
-					"OPTIONS, GET, HEAD, DELETE, PROPFIND, PUT, PROPPATCH, COPY, MOVE, LOCK, UNLOCK") != MHD_YES) {
-
-	}
+	addHeaderSafe(OPTIONS_PAGE, "Dav", "1");
+	addHeaderSafe(OPTIONS_PAGE, "Allow",
+			"OPTIONS, GET, HEAD, DELETE, PROPFIND, PUT, PROPPATCH, COPY, MOVE, LOCK, UNLOCK");
 }
 
 ////////////////////////
@@ -774,7 +772,13 @@ int main(int argCount, char ** args) {
 	// Start up the daemons
 	daemons = mallocSafe(sizeof(struct MHD_Daemon *) * daemonCount);
 	for (int i = 0; i < daemonCount; i++) {
-		initializeDaemin(daemonPorts[i], &(daemons[i]));
+		daemons[i] = MHD_start_daemon(MHD_USE_SELECT_INTERNALLY | MHD_USE_PEDANTIC_CHECKS, daemonPorts[i], NULL, NULL,
+				(MHD_AccessHandlerCallback) &answerToRequest, NULL, MHD_OPTION_END);
+
+		if (!daemons[i]) {
+			stdLogError(errno, "Unable to initialise daemon on port %d", daemonPorts[i]);
+			exit(255);
+		}
 	}
 
 	pthread_exit(NULL);

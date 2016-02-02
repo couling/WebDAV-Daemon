@@ -91,7 +91,7 @@ struct MessageHeader {
 	size_t partLengths[MAX_BUFFER_PARTS];
 };
 
-ssize_t sendMessage(int sock, enum RapConstant mID, int fd, int bufferCount, struct iovec buffer[]) {
+ssize_t sendMessage(int sock, struct Message * message) {
 	//stdLog("sendm %d", sock);
 	ssize_t size;
 	struct msghdr msg;
@@ -102,19 +102,19 @@ ssize_t sendMessage(int sock, enum RapConstant mID, int fd, int bufferCount, str
 	msg.msg_name = NULL;
 	msg.msg_namelen = 0;
 	msg.msg_iov = liovec;
-	msg.msg_iovlen = bufferCount + 1;
+	msg.msg_iovlen = message->bufferCount + 1;
 	liovec[0].iov_base = &messageHeader;
 	liovec[0].iov_len = sizeof(messageHeader);
-	memcpy(&(liovec[1]), buffer, sizeof(struct iovec) * bufferCount);
+	memcpy(&(liovec[1]), message->buffers, sizeof(struct iovec) * message->bufferCount);
 
 	memset(&messageHeader, 0, sizeof(messageHeader));
-	messageHeader.mID = mID;
-	messageHeader.partCount = bufferCount;
-	for (int i = 0; i < bufferCount; i++) {
-		messageHeader.partLengths[i] = buffer[i].iov_len;
+	messageHeader.mID = message->mID;
+	messageHeader.partCount = message->bufferCount;
+	for (int i = 0; i < message->bufferCount; i++) {
+		messageHeader.partLengths[i] = message->buffers[i].iov_len;
 	}
 
-	if (fd != -1) {
+	if (message->fd != -1) {
 		memset(&ctrl_buf, 0, sizeof(ctrl_buf));
 		msg.msg_control = &ctrl_buf;
 		msg.msg_controllen = sizeof(ctrl_buf);
@@ -122,15 +122,15 @@ ssize_t sendMessage(int sock, enum RapConstant mID, int fd, int bufferCount, str
 		cmsg->cmsg_len = CMSG_LEN(sizeof(int));
 		cmsg->cmsg_level = SOL_SOCKET;
 		cmsg->cmsg_type = SCM_RIGHTS;
-		*((int *) CMSG_DATA(cmsg)) = fd;
+		*((int *) CMSG_DATA(cmsg)) = message->fd;
 	} else {
 		msg.msg_control = NULL;
 		msg.msg_controllen = 0;
 	}
 
 	size = sendmsg(sock, &msg, 0);
-	if (fd != -1) {
-		close(fd);
+	if (message->fd != -1) {
+		close(message->fd);
 	}
 	if (size < 0) {
 		stdLogError(errno, "Could not send socket message");
@@ -138,18 +138,12 @@ ssize_t sendMessage(int sock, enum RapConstant mID, int fd, int bufferCount, str
 	return size;
 }
 
-ssize_t recvMessage(int sock, enum RapConstant * mID, int * fd, int * bufferCount, struct iovec * buffers,
-		char * incomingBuffer, size_t incomingBufferSize) {
+ssize_t recvMessage(int sock, struct Message * message, char * incomingBuffer, size_t incomingBufferSize) {
 	//stdLog("recvm %d", sock);
 	ssize_t size;
 	struct msghdr msg;
 	char ctrl_buf[CMSG_SPACE(sizeof(int))];
 	struct iovec iovec[2];
-	int dummyBufferCount = 0;
-
-	if (!bufferCount) {
-		bufferCount = &dummyBufferCount;
-	}
 
 	msg.msg_name = NULL;
 	msg.msg_namelen = 0;
@@ -177,39 +171,32 @@ ssize_t recvMessage(int sock, enum RapConstant * mID, int * fd, int * bufferCoun
 	struct cmsghdr * cmsg = CMSG_FIRSTHDR(&msg);
 	if (cmsg && cmsg->cmsg_len == CMSG_LEN(sizeof(int)) && cmsg->cmsg_level == SOL_SOCKET
 			&& cmsg->cmsg_type == SCM_RIGHTS) {
-		int recievedFd = *((int *) CMSG_DATA(cmsg));
-		if (fd) {
-			*fd = recievedFd;
-		} else {
-			stdLogError(0, "closing ignored fd");
-			close(recievedFd);
-		}
-	} else if (fd) {
-		// report back to the calling method that no FD was received.
-		*fd = -1;
+		message->fd = *((int *) CMSG_DATA(cmsg));
+	} else {
+		message->fd = -1;
 	}
 
 	struct MessageHeader * messageHeader = (struct MessageHeader *) (incomingBuffer);
-	if (size < sizeof(struct MessageHeader) || messageHeader->partCount > *bufferCount
-			|| messageHeader->partCount < 0) {
-		stdLogError(0, "Invalid message received %d %d", messageHeader->partCount, *bufferCount);
-		if (fd || *fd != -1) {
-			close(*fd);
+	if (size
+			< sizeof(struct MessageHeader)|| messageHeader->partCount < 0 || messageHeader->partCount > MAX_BUFFER_PARTS) {
+		stdLogError(0, "Invalid message received %d", messageHeader->partCount);
+		if (message->fd != -1) {
+			close(message->fd);
 		}
 		return -1;
 	}
 
-	*mID = messageHeader->mID;
-	*bufferCount = messageHeader->partCount;
+	message->mID = messageHeader->mID;
+	message->bufferCount = messageHeader->partCount;
 	char * partPtr = &incomingBuffer[sizeof(struct MessageHeader)];
 	for (int i = 0; i < messageHeader->partCount; i++) {
-		buffers[i].iov_base = partPtr;
-		buffers[i].iov_len = messageHeader->partLengths[i];
+		message->buffers[i].iov_base = partPtr;
+		message->buffers[i].iov_len = messageHeader->partLengths[i];
 		partPtr += messageHeader->partLengths[i];
 		if (partPtr > incomingBuffer + size) {
 			stdLogError(0, "Invalid message received: parts too long\n");
-			if (fd || *fd != -1) {
-				close(*fd);
+			if (message->fd != -1) {
+				close(message->fd);
 			}
 			return -1;
 		}
