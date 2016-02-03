@@ -3,7 +3,6 @@
 // TODO correct failure codes on collections
 // TODO configuration file & getopt
 
-
 #include "shared.h"
 
 #include <fcntl.h>
@@ -21,34 +20,27 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <semaphore.h>
 #include <microhttpd.h>
 #include <errno.h>
 
-#define RAP_PATH "/usr/sbin/rap"
-#define MIME_FILE_PATH "/etc/mime.types"
-
-#define ACCEPT_HEADER "OPTIONS, GET, HEAD, DELETE, PROPFIND, PUT, PROPPATCH, COPY, MOVE, LOCK, UNLOCK"
-
 struct RestrictedAccessProcessor {
+	int rapSessionInUse;
+	time_t rapCreated;
 	int pid;
 	int socketFd;
-	char * user;
-	char * password;
+	const char * user;
 	int writeDataFd;
 	int readDataFd;
 	int responseAlreadyGiven;
 };
 
-// Used as a place holder for failed auth requests which failed due to invalid credentials
-static const struct RestrictedAccessProcessor AUTH_FAILED_RAP = { .pid = 0, .socketFd = -1, .user = "<auth failed>",
-		.password = "", .writeDataFd = -1, .readDataFd = -1, .responseAlreadyGiven = 1 };
-
-// Used as a place holder for failed auth requests which failed due to errors
-static const struct RestrictedAccessProcessor AUTH_ERROR_RAP = { .pid = 0, .socketFd = -1, .user = "<auth error>",
-		.password = "", .writeDataFd = -1, .readDataFd = -1, .responseAlreadyGiven = 1 };
-
-#define AUTH_FAILED ((struct RestrictedAccessProcessor *)&AUTH_FAILED_RAP)
-#define AUTH_ERROR ((struct RestrictedAccessProcessor *)&AUTH_ERROR_RAP)
+struct RapGroup {
+	const char * user;
+	const char * password;
+	int rapSessionCount;
+	struct RestrictedAccessProcessor * rapSession;
+};
 
 struct MimeType {
 	const char * ext;
@@ -60,17 +52,43 @@ struct Header {
 	const char * value;
 };
 
+// All Daemons
+// Not sure why we keep these, they're not used for anything
 static struct MHD_Daemon **daemons;
 static int daemonPorts[] = { 8080 };
 static int daemonCount = sizeof(daemonPorts) / sizeof(daemonPorts[0]);
-size_t mimeFileBufferSize;
-char * mimeFileBuffer;
-struct MimeType * mimeTypes = NULL;
-int mimeTypeCount = 0;
+
+// Mime Database.
+// TODO find a way to move this to the RAP.
+static size_t mimeFileBufferSize;
+static char * mimeFileBuffer;
+static struct MimeType * mimeTypes = NULL;
+static int mimeTypeCount = 0;
+
+static sem_t rapDBLock;
+static int rapDBSize;
+static struct RapGroup * rapDB;
+static int rapSessionMaxLife = 60 * 5;
+
+#define RAP_PATH "/usr/sbin/rap"
+#define MIME_FILE_PATH "/etc/mime.types"
+
+#define ACCEPT_HEADER "OPTIONS, GET, HEAD, DELETE, PROPFIND, PUT, PROPPATCH, COPY, MOVE, LOCK, UNLOCK"
 
 static struct MHD_Response * INTERNAL_SERVER_ERROR_PAGE;
 static struct MHD_Response * UNAUTHORIZED_PAGE;
 static struct MHD_Response * METHOD_NOT_SUPPORTED_PAGE;
+
+// Used as a place holder for failed auth requests which failed due to invalid credentials
+static const struct RestrictedAccessProcessor AUTH_FAILED_RAP = { .pid = 0, .socketFd = -1, .user = "<auth failed>",
+		.writeDataFd = -1, .readDataFd = -1, .responseAlreadyGiven = 1 };
+
+// Used as a place holder for failed auth requests which failed due to errors
+static const struct RestrictedAccessProcessor AUTH_ERROR_RAP = { .pid = 0, .socketFd = -1, .user = "<auth error>",
+		.writeDataFd = -1, .readDataFd = -1, .responseAlreadyGiven = 1 };
+
+#define AUTH_FAILED ((struct RestrictedAccessProcessor *)&AUTH_FAILED_RAP)
+#define AUTH_ERROR ((struct RestrictedAccessProcessor *)&AUTH_ERROR_RAP)
 
 ///////////////////////
 // Response Queueing //
@@ -302,32 +320,32 @@ static int forkRapProcess(const char * path, int * newSockFd) {
 
 static void destroyRap(struct RestrictedAccessProcessor * processor) {
 	close(processor->socketFd);
-	free(processor->user);
-	free(processor);
+	stdLog("destroying rap %d on %d", processor->pid, processor->socketFd);
+	processor->socketFd = -1;
 }
 
-static struct RestrictedAccessProcessor * createRap(struct MHD_Connection *request, const char * user,
+static struct RestrictedAccessProcessor * createRap(struct RestrictedAccessProcessor * processor, const char * user,
 		const char * password) {
 
-	struct RestrictedAccessProcessor * processor = mallocSafe(sizeof(struct RestrictedAccessProcessor));
 	processor->pid = forkRapProcess(RAP_PATH, &(processor->socketFd));
 	if (!processor->pid) {
-		free(processor);
 		return AUTH_ERROR;
 	}
-	size_t userLen = strlen(user) + 1;
-	size_t passLen = strlen(password) + 1;
-	size_t bufferSize = userLen + passLen;
-	processor->user = mallocSafe(bufferSize);
-	processor->password = processor->user + userLen;
-	memcpy(processor->user, user, userLen);
-	memcpy(processor->password, password, passLen);
-	struct Message message = { .mID = RAP_AUTHENTICATE, .fd = -1, .bufferCount = 2, .buffers = { { .iov_len = userLen,
-			.iov_base = processor->user }, { .iov_len = passLen, .iov_base = processor->password } } };
+
+	struct Message message;
+	message.mID = RAP_AUTHENTICATE;
+	message.fd = -1;
+	message.bufferCount = 2;
+	message.buffers[RAP_USER_INDEX].iov_len = strlen(user) + 1;
+	message.buffers[RAP_USER_INDEX].iov_base = (void *) user;
+	message.buffers[RAP_PASSWORD_INDEX].iov_len = strlen(password) + 1;
+	message.buffers[RAP_PASSWORD_INDEX].iov_base = (void *) password;
+
 	if (sendMessage(processor->socketFd, &message) <= 0) {
 		destroyRap(processor);
 		return AUTH_ERROR;
 	}
+
 	char incomingBuffer[INCOMING_BUFFER_SIZE];
 	ssize_t readResult = recvMessage(processor->socketFd, &message, incomingBuffer, INCOMING_BUFFER_SIZE);
 	if (readResult <= 0 || message.mID != RAP_SUCCESS) {
@@ -339,33 +357,121 @@ static struct RestrictedAccessProcessor * createRap(struct MHD_Connection *reque
 			stdLogError(0, "RAP closed socket unexpectedly");
 			return AUTH_ERROR;
 		} else {
-			stdLogError(0, "Access denied for user %s %d %zd", user, message.mID, readResult);
+			stdLogError(0, "Access denied for user %s", user);
 			return AUTH_FAILED;
 		}
 	}
 
+	processor->user = user;
+	time(&processor->rapCreated);
+
+	stdLog("RAP %d authenticated on %d",processor->pid, processor->socketFd);
+
 	return processor;
+}
+
+static int compareRapGroup(const void * rapA, const void * rapB) {
+	int result = strcmp(((struct RapGroup *) rapA)->user, ((struct RapGroup *) rapB)->user);
+	if (result == 0) {
+		result = strcmp(((struct RapGroup *) rapA)->password, ((struct RapGroup *) rapB)->password);
+	}
+	return result;
+}
+
+static struct RestrictedAccessProcessor * acquireRapFromDb(const char * user, const char * password) {
+	struct RapGroup groupToFind = { .user = user, .password = password };
+	sem_wait(&rapDBLock);
+	struct RapGroup *groupFound = bsearch(&groupToFind, rapDB, rapDBSize, sizeof(struct RapGroup), &compareRapGroup);
+	struct RestrictedAccessProcessor * rapSessionFound = NULL;
+	if (groupFound) {
+		time_t expireTime;
+		time(&expireTime);
+		expireTime -= rapSessionMaxLife;
+		for (int i = 0; i < groupFound->rapSessionCount; i++) {
+			if (groupFound->rapSession[i].socketFd != -1 && !groupFound->rapSession[i].rapSessionInUse
+					&& groupFound->rapSession[i].rapCreated >= expireTime) {
+				rapSessionFound = &groupFound->rapSession[i];
+				groupFound->rapSession[i].rapSessionInUse = 1;
+				break;
+			}
+		}
+	}
+	sem_post(&rapDBLock);
+	return rapSessionFound;
+}
+
+static struct RestrictedAccessProcessor * addRapToDb(struct RestrictedAccessProcessor * rapSession,
+		const char * password) {
+	struct RestrictedAccessProcessor * newRapSession;
+	struct RapGroup groupToFind;
+	groupToFind.user = rapSession->user;
+	groupToFind.password = password;
+	sem_wait(&rapDBLock);
+	struct RapGroup *groupFound = bsearch(&groupToFind, rapDB, rapDBSize, sizeof(struct RapGroup), &compareRapGroup);
+	if (groupFound) {
+		newRapSession = NULL;
+		for (int i = 0; i < groupFound->rapSessionCount; i++) {
+			if (groupFound->rapSession[i].socketFd == -1) {
+				newRapSession = &groupFound->rapSession[i];
+				break;
+			}
+		}
+		if (!newRapSession) {
+			// TODO limit session count
+			groupFound->rapSessionCount++;
+			groupFound->rapSession = reallocSafe(groupFound->rapSession,
+					sizeof(struct RestrictedAccessProcessor) * groupFound->rapSessionCount);
+			newRapSession = &groupFound->rapSession[groupFound->rapSessionCount - 1];
+		}
+	} else {
+		rapDBSize++;
+		rapDB = reallocSafe(rapDB, rapDBSize * sizeof(struct RapGroup));
+		groupFound = &rapDB[rapDBSize-1];
+		size_t userSize = strlen(groupToFind.user) + 1;
+		size_t passwordSize = strlen(groupToFind.password) + 1;
+		size_t bufferSize = userSize + passwordSize;
+		char * buffer = mallocSafe(bufferSize);
+		memcpy(buffer, groupToFind.user, userSize);
+		memcpy(buffer + userSize, groupToFind.password, passwordSize);
+		groupFound->user = buffer;
+		groupFound->password = buffer + userSize;
+		groupFound->rapSessionCount = 1;
+		groupFound->rapSession = mallocSafe(sizeof(struct RestrictedAccessProcessor));
+		newRapSession = &groupFound->rapSession[0];
+		qsort(rapDB, rapDBSize, sizeof(struct RapGroup), &compareRapGroup);
+	}
+	*newRapSession = *rapSession;
+	newRapSession->user = groupFound->user;
+	newRapSession->rapSessionInUse = 1;
+	sem_post(&rapDBLock);
+	return newRapSession;
 }
 
 static void releaseRap(struct RestrictedAccessProcessor * processor) {
-	//stdLog("release %d on %d", processor->pid, processor->socketFd);
-	destroyRap(processor);
+	processor->rapSessionInUse = 0;
 }
 
 static struct RestrictedAccessProcessor * acquireRap(struct MHD_Connection *request) {
-	// TODO reuse RAP
 	char * user;
 	char * password;
-	user = MHD_basic_auth_get_username_password(request, &(password));
-	struct RestrictedAccessProcessor * processor;
+	user = MHD_basic_auth_get_username_password(request, &password);
 	if (user && password) {
-		processor = createRap(request, user, password);
+		struct RestrictedAccessProcessor * rapSession = acquireRapFromDb(user, password);
+		if (rapSession) {
+			return rapSession;
+		} else {
+			struct RestrictedAccessProcessor newSession;
+			rapSession = createRap(&newSession, user, password);
+			if (rapSession != &newSession) {
+				return rapSession;
+			} else {
+				return addRapToDb(rapSession, password);
+			}
+		}
 	} else {
 		stdLogError(0, "Rejecting request without auth");
-		processor = AUTH_FAILED;
+		return AUTH_FAILED;
 	}
-	//stdLog("acquire %d on %d", processor->pid, processor->socketFd);
-	return processor;
 }
 
 static void cleanupAfterRap(int sig, siginfo_t *siginfo, void *context) {
@@ -375,6 +481,29 @@ static void cleanupAfterRap(int sig, siginfo_t *siginfo, void *context) {
 		stdLogError(0, "RAP %d failed with segmentation fault", siginfo->si_pid);
 	}
 	//stdLog("Child finished PID: %d staus: %d", siginfo->si_pid, status);
+}
+
+static void * rapTimeoutWorker(void * ignored) {
+	// TODO actually free() something
+	while (1) {
+		sleep(rapSessionMaxLife / 2);
+		time_t expireTime;
+		time(&expireTime);
+		expireTime -= rapSessionMaxLife;
+		stdLog("Cleaning");
+		sem_wait(&rapDBLock);
+		for (int group = 0; group < rapDBSize; group++) {
+			for (int rap = 0; rap < rapDB[group].rapSessionCount; rap++) {
+				if (!rapDB[group].rapSession[rap].rapSessionInUse
+						&& rapDB[group].rapSession[rap].socketFd != -1
+						&& rapDB[group].rapSession[rap].rapCreated < expireTime) {
+					destroyRap(&rapDB[group].rapSession[rap]);
+				}
+			}
+		}
+		sem_post(&rapDBLock);
+	}
+	return NULL;
 }
 
 ////////////////////////
@@ -769,6 +898,28 @@ static void initializeStaticResponses() {
 			"OPTIONS, GET, HEAD, DELETE, PROPFIND, PUT, PROPPATCH, COPY, MOVE, LOCK, UNLOCK");
 }
 
+static void initializeRapDatabase() {
+	struct sigaction act;
+	memset(&act, 0, sizeof(act));
+	act.sa_sigaction = &cleanupAfterRap;
+	act.sa_flags = SA_SIGINFO;
+	if (sigaction(SIGCHLD, &act, NULL) < 0) {
+		stdLogError(errno, "Could not set handler method for finished child threads");
+		exit(255);
+	}
+
+	sem_init(&rapDBLock, 0, 1);
+
+	rapDBSize = 0;
+	rapDB = NULL;
+
+	pthread_t newThread;
+	if (pthread_create(&newThread, NULL, &rapTimeoutWorker, NULL)) {
+		stdLogError(errno, "Could not create worker thread for rap db");
+		exit(255);
+	}
+}
+
 ////////////////////////
 // End Initialisation //
 ////////////////////////z
@@ -780,14 +931,7 @@ static void initializeStaticResponses() {
 int main(int argCount, char ** args) {
 	initializeMimeTypes();
 	initializeStaticResponses();
-	struct sigaction act;
-	memset(&act, 0, sizeof(act));
-	act.sa_sigaction = &cleanupAfterRap;
-	act.sa_flags = SA_SIGINFO;
-	if (sigaction(SIGCHLD, &act, NULL) < 0) {
-		stdLogError(errno, "Could not set handler method for finished child threads");
-		return 255;
-	}
+	initializeRapDatabase();
 
 	// Start up the daemons
 	daemons = mallocSafe(sizeof(struct MHD_Daemon *) * daemonCount);

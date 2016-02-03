@@ -497,10 +497,6 @@ static size_t authenticate(struct Message * message) {
 	char * user = iovecToString(&message->buffers[RAP_USER_INDEX]);
 	char * password = iovecToString(&message->buffers[RAP_PASSWORD_INDEX]);
 
-	// TODO REMOVE THIS!
-	authenticated = 1;
-	authenticatedUser = "philip";
-	return respond(RAP_SUCCESS, -1);
 	if (pamAuthenticate(user, password)) {
 		//stdLog("Login accepted for %s", user);
 		return respond(RAP_SUCCESS, -1);
