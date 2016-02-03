@@ -1,11 +1,8 @@
-// TODO ssl?
-// TODO auth modes?
-// TODO Basic http methods
-// TODO webdav addaional methods
-// TODO XML?
-// TODO etags
+// TODO ssl
+// TODO auth modes other than basic?
 // TODO correct failure codes on collections
-// TODO access logging
+// TODO configuration file & getopt
+
 
 #include "shared.h"
 
@@ -43,12 +40,12 @@ struct RestrictedAccessProcessor {
 };
 
 // Used as a place holder for failed auth requests which failed due to invalid credentials
-static const struct RestrictedAccessProcessor AUTH_FAILED_RAP = { .pid = 0, .socketFd = -1, .user = "", .password = "",
-		.writeDataFd = -1, .readDataFd = -1, .responseAlreadyGiven = 1 };
+static const struct RestrictedAccessProcessor AUTH_FAILED_RAP = { .pid = 0, .socketFd = -1, .user = "<auth failed>",
+		.password = "", .writeDataFd = -1, .readDataFd = -1, .responseAlreadyGiven = 1 };
 
 // Used as a place holder for failed auth requests which failed due to errors
-static const struct RestrictedAccessProcessor AUTH_ERROR_RAP = { .pid = 0, .socketFd = -1, .user = "", .password = "",
-		.writeDataFd = -1, .readDataFd = -1, .responseAlreadyGiven = 1 };
+static const struct RestrictedAccessProcessor AUTH_ERROR_RAP = { .pid = 0, .socketFd = -1, .user = "<auth error>",
+		.password = "", .writeDataFd = -1, .readDataFd = -1, .responseAlreadyGiven = 1 };
 
 #define AUTH_FAILED ((struct RestrictedAccessProcessor *)&AUTH_FAILED_RAP)
 #define AUTH_ERROR ((struct RestrictedAccessProcessor *)&AUTH_ERROR_RAP)
@@ -81,6 +78,10 @@ static struct MHD_Response * METHOD_NOT_SUPPORTED_PAGE;
 
 //#define queueAuthRequiredResponse(request) ( MHD_queue_response(request, MHD_HTTP_UNAUTHORIZED, UNAUTHORIZED_PAGE) )
 //#define queueInternalServerError(request) ( MHD_queue_response(request, MHD_HTTP_INTERNAL_SERVER_ERROR, INTERNAL_SERVER_ERROR_PAGE) )
+
+static void logAccess(int statusCode, const char * method, const char * user, const char * url) {
+	stdLog("%d %s %s %s", statusCode, method, user, url);
+}
 
 static void addHeaderSafe(struct MHD_Response * response, const char * headerKey, const char * headerValue) {
 	if (headerValue == NULL) {
@@ -276,7 +277,7 @@ static int forkRapProcess(const char * path, int * newSockFd) {
 		close(sockFd[1]);
 		if (result != -1) {
 			*newSockFd = sockFd[0];
-			//stdLog("New RAP %d %d", result, sockFd[0]);
+			//stdLog("New RAP %d on %d", result, sockFd[0]);
 			return result;
 		} else {
 			// fork failed so close parent pipes and return non-zero
@@ -287,7 +288,7 @@ static int forkRapProcess(const char * path, int * newSockFd) {
 	} else {
 		// child
 		// Sort out socket
-		// stdLog("Starting rap: %s", path);
+		//stdLog("Starting rap: %s", path);
 		if (dup2(sockFd[1], STDIN_FILENO) == -1 || dup2(sockFd[1], STDOUT_FILENO) == -1) {
 			stdLogError(errno, "Could not assign new socket (%d) to stdin/stdout", newSockFd[1]);
 			exit(255);
@@ -327,26 +328,27 @@ static struct RestrictedAccessProcessor * createRap(struct MHD_Connection *reque
 		destroyRap(processor);
 		return AUTH_ERROR;
 	}
-	// TODO implement timeout ... possibly using "select"
 	char incomingBuffer[INCOMING_BUFFER_SIZE];
-	size_t readResult = recvMessage(processor->socketFd, &message, incomingBuffer, INCOMING_BUFFER_SIZE);
+	ssize_t readResult = recvMessage(processor->socketFd, &message, incomingBuffer, INCOMING_BUFFER_SIZE);
 	if (readResult <= 0 || message.mID != RAP_SUCCESS) {
 		destroyRap(processor);
 		if (readResult < 0) {
-			stdLogError(errno, "Could not read result from RAP ");
+			stdLogError(0, "Could not read result from RAP ");
+			return AUTH_ERROR;
 		} else if (readResult == 0) {
 			stdLogError(0, "RAP closed socket unexpectedly");
+			return AUTH_ERROR;
 		} else {
-			stdLogError(0, "Access denied for user %s", user);
+			stdLogError(0, "Access denied for user %s %d %zd", user, message.mID, readResult);
 			return AUTH_FAILED;
 		}
-		return AUTH_ERROR;
 	}
 
 	return processor;
 }
 
 static void releaseRap(struct RestrictedAccessProcessor * processor) {
+	//stdLog("release %d on %d", processor->pid, processor->socketFd);
 	destroyRap(processor);
 }
 
@@ -355,12 +357,15 @@ static struct RestrictedAccessProcessor * acquireRap(struct MHD_Connection *requ
 	char * user;
 	char * password;
 	user = MHD_basic_auth_get_username_password(request, &(password));
+	struct RestrictedAccessProcessor * processor;
 	if (user && password) {
-		return createRap(request, user, password);
+		processor = createRap(request, user, password);
 	} else {
 		stdLogError(0, "Rejecting request without auth");
-		return AUTH_FAILED;
+		processor = AUTH_FAILED;
 	}
+	//stdLog("acquire %d on %d", processor->pid, processor->socketFd);
+	return processor;
 }
 
 static void cleanupAfterRap(int sig, siginfo_t *siginfo, void *context) {
@@ -401,6 +406,11 @@ static int completeUpload(struct MHD_Connection *request, struct RestrictedAcces
 		*response = createFileResponse(request, "/usr/share/webdavd/HTTP_INSUFFICIENT_STORAGE.html");
 		return MHD_HTTP_INSUFFICIENT_STORAGE;
 	} else {
+		// Closing this pipe signals to the rap that there is no more data
+		// This MUST happen before the recvMessage a few lines below or the RAP
+		// will NOT send a message and recvMessage will hang.
+		close(processor->writeDataFd);
+		processor->writeDataFd = -1;
 		struct Message message;
 		char incomingBuffer[INCOMING_BUFFER_SIZE];
 		int readResult = recvMessage(processor->socketFd, &message, incomingBuffer, INCOMING_BUFFER_SIZE);
@@ -513,8 +523,22 @@ static int requestHasData(struct MHD_Connection *request) {
 }
 
 static int sendResponse(struct MHD_Connection *request, int statusCode, struct MHD_Response * response,
-		const char * method, const char * url, const char * user) {
-	stdLog("%d %s %s %s", statusCode, method, user, url);
+		struct RestrictedAccessProcessor * rapSession, const char * method, const char * url) {
+
+	// This doesn't really belong here but its a good safty check. We should never try to send a response
+	// when the data pipes are still open
+	if (rapSession->readDataFd != -1) {
+		stdLogError(0, "readDataFd was not properly closed before sending response");
+		close(rapSession->readDataFd);
+		rapSession->readDataFd = -1;
+	}
+	if (rapSession->writeDataFd != -1) {
+		stdLogError(0, "writeDataFd was not properly closed before sending response");
+		close(rapSession->writeDataFd);
+		rapSession->writeDataFd = -1;
+	}
+
+	logAccess(statusCode, method, rapSession->user, url);
 	switch (statusCode) {
 	case MHD_HTTP_INTERNAL_SERVER_ERROR:
 		return MHD_queue_response(request, MHD_HTTP_INTERNAL_SERVER_ERROR, INTERNAL_SERVER_ERROR_PAGE);
@@ -536,88 +560,80 @@ static int answerToRequest(void *cls, struct MHD_Connection *request, char *url,
 
 	if (*rapSession) {
 		if (*upload_data_size) {
+			// Finished uploading data
 			if (!(*rapSession)->responseAlreadyGiven) {
 				processUploadData(request, upload_data, *upload_data_size, *rapSession);
 			}
 			*upload_data_size = 0;
 			return MHD_YES;
 		} else {
+			// Uploading more data
 			if ((*rapSession)->responseAlreadyGiven) {
 				releaseRap(*rapSession);
 				return MHD_YES;
 			} else {
 				struct MHD_Response * response;
 				int statusCode = completeUpload(request, *rapSession, &response);
-				int result = sendResponse(request, statusCode, response, method, url, (*rapSession)->user);
-				releaseRap(*rapSession);
+				int result = sendResponse(request, statusCode, response, *rapSession, method, url);
+				if (*rapSession != AUTH_ERROR && *rapSession != AUTH_FAILED) {
+					releaseRap(*rapSession);
+				}
 				return result;
 			}
 		}
 	} else {
+		const char * host = getHeader(request, "Host");
+		if (host == NULL) {
+			// TODO something more meaningful here.
+			host = "";
+		}
+
+		// Authenticate all new requests regardless of anything else
 		*rapSession = acquireRap(request);
 		if (*rapSession == AUTH_FAILED) {
-			return sendResponse(request, MHD_HTTP_UNAUTHORIZED, NULL, method, url, "?");
+			return sendResponse(request, MHD_HTTP_UNAUTHORIZED, NULL, *rapSession, method, url);
 		} else if (*rapSession == AUTH_ERROR) {
-			return sendResponse(request, MHD_HTTP_INTERNAL_SERVER_ERROR, NULL, method, url, "?");
-		} else if (strcmp(version, "HTTP/1.1")) {
-			// We can only accept http 1.1 sessions
-			// Http 1.0 is old and REALLY shouldn't be used
-			// It misses out the "Host" header which is required for this program to function correctly
-			stdLogError(0, "HTTP Version not supported, only HTTP/1.1 is accepted. Supplied: %s", version);
-			int ret = sendResponse(request, MHD_HTTP_HTTP_VERSION_NOT_SUPPORTED,
-					createFileResponse(request, "/usr/share/webdavd/HTTP_VERSION_NOT_SUPPORTED.html"), method, url,
-					(*rapSession)->user);
-			if (!requestHasData(request)) {
-				releaseRap(*rapSession);
-			}
-			return ret;
+			return sendResponse(request, MHD_HTTP_INTERNAL_SERVER_ERROR, NULL, *rapSession, method, url);
 		} else {
-			// Get the host header and determine if data is to be sent
-			const char * host = getHeader(request, "Host");
-			int hasData = requestHasData(request);
-			if (hasData) {
+			if (requestHasData(request)) {
 				// If we have data to send then create a pipe to pump it through
 				int pipeEnds[2];
 				if (pipe(pipeEnds)) {
 					stdLogError(errno, "Could not create write pipe");
-					return sendResponse(request, MHD_HTTP_INTERNAL_SERVER_ERROR, NULL, method, url, (*rapSession)->user);
+					return sendResponse(request, MHD_HTTP_INTERNAL_SERVER_ERROR, NULL, *rapSession, method, url);
 				}
 				(*rapSession)->readDataFd = pipeEnds[PIPE_READ];
 				(*rapSession)->writeDataFd = pipeEnds[PIPE_WRITE];
+				struct MHD_Response * response;
+
+				int statusCode = processNewRequest(request, url, host, method, *rapSession, &response);
+
+				if (statusCode == MHD_HTTP_CONTINUE) {
+					// do not queue a response for contiune
+					(*rapSession)->responseAlreadyGiven = 0;
+					//logAccess(statusCode, method, (*rapSession)->user, url);
+					return MHD_YES;
+				} else {
+					(*rapSession)->responseAlreadyGiven = 1;
+					return sendResponse(request, statusCode, response, *rapSession, method, url);
+				}
 			} else {
 				(*rapSession)->readDataFd = -1;
 				(*rapSession)->writeDataFd = -1;
-			}
-			struct MHD_Response * response;
-			int statusCode = processNewRequest(request, url, host, method, *rapSession, &response);
+				struct MHD_Response * response;
 
-			if (statusCode == MHD_HTTP_CONTINUE) {
-				if (hasData) {
-					// do not queue a response for contiune
-					(*rapSession)->responseAlreadyGiven = 0;
-					return MHD_YES;
-				} else {
+				int statusCode = processNewRequest(request, url, host, method, *rapSession, &response);
+
+				if (statusCode == MHD_HTTP_CONTINUE) {
 					stdLogError(0, "RAP returned CONTINUE when there is no data");
-					int ret = sendResponse(request, MHD_HTTP_INTERNAL_SERVER_ERROR, NULL, method, url, (*rapSession)->user);
+					int ret = sendResponse(request, MHD_HTTP_INTERNAL_SERVER_ERROR, NULL, *rapSession, method, url);
+					releaseRap(*rapSession);
+					return ret;
+				} else {
+					int ret = sendResponse(request, statusCode, response, *rapSession, method, url);
 					releaseRap(*rapSession);
 					return ret;
 				}
-			} else {
-				int ret = sendResponse(request, statusCode, response, method, url, (*rapSession)->user);
-				if (hasData) {
-					(*rapSession)->responseAlreadyGiven = 1;
-					if ((*rapSession)->readDataFd != -1) {
-						close((*rapSession)->readDataFd);
-						(*rapSession)->readDataFd = -1;
-					}
-					if ((*rapSession)->writeDataFd != -1) {
-						close((*rapSession)->writeDataFd);
-						(*rapSession)->writeDataFd = -1;
-					}
-				} else {
-					releaseRap(*rapSession);
-				}
-				return ret;
 			}
 		}
 	}

@@ -225,8 +225,6 @@ static int respondToPropFind(const char * file, const char * host, struct Proper
 		filePath = (char *) file;
 	}
 
-	stdLog("PROPFIND success %s %s %s", authenticatedUser, host, file);
-
 	time_t fileTime;
 	time(&fileTime);
 	struct Message message = { .mID = RAP_MULTISTATUS, .fd = pipeEnds[PIPE_READ], .bufferCount = 2 };
@@ -428,7 +426,7 @@ static int pamAuthenticate(const char * user, const char * password) {
 	struct passwd * pwd;
 	char ** envList;
 
-	// TODO setup multiple PAM services
+	// TODO setup configurable PAM services
 	if (pam_start("webdavd", user, &pamc, &pamh) != PAM_SUCCESS) {
 		stdLogError(0, "Could not start PAM");
 		return 0;

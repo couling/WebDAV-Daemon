@@ -85,34 +85,28 @@ void * reallocSafe(void * mem, size_t newSize) {
 	}
 }
 
-struct MessageHeader {
-	enum RapConstant mID;
-	int partCount;
-	size_t partLengths[MAX_BUFFER_PARTS];
-};
-
 ssize_t sendMessage(int sock, struct Message * message) {
 	//stdLog("sendm %d", sock);
 	ssize_t size;
 	struct msghdr msg;
 	char ctrl_buf[CMSG_SPACE(sizeof(int))];
 	struct iovec liovec[MAX_BUFFER_PARTS + 1];
-	struct MessageHeader messageHeader;
+
+	if (message->bufferCount > MAX_BUFFER_PARTS || message->bufferCount < 0) {
+		stdLogError(0, "Can not send message with %d parts", message->bufferCount);
+		if (message->fd != -1) {
+			close(message->fd);
+		}
+		return -1;
+	}
 
 	msg.msg_name = NULL;
 	msg.msg_namelen = 0;
 	msg.msg_iov = liovec;
 	msg.msg_iovlen = message->bufferCount + 1;
-	liovec[0].iov_base = &messageHeader;
-	liovec[0].iov_len = sizeof(messageHeader);
+	liovec[0].iov_base = message;
+	liovec[0].iov_len = sizeof(*message);
 	memcpy(&(liovec[1]), message->buffers, sizeof(struct iovec) * message->bufferCount);
-
-	memset(&messageHeader, 0, sizeof(messageHeader));
-	messageHeader.mID = message->mID;
-	messageHeader.partCount = message->bufferCount;
-	for (int i = 0; i < message->bufferCount; i++) {
-		messageHeader.partLengths[i] = message->buffers[i].iov_len;
-	}
 
 	if (message->fd != -1) {
 		memset(&ctrl_buf, 0, sizeof(ctrl_buf));
@@ -140,7 +134,7 @@ ssize_t sendMessage(int sock, struct Message * message) {
 
 ssize_t recvMessage(int sock, struct Message * message, char * incomingBuffer, size_t incomingBufferSize) {
 	//stdLog("recvm %d", sock);
-	ssize_t size;
+
 	struct msghdr msg;
 	char ctrl_buf[CMSG_SPACE(sizeof(int))];
 	struct iovec iovec[2];
@@ -148,25 +142,34 @@ ssize_t recvMessage(int sock, struct Message * message, char * incomingBuffer, s
 	msg.msg_name = NULL;
 	msg.msg_namelen = 0;
 	msg.msg_iov = iovec;
-	msg.msg_iovlen = 1;
-	msg.msg_control = &ctrl_buf;
+	msg.msg_iovlen = 2;
+	msg.msg_control = ctrl_buf;
 	msg.msg_controllen = sizeof(ctrl_buf);
-	iovec[0].iov_base = incomingBuffer;
-	iovec[0].iov_len = incomingBufferSize - 1;
+	iovec[0].iov_base = message;
+	iovec[0].iov_len = sizeof(*message);
+	iovec[1].iov_base = incomingBuffer;
+	iovec[1].iov_len = incomingBufferSize;
 
 	memset(incomingBuffer, 0, incomingBufferSize);
 
-	size = recvmsg(sock, &msg, MSG_CMSG_CLOEXEC);
-	if (size < 0) {
-		stdLogError(errno, "Could not receive socket message");
-		return -1;
+	// TODO implement timeout ... possibly using "select"
+	ssize_t size = recvmsg(sock, &msg, MSG_CMSG_CLOEXEC);
+	// this is there to stop random EINTR failures. never yet found out what cause them
+	// but this seems to fix them.
+	if (size < 0 && errno == EINTR) {
+		stdLogError(0, "Could not receive socket message intr %d %zd ... retry", sock, size);
+		int retryCount = 20;
+		do {
+			retryCount --;
+			size = recvmsg(sock, &msg, MSG_CMSG_CLOEXEC);
+		} while (size < 0 && errno == EINTR && retryCount > 0);
 	}
-	if (size == 0) {
-		return 0;
+	if (size <= 0) {
+		if (size < 0) {
+			stdLogError(errno, "Could not receive socket message %d %zd", sock, size);
+		}
+		return size;
 	}
-
-	// Null terminate the buffer to avoid buffer overread
-	incomingBuffer[size] = '\0';
 
 	struct cmsghdr * cmsg = CMSG_FIRSTHDR(&msg);
 	if (cmsg && cmsg->cmsg_len == CMSG_LEN(sizeof(int)) && cmsg->cmsg_level == SOL_SOCKET
@@ -176,30 +179,29 @@ ssize_t recvMessage(int sock, struct Message * message, char * incomingBuffer, s
 		message->fd = -1;
 	}
 
-	struct MessageHeader * messageHeader = (struct MessageHeader *) (incomingBuffer);
-	if (size
-			< sizeof(struct MessageHeader)|| messageHeader->partCount < 0 || messageHeader->partCount > MAX_BUFFER_PARTS) {
-		stdLogError(0, "Invalid message received %d", messageHeader->partCount);
+	if (size < sizeof(*message) || message->bufferCount < 0 || message->bufferCount > MAX_BUFFER_PARTS) {
+		stdLogError(0, "Invalid message received %zd %d", size, message->bufferCount);
 		if (message->fd != -1) {
 			close(message->fd);
 		}
 		return -1;
 	}
 
-	message->mID = messageHeader->mID;
-	message->bufferCount = messageHeader->partCount;
-	char * partPtr = &incomingBuffer[sizeof(struct MessageHeader)];
-	for (int i = 0; i < messageHeader->partCount; i++) {
+	char * partPtr = incomingBuffer;
+	for (int i = 0; i < message->bufferCount; i++) {
 		message->buffers[i].iov_base = partPtr;
-		message->buffers[i].iov_len = messageHeader->partLengths[i];
-		partPtr += messageHeader->partLengths[i];
-		if (partPtr > incomingBuffer + size) {
+		partPtr += message->buffers[i].iov_len;
+		if (partPtr > incomingBuffer + size - sizeof(*message)) {
 			stdLogError(0, "Invalid message received: parts too long\n");
 			if (message->fd != -1) {
 				close(message->fd);
 			}
 			return -1;
 		}
+	}
+	for (int i = message->bufferCount; i < MAX_BUFFER_PARTS; i++) {
+		message->buffers[i].iov_base = NULL;
+		message->buffers[i].iov_len = 0;
 	}
 
 	return size;
