@@ -318,7 +318,7 @@ static size_t writeFile(struct Message * requestMessage) {
 
 static size_t readFile(struct Message * requestMessage) {
 	if (requestMessage->fd != -1) {
-		stdLogError(0, "read file request send incoming data!");
+		stdLogError(0, "read file request sent incoming data!");
 		close(requestMessage->fd);
 	}
 	if (!authenticated || requestMessage->bufferCount != 2) {
@@ -358,7 +358,6 @@ static size_t readFile(struct Message * requestMessage) {
 
 			time_t fileTime;
 			time(&fileTime);
-			stdLog("GET dir success %s %s %s", authenticatedUser, host, file);
 
 			struct Message message = { .mID = RAP_SUCCESS, .fd = pipeEnds[PIPE_READ], 3 };
 			message.buffers[RAP_DATE_INDEX].iov_base = &fileTime;
@@ -393,7 +392,6 @@ static size_t readFile(struct Message * requestMessage) {
 			fclose(outPipe);
 			return messageResult;
 		} else {
-			stdLog("GET success %s %s %s", authenticatedUser, host, file);
 			struct Message message = { .mID = RAP_SUCCESS, .fd = fd, .bufferCount = 3 };
 			message.buffers[RAP_DATE_INDEX].iov_base = &statinfo.st_mtime;
 			message.buffers[RAP_DATE_INDEX].iov_len = sizeof(statinfo.st_mtime);

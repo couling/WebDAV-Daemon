@@ -30,23 +30,28 @@
 #define RAP_PATH "/usr/sbin/rap"
 #define MIME_FILE_PATH "/etc/mime.types"
 
+#define ACCEPT_HEADER "OPTIONS, GET, HEAD, DELETE, PROPFIND, PUT, PROPPATCH, COPY, MOVE, LOCK, UNLOCK"
+
 struct RestrictedAccessProcessor {
 	int pid;
 	int socketFd;
 	char * user;
 	char * password;
+	int writeDataFd;
+	int readDataFd;
+	int responseAlreadyGiven;
 };
 
-struct WriteHandle {
-	int fd;
-	int failed;
-	struct RestrictedAccessProcessor * rap;
-};
+// Used as a place holder for failed auth requests which failed due to invalid credentials
+static const struct RestrictedAccessProcessor AUTH_FAILED_RAP = { .pid = 0, .socketFd = -1, .user = "", .password = "",
+		.writeDataFd = -1, .readDataFd = -1, .responseAlreadyGiven = 1 };
 
-struct MainHeaderInfo {
-	char * host;
-	int dataSent;
-};
+// Used as a place holder for failed auth requests which failed due to errors
+static const struct RestrictedAccessProcessor AUTH_ERROR_RAP = { .pid = 0, .socketFd = -1, .user = "", .password = "",
+		.writeDataFd = -1, .readDataFd = -1, .responseAlreadyGiven = 1 };
+
+#define AUTH_FAILED ((struct RestrictedAccessProcessor *)&AUTH_FAILED_RAP)
+#define AUTH_ERROR ((struct RestrictedAccessProcessor *)&AUTH_ERROR_RAP)
 
 struct MimeType {
 	const char * ext;
@@ -68,14 +73,14 @@ int mimeTypeCount = 0;
 
 static struct MHD_Response * INTERNAL_SERVER_ERROR_PAGE;
 static struct MHD_Response * UNAUTHORIZED_PAGE;
-static struct MHD_Response * OPTIONS_PAGE;
+static struct MHD_Response * METHOD_NOT_SUPPORTED_PAGE;
 
 ///////////////////////
 // Response Queueing //
 ///////////////////////
 
-#define queueAuthRequiredResponse(request) ( MHD_queue_response(request, MHD_HTTP_UNAUTHORIZED, UNAUTHORIZED_PAGE) )
-#define queueInternalServerError(request) ( MHD_queue_response(request, MHD_HTTP_INTERNAL_SERVER_ERROR, INTERNAL_SERVER_ERROR_PAGE) )
+//#define queueAuthRequiredResponse(request) ( MHD_queue_response(request, MHD_HTTP_UNAUTHORIZED, UNAUTHORIZED_PAGE) )
+//#define queueInternalServerError(request) ( MHD_queue_response(request, MHD_HTTP_INTERNAL_SERVER_ERROR, INTERNAL_SERVER_ERROR_PAGE) )
 
 static void addHeaderSafe(struct MHD_Response * response, const char * headerKey, const char * headerValue) {
 	if (headerValue == NULL) {
@@ -124,26 +129,22 @@ static ssize_t fdContentReader(int *fd, uint64_t pos, char *buf, size_t max) {
 	if (bytesRead == 0) {
 		return MHD_CONTENT_READER_END_OF_STREAM;
 	}
-	// size_t ignored = write(STDERR_FILENO, buf, bytesRead);
 	while (bytesRead < max) {
 		size_t newBytesRead = read(*fd, buf + bytesRead, max - bytesRead);
 		if (newBytesRead <= 0) {
 			break;
 		}
-		// ignored = write(STDERR_FILENO, buf + bytesRead, newBytesRead);
 		bytesRead += newBytesRead;
 	}
 	return bytesRead;
 }
 
 static void fdContentReaderCleanup(int *fd) {
-	// char c = '\n';
-	// write(STDERR_FILENO, &c, 1);
 	close(*fd);
 	free(fd);
 }
 
-static struct MHD_Response * fdContentReaderCreate(int fd, const char * mimeType, time_t date) {
+static struct MHD_Response * createFdStreamResponse(int fd, const char * mimeType, time_t date) {
 	int * fdAllocated = mallocSafe(sizeof(int));
 	*fdAllocated = fd;
 	struct MHD_Response * response = MHD_create_response_from_callback(-1, 4096,
@@ -161,10 +162,9 @@ static struct MHD_Response * fdContentReaderCreate(int fd, const char * mimeType
 	}
 	addHeaderSafe(response, "Dav", "1");
 	return response;
-
 }
 
-static struct MHD_Response * fdFileContentReaderCreate(size_t size, int fd, const char * mimeType, time_t date) {
+static struct MHD_Response * createFdFileResponse(size_t size, int fd, const char * mimeType, time_t date) {
 	struct MHD_Response * response = MHD_create_response_from_fd(size, fd);
 	if (!response) {
 		close(fd);
@@ -180,32 +180,21 @@ static struct MHD_Response * fdFileContentReaderCreate(size_t size, int fd, cons
 	return response;
 }
 
-static int queueFileResponse(struct MHD_Connection *request, int responseCode, const char * fileName) {
+static struct MHD_Response * createFileResponse(struct MHD_Connection *request, const char * fileName) {
 	int fd = open(fileName, O_RDONLY);
-
 	if (fd == -1) {
-		return queueInternalServerError(request);
+		stdLogError(errno, "Could not open file for response", fileName);
+		return NULL;
 	}
 
 	struct stat statBuffer;
-	if (fstat(fd, &statBuffer)) {
-		close(fd);
-		return queueInternalServerError(request);
-	}
-
+	fstat(fd, &statBuffer);
 	struct MimeType * mimeType = findMimeType(fileName);
-	struct MHD_Response * response = fdFileContentReaderCreate(statBuffer.st_size, fd, mimeType ? mimeType->type : NULL,
-			statBuffer.st_mtime);
-	if (!response) {
-		return MHD_NO;
-	}
 
-	int result = MHD_queue_response(request, responseCode, response);
-	MHD_destroy_response(response);
-	return result;
+	return createFdFileResponse(statBuffer.st_size, fd, mimeType ? mimeType->type : NULL, statBuffer.st_mtime);
 }
 
-static int queueRapResponse(struct MHD_Connection *request, struct Message * message) {
+static int createRapResponse(struct MHD_Connection *request, struct Message * message, struct MHD_Response ** response) {
 	// Queue the response
 	switch (message->mID) {
 	case RAP_MULTISTATUS:
@@ -218,7 +207,6 @@ static int queueRapResponse(struct MHD_Connection *request, struct Message * mes
 
 		struct stat stat;
 		fstat(message->fd, &stat);
-		struct MHD_Response * response;
 		if (mimeType[0] == '\0') {
 			if (location) {
 				struct MimeType * found = findMimeType(location);
@@ -227,40 +215,39 @@ static int queueRapResponse(struct MHD_Connection *request, struct Message * mes
 				mimeType = NULL;
 			}
 		}
+
 		if ((stat.st_mode & S_IFMT) == S_IFREG) {
-			response = fdFileContentReaderCreate(stat.st_size, message->fd, mimeType, date);
+			*response = createFdFileResponse(stat.st_size, message->fd, mimeType, date);
 		} else {
-			response = fdContentReaderCreate(message->fd, mimeType, date);
+			*response = createFdStreamResponse(message->fd, mimeType, date);
 		}
 
 		if (location) {
-			addHeaderSafe(response, "Location", location);
+			addHeaderSafe(*response, "Location", location);
 		}
 
-		int ret = MHD_queue_response(request, (message->mID == RAP_SUCCESS ? MHD_HTTP_OK : 207), response);
-		MHD_destroy_response(response);
-		return ret;
+		return (message->mID == RAP_SUCCESS ? MHD_HTTP_OK : 207);
 	}
 
-	case RAP_INTERNAL_ERROR:
-		return queueInternalServerError(request);
-
 	case RAP_ACCESS_DENIED:
-		return queueFileResponse(request, MHD_HTTP_FORBIDDEN, "/usr/share/webdavd/HTTP_FORBIDDEN.html");
+		*response = createFileResponse(request, "/usr/share/webdavd/HTTP_FORBIDDEN.html");
+		return MHD_HTTP_FORBIDDEN;
 
 	case RAP_NOT_FOUND:
-		return queueFileResponse(request, MHD_HTTP_NOT_FOUND, "/usr/share/webdavd/HTTP_NOT_FOUND.html");
+		*response = createFileResponse(request, "/usr/share/webdavd/HTTP_NOT_FOUND.html");
+		return MHD_HTTP_FORBIDDEN;
 
 	case RAP_BAD_CLIENT_REQUEST:
-		return queueFileResponse(request, MHD_HTTP_BAD_REQUEST, "/usr/share/webdavd/HTTP_BAD_REQUEST.html");
-
-	case RAP_BAD_RAP_REQUEST:
-		stdLogError(0, "RAP reported bad request");
-		return queueInternalServerError(request);
+		*response = createFileResponse(request, "/usr/share/webdavd/HTTP_BAD_REQUEST.html");
+		return MHD_HTTP_BAD_REQUEST;
 
 	default:
 		stdLogError(0, "invalid response from RAP %d", (int) message->mID);
-		return queueInternalServerError(request);
+		/* no break */
+
+	case RAP_BAD_RAP_REQUEST:
+	case RAP_INTERNAL_ERROR:
+		return MHD_HTTP_INTERNAL_SERVER_ERROR;
 	}
 
 }
@@ -318,15 +305,14 @@ static void destroyRap(struct RestrictedAccessProcessor * processor) {
 	free(processor);
 }
 
-static int createRap(struct MHD_Connection *request, struct RestrictedAccessProcessor ** newProcessor,
-		const char * user, const char * password) {
+static struct RestrictedAccessProcessor * createRap(struct MHD_Connection *request, const char * user,
+		const char * password) {
 
 	struct RestrictedAccessProcessor * processor = mallocSafe(sizeof(struct RestrictedAccessProcessor));
 	processor->pid = forkRapProcess(RAP_PATH, &(processor->socketFd));
 	if (!processor->pid) {
 		free(processor);
-		*newProcessor = NULL;
-		return queueInternalServerError(request);
+		return AUTH_ERROR;
 	}
 	size_t userLen = strlen(user) + 1;
 	size_t passLen = strlen(password) + 1;
@@ -339,48 +325,41 @@ static int createRap(struct MHD_Connection *request, struct RestrictedAccessProc
 			.iov_base = processor->user }, { .iov_len = passLen, .iov_base = processor->password } } };
 	if (sendMessage(processor->socketFd, &message) <= 0) {
 		destroyRap(processor);
-		*newProcessor = NULL;
-		return queueInternalServerError(request);
+		return AUTH_ERROR;
 	}
 	// TODO implement timeout ... possibly using "select"
 	char incomingBuffer[INCOMING_BUFFER_SIZE];
 	size_t readResult = recvMessage(processor->socketFd, &message, incomingBuffer, INCOMING_BUFFER_SIZE);
 	if (readResult <= 0 || message.mID != RAP_SUCCESS) {
 		destroyRap(processor);
-		*newProcessor = NULL;
 		if (readResult < 0) {
 			stdLogError(errno, "Could not read result from RAP ");
-			return queueInternalServerError(request);
 		} else if (readResult == 0) {
 			stdLogError(0, "RAP closed socket unexpectedly");
-			return queueInternalServerError(request);
 		} else {
 			stdLogError(0, "Access denied for user %s", user);
-			return queueAuthRequiredResponse(request);
+			return AUTH_FAILED;
 		}
-
+		return AUTH_ERROR;
 	}
 
-	*newProcessor = processor;
-
-	return MHD_YES;
+	return processor;
 }
 
 static void releaseRap(struct RestrictedAccessProcessor * processor) {
 	destroyRap(processor);
 }
 
-static int acquireRap(struct MHD_Connection *request, struct RestrictedAccessProcessor ** processor) {
+static struct RestrictedAccessProcessor * acquireRap(struct MHD_Connection *request) {
 	// TODO reuse RAP
 	char * user;
 	char * password;
 	user = MHD_basic_auth_get_username_password(request, &(password));
 	if (user && password) {
-		return createRap(request, processor, user, password);
+		return createRap(request, user, password);
 	} else {
-		*processor = NULL;
 		stdLogError(0, "Rejecting request without auth");
-		return queueAuthRequiredResponse(request);
+		return AUTH_FAILED;
 	}
 }
 
@@ -404,100 +383,64 @@ static void cleanupAfterRap(int sig, siginfo_t *siginfo, void *context) {
 static int filterGetHeader(struct Header * header, enum MHD_ValueKind kind, const char *key, const char *value) {
 	if (!strcmp(key, header->key)) {
 		header->value = value;
+		return MHD_NO;
 	}
 	return MHD_YES;
 }
 
 static const char * getHeader(struct MHD_Connection *request, const char * headerKey) {
 	struct Header header = { .key = headerKey, .value = NULL };
-	if (MHD_get_connection_values(request, MHD_HEADER_KIND, (MHD_KeyValueIterator) &filterGetHeader, &header) == MHD_YES) {
-		return header.key;
+	MHD_get_connection_values(request, MHD_HEADER_KIND, (MHD_KeyValueIterator) &filterGetHeader, &header);
+	return header.value;
+}
+
+static int completeUpload(struct MHD_Connection *request, struct RestrictedAccessProcessor * processor,
+		struct MHD_Response ** response) {
+
+	if (processor->writeDataFd == -1) {
+		*response = createFileResponse(request, "/usr/share/webdavd/HTTP_INSUFFICIENT_STORAGE.html");
+		return MHD_HTTP_INSUFFICIENT_STORAGE;
 	} else {
-		return NULL;
-	}
-}
-
-static int filterMainHeaderInfo(struct MainHeaderInfo * mainHeaderInfo, enum MHD_ValueKind kind, const char *key,
-		const char *value) {
-	if (!strcmp(key, "Host")) {
-		mainHeaderInfo->host = (char *) value;
-	} else if (!strcmp(key, "Content-Length") || (!strcmp(key, "Transfer-Encoding") && !strcmp(value, "chunked"))) {
-		mainHeaderInfo->dataSent = 1;
-	}
-	return MHD_YES;
-}
-
-static int completeUpload(struct MHD_Connection *request, struct WriteHandle * writeHandle) {
-	if (!writeHandle->failed) {
-		// char a = '\n';
-		// size_t ignore = write(STDERR_FILENO, &a, 1);
-
-		close(writeHandle->fd);
 		struct Message message;
 		char incomingBuffer[INCOMING_BUFFER_SIZE];
-		int readResult = recvMessage(writeHandle->rap->socketFd, &message, incomingBuffer, INCOMING_BUFFER_SIZE);
+		int readResult = recvMessage(processor->socketFd, &message, incomingBuffer, INCOMING_BUFFER_SIZE);
 		if (readResult <= 0) {
 			if (readResult == 0) {
 				stdLogError(0, "RAP closed socket unexpectedly while waiting for response");
 			}
+			return MHD_HTTP_INTERNAL_SERVER_ERROR;
 		}
 
-		releaseRap(writeHandle->rap);
-		free(writeHandle);
 		if (readResult > 0) {
-			return queueRapResponse(request, &message);
+			return createRapResponse(request, &message, response);
 		} else {
-			return queueInternalServerError(request);
+			return MHD_HTTP_INTERNAL_SERVER_ERROR;
 		}
-	} else {
-		stdLog("M");
-		free(writeHandle);
-		return MHD_YES;
 	}
 }
 
-static void abortSession(struct WriteHandle * writeHandle, struct RestrictedAccessProcessor * rapSession) {
-	if (writeHandle) {
-		close(writeHandle->fd);
-		writeHandle->failed = 1;
-	}
-	releaseRap(rapSession);
-}
+static void processUploadData(struct MHD_Connection * request, const char * upload_data, size_t upload_data_size,
+		struct RestrictedAccessProcessor * processor) {
 
-static int processUploadData(struct MHD_Connection * request, const char * upload_data, size_t * upload_data_size,
-		struct WriteHandle * writeHandle) {
-	if (writeHandle->failed) {
-		return MHD_YES;
+	if (processor->writeDataFd != -1) {
+		// size_t ignore = write(STDERR_FILENO, upload_data, *upload_data_size);
+		size_t bytesWritten = write(processor->writeDataFd, upload_data, upload_data_size);
+		if (bytesWritten < upload_data_size) {
+			// not all data could be written to the file handle and therefore
+			// the operation has now failed. There's nothing we can do now but report the error
+			// This may not actually be desirable and so we need to consider slamming closed the connection.
+			close(processor->writeDataFd);
+			processor->writeDataFd = -1;
+		}
 	}
-	// size_t ignore = write(STDERR_FILENO, upload_data, *upload_data_size);
-	size_t bytesWritten = write(writeHandle->fd, upload_data, *upload_data_size);
-	if (bytesWritten < *upload_data_size) {
-		// not all data could be written to the file handle and therefore
-		// the operation has now failed. There's nothing we can do now but report the error
-		// We will still return MHD_YES and so spool through the data provided
-		// This may not actually be desirable and so we need to consider slamming closed the connection.
-		abortSession(writeHandle, writeHandle->rap);
-		return queueFileResponse(request, MHD_HTTP_INSUFFICIENT_STORAGE,
-				"/usr/share/webdavd/HTTP_INSUFFICIENT_STORAGE.html");
-	} else {
-		*upload_data_size = 0;
-		return MHD_YES;
-	}
-
 }
 
 static int processNewRequest(struct MHD_Connection * request, const char * url, const char * host, const char * method,
-		struct WriteHandle * writeHandle) {
-
-	// Get a RAP
-	struct RestrictedAccessProcessor * rapSession;
-	int ret = acquireRap(request, &rapSession);
-	if (!rapSession) {
-		return ret;
-	}
+		struct RestrictedAccessProcessor * rapSession, struct MHD_Response ** response) {
 
 	// Interpret the method
 	struct Message message;
+	message.fd = rapSession->readDataFd;
 	message.buffers[RAP_HOST_INDEX].iov_len = strlen(host) + 1;
 	message.buffers[RAP_HOST_INDEX].iov_base = (void *) host;
 	message.buffers[RAP_FILE_INDEX].iov_len = strlen(url) + 1;
@@ -527,94 +470,156 @@ static int processNewRequest(struct MHD_Connection * request, const char * url, 
 		}
 		message.bufferCount = 3;
 	} else if (!strcmp("OPTIONS", method)) {
-		stdLog("OPTIONS success %s %s %s", rapSession->user, host, url);
-		releaseRap(rapSession);
-		return MHD_queue_response(request, MHD_HTTP_OK, OPTIONS_PAGE);
+		*response = createFileResponse(request, "/usr/share/webdavd/OPTIONS.html");
+		addHeaderSafe(*response, "Accept", ACCEPT_HEADER);
+		return MHD_HTTP_OK;
 	} else {
-		// TODO add "Allow" header
-		stdLogError(0, "Can not cope with method: %s (%s data)", method, (writeHandle ? "with" : "without"));
-		releaseRap(rapSession);
-		return queueFileResponse(request, MHD_HTTP_METHOD_NOT_ACCEPTABLE,
-				"/usr/share/webdavd/HTTP_METHOD_NOT_SUPPORTED.html");
-	}
-
-	// If we have data to send then create a pipe to pump it through
-	if (writeHandle) {
-		int pipeEnds[2];
-		if (pipe(pipeEnds)) {
-			stdLogError(errno, "Could not create write pipe");
-			return queueInternalServerError(request);
-		}
-		writeHandle->fd = pipeEnds[PIPE_WRITE];
-		message.fd = pipeEnds[PIPE_READ];
-		writeHandle->failed = 0;
-		writeHandle->rap = rapSession;
-	} else {
-		message.fd = -1;
+		stdLogError(0, "Can not cope with method: %s (%s data)", method,
+				(rapSession->writeDataFd != -1 ? "with" : "without"));
+		return MHD_HTTP_METHOD_NOT_ALLOWED;
 	}
 
 	// Send the request to the RAP
-	if (sendMessage(rapSession->socketFd, &message) < 0) {
-		abortSession(writeHandle, rapSession);
-		return queueInternalServerError(request);
+	size_t ioResult = sendMessage(rapSession->socketFd, &message);
+	rapSession->readDataFd = -1; // this will always be closed by sendMessage even on failure!
+	if (ioResult <= 0) {
+		return MHD_HTTP_INTERNAL_SERVER_ERROR;
 	}
 
 	// Get result from RAP
 	char incomingBuffer[INCOMING_BUFFER_SIZE];
-	int readResult = recvMessage(rapSession->socketFd, &message, incomingBuffer, INCOMING_BUFFER_SIZE);
-	if (readResult <= 0) {
-		if (readResult == 0) {
+	ioResult = recvMessage(rapSession->socketFd, &message, incomingBuffer, INCOMING_BUFFER_SIZE);
+	if (ioResult <= 0) {
+		if (ioResult == 0) {
 			stdLogError(0, "RAP closed socket unexpectedly while waiting for response");
 		}
-		abortSession(writeHandle, rapSession);
-		return queueInternalServerError(request);
+		return MHD_HTTP_INTERNAL_SERVER_ERROR;
 	}
 
 	if (message.mID == RAP_CONTINUE) {
-		if (!writeHandle) {
-			stdLogError(0, "RAP returned RAP_CONTINUE when no data was sent");
-			return queueInternalServerError(request);
-		}
-		else {
-			return MHD_YES;
-		}
+		return MHD_HTTP_CONTINUE;
 	} else {
-		abortSession(writeHandle, rapSession);
-		return queueRapResponse(request, &message);
+		return createRapResponse(request, &message, response);
+	}
+}
+
+static int requestHasData(struct MHD_Connection *request) {
+	if (getHeader(request, "Content-Length")) {
+		return 1;
+	} else {
+		const char * te = getHeader(request, "Transfer-Encoding");
+		return te && !strcmp(te, "chunked");
+	}
+}
+
+static int sendResponse(struct MHD_Connection *request, int statusCode, struct MHD_Response * response,
+		const char * method, const char * url, const char * user) {
+	stdLog("%d %s %s %s", statusCode, method, user, url);
+	switch (statusCode) {
+	case MHD_HTTP_INTERNAL_SERVER_ERROR:
+		return MHD_queue_response(request, MHD_HTTP_INTERNAL_SERVER_ERROR, INTERNAL_SERVER_ERROR_PAGE);
+	case MHD_HTTP_UNAUTHORIZED:
+		return MHD_queue_response(request, MHD_HTTP_UNAUTHORIZED, UNAUTHORIZED_PAGE);
+	case MHD_HTTP_METHOD_NOT_ACCEPTABLE:
+		return MHD_queue_response(request, MHD_HTTP_METHOD_NOT_ACCEPTABLE, METHOD_NOT_SUPPORTED_PAGE);
+	default: {
+		int queueResult = MHD_queue_response(request, statusCode, response);
+		MHD_destroy_response(response);
+		return queueResult;
+	}
 	}
 }
 
 static int answerToRequest(void *cls, struct MHD_Connection *request, char *url, const char *method,
-		const char *version, const char *upload_data, size_t *upload_data_size, struct WriteHandle ** writeHandle) {
+		const char *version, const char *upload_data, size_t *upload_data_size,
+		struct RestrictedAccessProcessor ** rapSession) {
 
-	// We can only accept http 1.1 sessions
-	// Http 1.0 is old and REALLY shouldn't be used
-	// It misses out the "Host" header which is required for this program to function correctly
-	if (strcmp(version, "HTTP/1.1")) {
-		stdLogError(0, "HTTP Version not supported, only HTTP/1.1 is accepted. Supplied: %s", version);
-		return queueFileResponse(request, MHD_HTTP_HTTP_VERSION_NOT_SUPPORTED,
-				"/usr/share/webdavd/HTTP_VERSION_NOT_SUPPORTED.html");
-	}
-
-	if (*writeHandle) {
-		if (*upload_data_size)
-			return processUploadData(request, upload_data, upload_data_size, *writeHandle);
-		else
-			return completeUpload(request, *writeHandle);
+	if (*rapSession) {
+		if (*upload_data_size) {
+			if (!(*rapSession)->responseAlreadyGiven) {
+				processUploadData(request, upload_data, *upload_data_size, *rapSession);
+			}
+			*upload_data_size = 0;
+			return MHD_YES;
+		} else {
+			if ((*rapSession)->responseAlreadyGiven) {
+				releaseRap(*rapSession);
+				return MHD_YES;
+			} else {
+				struct MHD_Response * response;
+				int statusCode = completeUpload(request, *rapSession, &response);
+				int result = sendResponse(request, statusCode, response, method, url, (*rapSession)->user);
+				releaseRap(*rapSession);
+				return result;
+			}
+		}
 	} else {
-		// Get the host header and determine if data is to be sent
-		struct MainHeaderInfo mainHeaderInfo = { .dataSent = 0, .host = NULL };
-		if (!MHD_get_connection_values(request, MHD_HEADER_KIND, (MHD_KeyValueIterator) &filterMainHeaderInfo,
-				&mainHeaderInfo)) {
-			return queueInternalServerError(request);
+		*rapSession = acquireRap(request);
+		if (*rapSession == AUTH_FAILED) {
+			return sendResponse(request, MHD_HTTP_UNAUTHORIZED, NULL, method, url, "?");
+		} else if (*rapSession == AUTH_ERROR) {
+			return sendResponse(request, MHD_HTTP_INTERNAL_SERVER_ERROR, NULL, method, url, "?");
+		} else if (strcmp(version, "HTTP/1.1")) {
+			// We can only accept http 1.1 sessions
+			// Http 1.0 is old and REALLY shouldn't be used
+			// It misses out the "Host" header which is required for this program to function correctly
+			stdLogError(0, "HTTP Version not supported, only HTTP/1.1 is accepted. Supplied: %s", version);
+			int ret = sendResponse(request, MHD_HTTP_HTTP_VERSION_NOT_SUPPORTED,
+					createFileResponse(request, "/usr/share/webdavd/HTTP_VERSION_NOT_SUPPORTED.html"), method, url,
+					(*rapSession)->user);
+			if (!requestHasData(request)) {
+				releaseRap(*rapSession);
+			}
+			return ret;
+		} else {
+			// Get the host header and determine if data is to be sent
+			const char * host = getHeader(request, "Host");
+			int hasData = requestHasData(request);
+			if (hasData) {
+				// If we have data to send then create a pipe to pump it through
+				int pipeEnds[2];
+				if (pipe(pipeEnds)) {
+					stdLogError(errno, "Could not create write pipe");
+					return sendResponse(request, MHD_HTTP_INTERNAL_SERVER_ERROR, NULL, method, url, (*rapSession)->user);
+				}
+				(*rapSession)->readDataFd = pipeEnds[PIPE_READ];
+				(*rapSession)->writeDataFd = pipeEnds[PIPE_WRITE];
+			} else {
+				(*rapSession)->readDataFd = -1;
+				(*rapSession)->writeDataFd = -1;
+			}
+			struct MHD_Response * response;
+			int statusCode = processNewRequest(request, url, host, method, *rapSession, &response);
+
+			if (statusCode == MHD_HTTP_CONTINUE) {
+				if (hasData) {
+					// do not queue a response for contiune
+					(*rapSession)->responseAlreadyGiven = 0;
+					return MHD_YES;
+				} else {
+					stdLogError(0, "RAP returned CONTINUE when there is no data");
+					int ret = sendResponse(request, MHD_HTTP_INTERNAL_SERVER_ERROR, NULL, method, url, (*rapSession)->user);
+					releaseRap(*rapSession);
+					return ret;
+				}
+			} else {
+				int ret = sendResponse(request, statusCode, response, method, url, (*rapSession)->user);
+				if (hasData) {
+					(*rapSession)->responseAlreadyGiven = 1;
+					if ((*rapSession)->readDataFd != -1) {
+						close((*rapSession)->readDataFd);
+						(*rapSession)->readDataFd = -1;
+					}
+					if ((*rapSession)->writeDataFd != -1) {
+						close((*rapSession)->writeDataFd);
+						(*rapSession)->writeDataFd = -1;
+					}
+				} else {
+					releaseRap(*rapSession);
+				}
+				return ret;
+			}
 		}
-		if (mainHeaderInfo.dataSent) {
-			*writeHandle = mallocSafe(sizeof(struct WriteHandle));
-			(*writeHandle)->failed = 1; // Initialise it so that nothing is saved unless otherwise set
-			(*writeHandle)->fd = -1; // we have nothing to write to until we have something to write to.
-			(*writeHandle)->rap = NULL;
-		}
-		return processNewRequest(request, url, mainHeaderInfo.host, method, *writeHandle);
 	}
 }
 
@@ -743,9 +748,8 @@ static void initializeStaticResponses() {
 	initializeStaticResponse(&INTERNAL_SERVER_ERROR_PAGE, "/usr/share/webdavd/HTTP_INTERNAL_SERVER_ERROR.html");
 	initializeStaticResponse(&UNAUTHORIZED_PAGE, "/usr/share/webdavd/HTTP_UNAUTHORIZED.html");
 	addHeaderSafe(UNAUTHORIZED_PAGE, "WWW-Authenticate", "Basic realm=\"My Server\"");
-	initializeStaticResponse(&OPTIONS_PAGE, "/usr/share/webdavd/OPTIONS.html");
-	addHeaderSafe(OPTIONS_PAGE, "Dav", "1");
-	addHeaderSafe(OPTIONS_PAGE, "Allow",
+	initializeStaticResponse(&METHOD_NOT_SUPPORTED_PAGE, "/usr/share/webdavd/HTTP_METHOD_NOT_SUPPORTED.html");
+	addHeaderSafe(METHOD_NOT_SUPPORTED_PAGE, "Allow",
 			"OPTIONS, GET, HEAD, DELETE, PROPFIND, PUT, PROPPATCH, COPY, MOVE, LOCK, UNLOCK");
 }
 
