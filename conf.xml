@@ -1,0 +1,24 @@
+<server-config xmlns="http://couling.me/webdavd">
+	<server>
+		<listen port="80" host="*" ssl-enabled="no" />
+		<listen port="443" host="*" ssl-enabled="yes" />
+		<session-timeout>5:00</session-timeout>
+		<max-user-sessions>10</max-user-sessions>
+		<restricted user="nobody" group="nobody" />
+		<mime-file>/etc/mime.types</mime-file>
+		<rap-binary>/usr/sbin/rap</rap-binary>
+		<ssl>
+			<cert>
+				<host>*</host>
+				<certificate>/etc/ssl/cert/local/server.cert</certificate>
+				<chain>/etc/ssl/cert/local/server.cert</chain>
+				<key>/etc/ssl/private/server.key</key>
+			</cert>
+			<cert>
+				<host>*</host>
+				<certificate>/etc/ssl/cert/local/server.cert</certificate>
+				<key>/etc/ssl/private/server.key</key>
+			</cert>
+		</ssl>
+	</server>
+</server-config>
