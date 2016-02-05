@@ -5,20 +5,17 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <string.h>
-#include <pwd.h>
-#include <grp.h>
 #include <time.h>
 #include <sys/stat.h>
 #include <dirent.h>
 #include <security/pam_appl.h>
-#include <libxml/xmlreader.h>
 
 #define BUFFER_SIZE 4096
 
 static int authenticated = 0;
 static const char * authenticatedUser;
 
-const char * nodeTypeToName(int nodeType) {
+static const char * nodeTypeToName(int nodeType) {
 	switch (nodeType) {
 	case XML_READER_TYPE_NONE:
 		return "XML_READER_TYPE_NONE";
@@ -64,33 +61,6 @@ const char * nodeTypeToName(int nodeType) {
 static size_t respond(enum RapConstant result, int fd) {
 	struct Message message = { .mID = result, .fd = fd, .bufferCount = 0 };
 	return sendMessage(STDOUT_FILENO, &message);
-}
-
-static int stepInto(xmlTextReaderPtr reader) {
-	// Skip all significant white space
-	int result;
-	do {
-		result = xmlTextReaderRead(reader);
-	} while (result && xmlTextReaderNodeType(reader) == XML_READER_TYPE_SIGNIFICANT_WHITESPACE);
-	return result;
-}
-
-static int stepOver(xmlTextReaderPtr reader) {
-	int depth = xmlTextReaderDepth(reader);
-	int result;
-	do {
-		result = xmlTextReaderRead(reader);
-	} while (result && xmlTextReaderDepth(reader) > depth);
-	while (result && xmlTextReaderNodeType(reader) == XML_READER_TYPE_SIGNIFICANT_WHITESPACE) {
-		result = xmlTextReaderRead(reader);
-	}
-	return result;
-}
-
-static int elementMatches(xmlTextReaderPtr reader, const char * namespace, const char * nodeName) {
-	return xmlTextReaderNodeType(reader) == XML_READER_TYPE_ELEMENT
-			&& !strcmp(xmlTextReaderConstNamespaceUri(reader), namespace)
-			&& !strcmp(xmlTextReaderConstLocalName(reader), nodeName);
 }
 
 struct PropertySet {
@@ -423,7 +393,6 @@ static int pamAuthenticate(const char * user, const char * password) {
 	static struct pam_conv pamc = { .conv = (int (*)(int num_msg, const struct pam_message **msg,
 			struct pam_response **resp, void *appdata_ptr)) &pamConverse };
 	pamc.appdata_ptr = (void *) password;
-	struct passwd * pwd;
 	char ** envList;
 
 	// TODO setup configurable PAM services
@@ -447,7 +416,7 @@ static int pamAuthenticate(const char * user, const char * password) {
 
 	// Get user details
 	if ((pamResult = pam_get_item(pamh, PAM_USER, (const void **) &user)) != PAM_SUCCESS
-			|| (pwd = getpwnam(user)) == NULL || (envList = pam_getenvlist(pamh)) == NULL) {
+			|| (envList = pam_getenvlist(pamh)) == NULL) {
 
 		pamResult = pam_close_session(pamh, 0);
 		pam_end(pamh, pamResult);
@@ -463,7 +432,9 @@ static int pamAuthenticate(const char * user, const char * password) {
 	}
 	free(envList);
 
-	if (initgroups(user, pwd->pw_gid) || setgid(pwd->pw_gid) || setuid(pwd->pw_uid)) {
+
+
+	if (!lockToUser(user)) {
 		stdLogError(errno, "Could not set uid or gid");
 		pam_close_session(pamh, 0);
 		pam_end(pamh, pamResult);

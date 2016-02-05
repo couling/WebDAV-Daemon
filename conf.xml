@@ -1,22 +1,44 @@
 <server-config xmlns="http://couling.me/webdavd">
+	<!-- Each <server> will occupy its own process -->
 	<server>
-		<listen port="80" host="*" ssl-enabled="no" />
-		<listen port="443" host="*" ssl-enabled="yes" />
+		<!-- Each listen port opens an individual listening daemon -->
+		<!-- There is no default port. Default host is "*" (any ip). Default ssl-enabled 
+			is "no" -->
+		<listen port="80" host="*" ssl="disabled" />
+		<listen port="443" host="*" ssl="enabled" />
+		<!-- The actual rap session max life (has secirity implications) -->
+		<!-- default: 5:00 Supports format: [[[hours:]minutes:]seconds] -->
 		<session-timeout>5:00</session-timeout>
+		<!-- Max rap sessions per user keep this low (eg 10) -->
 		<max-user-sessions>10</max-user-sessions>
-		<restricted user="nobody" group="nobody" />
+		<!-- Not yet supported until multiple servers. Will be very important -->
+		<restricted user="nobody" />
+		<!-- mime.types file default /etc/mime.types -->
 		<mime-file>/etc/mime.types</mime-file>
+		<!-- The location of the rap binary. default /usr/sbin/rap -->
+		<!-- DO NOT CHANGE UNLESS YOU KNOW WHAT YOU ARE DOING -->
 		<rap-binary>/usr/sbin/rap</rap-binary>
+		<!-- The service name for PAM. specifies the file name searched for --> 
+		<!-- in /etc/pam.d/. default webdavd -->
+		<pam-service>webdavd</pam-service>
+		<!-- Directory containing static error responses -->
+		<!-- default /usr/share/webdavd -->
+		<static-error-dir>/usr/share/webdavd</static-error-dir>
+		<!-- File location for logs. Default /var/log/error.log and /var/log/access.log -->
+		<error-log>/var/log/error.log</error-log>
+		<access-log>/var/log/access.log</access-log>
+		<!-- This is only required if you have specified a <listen> with ssl="enabled" -->
+		<!-- If no listen has ssl="enabled" then exclude the <ssl> node entirely -->
 		<ssl>
+			<!-- If <ssl> is provided, it must have or more valid <cert> entries -->
 			<cert>
-				<host>*</host>
+				<!-- Hostname for SNI (multiple certificates -->
+				<!-- The FIRST <cert> is always used for unknown hosts -->
+				<!-- The certificate file -->
 				<certificate>/etc/ssl/cert/local/server.cert</certificate>
+				<!-- If the certificate requires intermediary ca certificates then add <chain> nodes -->
 				<chain>/etc/ssl/cert/local/server.cert</chain>
-				<key>/etc/ssl/private/server.key</key>
-			</cert>
-			<cert>
-				<host>*</host>
-				<certificate>/etc/ssl/cert/local/server.cert</certificate>
+				<!-- The key for <certificate> -->
 				<key>/etc/ssl/private/server.key</key>
 			</cert>
 		</ssl>

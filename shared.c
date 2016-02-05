@@ -8,6 +8,8 @@
 #include <sys/socket.h>
 #include <errno.h>
 #include <time.h>
+#include <pwd.h>
+#include <grp.h>
 
 static char * timeNow() {
 	time_t rawtime;
@@ -160,7 +162,7 @@ ssize_t recvMessage(int sock, struct Message * message, char * incomingBuffer, s
 		stdLogError(0, "Could not receive socket message intr %d %zd ... retry", sock, size);
 		int retryCount = 20;
 		do {
-			retryCount --;
+			retryCount--;
 			size = recvmsg(sock, &msg, MSG_CMSG_CLOEXEC);
 		} while (size < 0 && errno == EINTR && retryCount > 0);
 	}
@@ -218,3 +220,42 @@ size_t getWebDate(time_t rawtime, char * buf, size_t bufSize) {
 	return strftime(buf, bufSize, "%a, %d %b %Y %H:%M:%S %Z", timeinfo);
 }
 
+int lockToUser(const char * user) {
+	struct passwd * pwd = getpwnam(user);
+	if (!pwd) {
+		stdLogError(errno, "Could not find user %s", user);
+		return 0;
+	}
+	if (initgroups(user, pwd->pw_gid) || setgid(pwd->pw_gid) || setuid(pwd->pw_uid)) {
+		stdLogError(errno, "Could not lock down to user %s", user);
+		return 0;
+	}
+	return 1;
+}
+
+int stepInto(xmlTextReaderPtr reader) {
+	// Skip all significant white space
+	int result;
+	do {
+		result = xmlTextReaderRead(reader);
+	} while (result && xmlTextReaderNodeType(reader) == XML_READER_TYPE_SIGNIFICANT_WHITESPACE);
+	return result;
+}
+
+int stepOver(xmlTextReaderPtr reader) {
+	int depth = xmlTextReaderDepth(reader);
+	int result;
+	do {
+		result = xmlTextReaderRead(reader);
+	} while (result && xmlTextReaderDepth(reader) > depth);
+	while (result && xmlTextReaderNodeType(reader) == XML_READER_TYPE_SIGNIFICANT_WHITESPACE) {
+		result = xmlTextReaderRead(reader);
+	}
+	return result;
+}
+
+int elementMatches(xmlTextReaderPtr reader, const char * namespace, const char * nodeName) {
+	return xmlTextReaderNodeType(reader) == XML_READER_TYPE_ELEMENT
+			&& !strcmp(xmlTextReaderConstNamespaceUri(reader), namespace)
+			&& !strcmp(xmlTextReaderConstLocalName(reader), nodeName);
+}

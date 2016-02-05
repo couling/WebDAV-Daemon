@@ -2,6 +2,7 @@
 // TODO auth modes other than basic?
 // TODO correct failure codes on collections
 // TODO configuration file & getopt
+// TODO single root parent with multiple configured server processes
 
 #include "shared.h"
 
@@ -23,6 +24,10 @@
 #include <semaphore.h>
 #include <microhttpd.h>
 #include <errno.h>
+
+////////////////
+// Structures //
+////////////////
 
 struct RestrictedAccessProcessor {
 	int rapSessionInUse;
@@ -52,11 +57,59 @@ struct Header {
 	const char * value;
 };
 
+////////////////////
+// End Structures //
+////////////////////
+
+///////////////////////////
+// Webdavd Configuration //
+///////////////////////////
+
+struct DaemonConfig {
+	int port;
+	const char * host;
+	int sslEnabled;
+};
+
+struct SSLConfig {
+	int chainFileCount;
+	const char * keyFile;
+	const char * certificate;
+	const char ** chainFiles;
+
+};
+
+struct WebdavdConfiguration {
+	const char * restrictedUser;
+
+	// Daemons
+	int daemonCount;
+	struct DaemonConfig * daemons;
+
+	// RAP
+	time_t rapMaxSessionLife;
+	int rapMaxSessionsPerUser;
+
+	// files
+	const char * mimeTypesFile;
+	const char * rapBinary;
+	const char * accessLog;
+	const char * errorLog;
+
+	// Add static files
+
+	// SSL
+	int sslCertCount;
+	struct SSLConfig * sslCerts;
+}static config;
+
+///////////////////////////////
+// End Webdavd Configuration //
+///////////////////////////////
+
 // All Daemons
 // Not sure why we keep these, they're not used for anything
 static struct MHD_Daemon **daemons;
-static int daemonPorts[] = { 8080 };
-static int daemonCount = sizeof(daemonPorts) / sizeof(daemonPorts[0]);
 
 // Mime Database.
 // TODO find a way to move this to the RAP.
@@ -68,10 +121,6 @@ static int mimeTypeCount = 0;
 static sem_t rapDBLock;
 static int rapDBSize;
 static struct RapGroup * rapDB;
-static int rapSessionMaxLife = 60 * 5;
-
-#define RAP_PATH "/usr/sbin/rap"
-#define MIME_FILE_PATH "/etc/mime.types"
 
 #define ACCEPT_HEADER "OPTIONS, GET, HEAD, DELETE, PROPFIND, PUT, PROPPATCH, COPY, MOVE, LOCK, UNLOCK"
 
@@ -90,27 +139,21 @@ static const struct RestrictedAccessProcessor AUTH_ERROR_RAP = { .pid = 0, .sock
 #define AUTH_FAILED ((struct RestrictedAccessProcessor *)&AUTH_FAILED_RAP)
 #define AUTH_ERROR ((struct RestrictedAccessProcessor *)&AUTH_ERROR_RAP)
 
-///////////////////////
-// Response Queueing //
-///////////////////////
-
-//#define queueAuthRequiredResponse(request) ( MHD_queue_response(request, MHD_HTTP_UNAUTHORIZED, UNAUTHORIZED_PAGE) )
-//#define queueInternalServerError(request) ( MHD_queue_response(request, MHD_HTTP_INTERNAL_SERVER_ERROR, INTERNAL_SERVER_ERROR_PAGE) )
+/////////
+// Log //
+/////////
 
 static void logAccess(int statusCode, const char * method, const char * user, const char * url) {
 	stdLog("%d %s %s %s", statusCode, method, user, url);
 }
 
-static void addHeaderSafe(struct MHD_Response * response, const char * headerKey, const char * headerValue) {
-	if (headerValue == NULL) {
-		stdLogError(0, "Attempt to add null value as header %s:", headerKey);
-		return;
-	}
-	if (MHD_add_response_header(response, headerKey, headerValue) != MHD_YES) {
-		stdLogError(errno, "Could not add response header %s: %s", headerKey, headerValue);
-		exit(255);
-	}
-}
+/////////////
+// End Log //
+/////////////
+
+//////////
+// Mime //
+//////////
 
 static int compareExt(const void * a, const void * b) {
 	return strcmp(((struct MimeType *) a)->ext, ((struct MimeType *) b)->ext);
@@ -137,6 +180,25 @@ static struct MimeType * findMimeType(const char * file) {
 	}
 
 	return bsearch(&type, mimeTypes, mimeTypeCount, sizeof(struct MimeType), &compareExt);
+}
+
+//////////////
+// End Mime //
+//////////////
+
+///////////////////////
+// Response Creation //
+///////////////////////
+
+static void addHeaderSafe(struct MHD_Response * response, const char * headerKey, const char * headerValue) {
+	if (headerValue == NULL) {
+		stdLogError(0, "Attempt to add null value as header %s:", headerKey);
+		return;
+	}
+	if (MHD_add_response_header(response, headerKey, headerValue) != MHD_YES) {
+		stdLogError(errno, "Could not add response header %s: %s", headerKey, headerValue);
+		exit(255);
+	}
 }
 
 static ssize_t fdContentReader(int *fd, uint64_t pos, char *buf, size_t max) {
@@ -327,7 +389,7 @@ static void destroyRap(struct RestrictedAccessProcessor * processor) {
 static struct RestrictedAccessProcessor * createRap(struct RestrictedAccessProcessor * processor, const char * user,
 		const char * password) {
 
-	processor->pid = forkRapProcess(RAP_PATH, &(processor->socketFd));
+	processor->pid = forkRapProcess(config.rapBinary, &(processor->socketFd));
 	if (!processor->pid) {
 		return AUTH_ERROR;
 	}
@@ -365,7 +427,7 @@ static struct RestrictedAccessProcessor * createRap(struct RestrictedAccessProce
 	processor->user = user;
 	time(&processor->rapCreated);
 
-	stdLog("RAP %d authenticated on %d",processor->pid, processor->socketFd);
+	stdLog("RAP %d authenticated on %d", processor->pid, processor->socketFd);
 
 	return processor;
 }
@@ -386,7 +448,7 @@ static struct RestrictedAccessProcessor * acquireRapFromDb(const char * user, co
 	if (groupFound) {
 		time_t expireTime;
 		time(&expireTime);
-		expireTime -= rapSessionMaxLife;
+		expireTime -= config.rapMaxSessionLife;
 		for (int i = 0; i < groupFound->rapSessionCount; i++) {
 			if (groupFound->rapSession[i].socketFd != -1 && !groupFound->rapSession[i].rapSessionInUse
 					&& groupFound->rapSession[i].rapCreated >= expireTime) {
@@ -426,7 +488,7 @@ static struct RestrictedAccessProcessor * addRapToDb(struct RestrictedAccessProc
 	} else {
 		rapDBSize++;
 		rapDB = reallocSafe(rapDB, rapDBSize * sizeof(struct RapGroup));
-		groupFound = &rapDB[rapDBSize-1];
+		groupFound = &rapDB[rapDBSize - 1];
 		size_t userSize = strlen(groupToFind.user) + 1;
 		size_t passwordSize = strlen(groupToFind.password) + 1;
 		size_t bufferSize = userSize + passwordSize;
@@ -486,16 +548,15 @@ static void cleanupAfterRap(int sig, siginfo_t *siginfo, void *context) {
 static void * rapTimeoutWorker(void * ignored) {
 	// TODO actually free() something
 	while (1) {
-		sleep(rapSessionMaxLife / 2);
+		sleep(config.rapMaxSessionLife / 2);
 		time_t expireTime;
 		time(&expireTime);
-		expireTime -= rapSessionMaxLife;
+		expireTime -= config.rapMaxSessionLife;
 		stdLog("Cleaning");
 		sem_wait(&rapDBLock);
 		for (int group = 0; group < rapDBSize; group++) {
 			for (int rap = 0; rap < rapDB[group].rapSessionCount; rap++) {
-				if (!rapDB[group].rapSession[rap].rapSessionInUse
-						&& rapDB[group].rapSession[rap].socketFd != -1
+				if (!rapDB[group].rapSession[rap].rapSessionInUse && rapDB[group].rapSession[rap].socketFd != -1
 						&& rapDB[group].rapSession[rap].rapCreated < expireTime) {
 					destroyRap(&rapDB[group].rapSession[rap]);
 				}
@@ -787,7 +848,7 @@ static char * loadFileToBuffer(const char * file, size_t * size) {
 	if (stat.st_size != 0) {
 		size_t bytesRead = read(fd, buffer, stat.st_size);
 		if (bytesRead != stat.st_size) {
-			stdLogError(bytesRead < 0 ? errno : 0, "Could not read whole file %s", MIME_FILE_PATH);
+			stdLogError(bytesRead < 0 ? errno : 0, "Could not read whole file %s", file);
 			free(mimeFileBuffer);
 			return NULL;
 		}
@@ -798,7 +859,7 @@ static char * loadFileToBuffer(const char * file, size_t * size) {
 
 static void initializeMimeTypes() {
 	// Load Mime file into memory
-	mimeFileBuffer = loadFileToBuffer(MIME_FILE_PATH, &mimeFileBufferSize);
+	mimeFileBuffer = loadFileToBuffer(config.mimeTypesFile, &mimeFileBufferSize);
 	if (!mimeFileBuffer) {
 		exit(1);
 	}
@@ -928,19 +989,83 @@ static void initializeRapDatabase() {
 // Main //
 //////////
 
+#define CONFIG_NAMESPACE "http://couling.me/webdavd"
+
+void configureServer(xmlTextReaderPtr reader, const char * configFile) {
+	config.restrictedUser = "nobody";
+	config.daemonCount = 1;
+	config.daemonCount = 0;
+	config.daemons = NULL;
+	config.rapMaxSessionLife = 60 * 5;
+	config.rapMaxSessionsPerUser = 10;
+	config.rapBinary = "/usr/sbin/rap";
+	config.mimeTypesFile = "/etc/mime.types";
+	config.accessLog = "/var/log/webdavd-access.log";
+	config.errorLog = "/var/log/webdavd-error.log";
+	config.sslCertCount = 0;
+	config.sslCerts = NULL;
+
+	if (!stepInto(reader)) {
+		stdLogError(0, "error while reading %s", configFile);
+		exit(1);
+	}
+	while (xmlTextReaderDepth(reader) == 2) {
+		// process config options
+	}
+}
+
+void configure(const char * configFile) {
+	xmlTextReaderPtr reader = xmlReaderForFile(configFile, NULL, XML_PARSE_NOENT);
+	if (!reader || !stepInto(reader)) {
+		stdLogError(0, "could not create xml reader for %s", configFile);
+		exit(1);
+	}
+	if (!elementMatches(reader, CONFIG_NAMESPACE, "server-config")) {
+		stdLogError(0, "root node is not server-config in namespace %s %s", CONFIG_NAMESPACE, configFile);
+		exit(1);
+	}
+	while (1) {
+		if (!stepInto(reader)) {
+			stdLogError(0, "error while reading %s", configFile);
+			exit(1);
+		}
+		if (xmlTextReaderDepth(reader) == 1) {
+			if (elementMatches(reader, CONFIG_NAMESPACE, "server")) {
+				configureServer(reader, configFile);
+			} else {
+				if (!stepOver(reader)) {
+					stdLogError(0, "error while reading %s", configFile);
+					exit(1);
+				}
+			}
+		} else {
+			break;
+		}
+	}
+	xmlFreeTextReader(reader);
+}
+
 int main(int argCount, char ** args) {
+	if (argCount > 0) {
+		for (int i = 0; i <= argCount; i++) {
+			configure(args[i]);
+		}
+	} else {
+		configure("/etc/webdavd");
+	}
+
 	initializeMimeTypes();
 	initializeStaticResponses();
 	initializeRapDatabase();
 
 	// Start up the daemons
-	daemons = mallocSafe(sizeof(struct MHD_Daemon *) * daemonCount);
-	for (int i = 0; i < daemonCount; i++) {
-		daemons[i] = MHD_start_daemon(MHD_USE_SELECT_INTERNALLY | MHD_USE_PEDANTIC_CHECKS, daemonPorts[i], NULL, NULL,
-				(MHD_AccessHandlerCallback) &answerToRequest, NULL, MHD_OPTION_END);
+	daemons = mallocSafe(sizeof(struct MHD_Daemon *) * config.daemonCount);
+	for (int i = 0; i < config.daemonCount; i++) {
+		daemons[i] = MHD_start_daemon(MHD_USE_SELECT_INTERNALLY | MHD_USE_PEDANTIC_CHECKS, config.daemons[i].port, NULL,
+				NULL, (MHD_AccessHandlerCallback) &answerToRequest, NULL, MHD_OPTION_END);
 
 		if (!daemons[i]) {
-			stdLogError(errno, "Unable to initialise daemon on port %d", daemonPorts[i]);
+			stdLogError(errno, "Unable to initialise daemon on port %d", config.daemons[i].port);
 			exit(255);
 		}
 	}
