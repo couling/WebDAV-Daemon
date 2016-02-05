@@ -3,6 +3,7 @@
 // TODO correct failure codes on collections
 // TODO configuration file & getopt
 // TODO single root parent with multiple configured server processes
+// TODO protect RAP sessions from DOS attack using a lock per user
 
 #include "shared.h"
 
@@ -43,7 +44,6 @@ struct RestrictedAccessProcessor {
 struct RapGroup {
 	const char * user;
 	const char * password;
-	int rapSessionCount;
 	struct RestrictedAccessProcessor * rapSession;
 };
 
@@ -61,9 +61,9 @@ struct Header {
 // End Structures //
 ////////////////////
 
-///////////////////////////
-// Webdavd Configuration //
-///////////////////////////
+//////////////////////////////////////
+// Webdavd Configuration Structures //
+//////////////////////////////////////
 
 struct DaemonConfig {
 	int port;
@@ -104,9 +104,9 @@ struct WebdavdConfiguration {
 	struct SSLConfig * sslCerts;
 }static config;
 
-///////////////////////////////
-// End Webdavd Configuration //
-///////////////////////////////
+//////////////////////////////////////////
+// End Webdavd Configuration Structures //
+//////////////////////////////////////////
 
 // All Daemons
 // Not sure why we keep these, they're not used for anything
@@ -137,8 +137,12 @@ static const struct RestrictedAccessProcessor AUTH_FAILED_RAP = { .pid = 0, .soc
 static const struct RestrictedAccessProcessor AUTH_ERROR_RAP = { .pid = 0, .socketFd = -1, .user = "<auth error>",
 		.writeDataFd = -1, .readDataFd = -1, .responseAlreadyGiven = 1 };
 
+static const struct RestrictedAccessProcessor AUTH_ERROR_BACKOFF = { .pid = 0, .socketFd = -1, .user = "<backoff>",
+		.writeDataFd = -1, .readDataFd = -1, .responseAlreadyGiven = 1 };
+
 #define AUTH_FAILED ((struct RestrictedAccessProcessor *)&AUTH_FAILED_RAP)
 #define AUTH_ERROR ((struct RestrictedAccessProcessor *)&AUTH_ERROR_RAP)
+#define AUTH_BACKOFF ((struct RestrictedAccessProcessor *)&AUTH_ERROR_BACKOFF)
 
 /////////
 // Log //
@@ -441,21 +445,26 @@ static int compareRapGroup(const void * rapA, const void * rapB) {
 	return result;
 }
 
-static struct RestrictedAccessProcessor * acquireRapFromDb(const char * user, const char * password) {
+static struct RestrictedAccessProcessor * acquireRapFromDb(const char * user, const char * password,
+		int * activeSessions) {
 	struct RapGroup groupToFind = { .user = user, .password = password };
 	sem_wait(&rapDBLock);
 	struct RapGroup *groupFound = bsearch(&groupToFind, rapDB, rapDBSize, sizeof(struct RapGroup), &compareRapGroup);
 	struct RestrictedAccessProcessor * rapSessionFound = NULL;
+	*activeSessions = 0;
 	if (groupFound) {
 		time_t expireTime;
 		time(&expireTime);
 		expireTime -= config.rapMaxSessionLife;
-		for (int i = 0; i < groupFound->rapSessionCount; i++) {
+		for (int i = 0; i < config.rapMaxSessionsPerUser; i++) {
 			if (groupFound->rapSession[i].socketFd != -1 && !groupFound->rapSession[i].rapSessionInUse
 					&& groupFound->rapSession[i].rapCreated >= expireTime) {
 				rapSessionFound = &groupFound->rapSession[i];
 				groupFound->rapSession[i].rapSessionInUse = 1;
+				(*activeSessions)++;
 				break;
+			} else if (groupFound->rapSession[i].rapSessionInUse) {
+				(*activeSessions)++;
 			}
 		}
 	}
@@ -473,18 +482,22 @@ static struct RestrictedAccessProcessor * addRapToDb(struct RestrictedAccessProc
 	struct RapGroup *groupFound = bsearch(&groupToFind, rapDB, rapDBSize, sizeof(struct RapGroup), &compareRapGroup);
 	if (groupFound) {
 		newRapSession = NULL;
-		for (int i = 0; i < groupFound->rapSessionCount; i++) {
+		time_t expireTime;
+		time(&expireTime);
+		expireTime -= config.rapMaxSessionLife;
+		for (int i = 0; i < config.rapMaxSessionsPerUser; i++) {
 			if (groupFound->rapSession[i].socketFd == -1) {
 				newRapSession = &groupFound->rapSession[i];
 				break;
+			} else if (groupFound->rapSession[i].rapCreated < expireTime
+					&& !groupFound->rapSession[i].rapSessionInUse) {
+				destroyRap(&groupFound->rapSession[i]);
+				newRapSession = &groupFound->rapSession[i];
 			}
 		}
 		if (!newRapSession) {
-			// TODO limit session count
-			groupFound->rapSessionCount++;
-			groupFound->rapSession = reallocSafe(groupFound->rapSession,
-					sizeof(struct RestrictedAccessProcessor) * groupFound->rapSessionCount);
-			newRapSession = &groupFound->rapSession[groupFound->rapSessionCount - 1];
+			destroyRap(rapSession);
+			return AUTH_BACKOFF;
 		}
 	} else {
 		rapDBSize++;
@@ -498,8 +511,7 @@ static struct RestrictedAccessProcessor * addRapToDb(struct RestrictedAccessProc
 		memcpy(buffer + userSize, groupToFind.password, passwordSize);
 		groupFound->user = buffer;
 		groupFound->password = buffer + userSize;
-		groupFound->rapSessionCount = 1;
-		groupFound->rapSession = mallocSafe(sizeof(struct RestrictedAccessProcessor));
+		groupFound->rapSession = mallocSafe(sizeof(struct RestrictedAccessProcessor) * config.rapMaxSessionsPerUser);
 		newRapSession = &groupFound->rapSession[0];
 		qsort(rapDB, rapDBSize, sizeof(struct RapGroup), &compareRapGroup);
 	}
@@ -519,7 +531,8 @@ static struct RestrictedAccessProcessor * acquireRap(struct MHD_Connection *requ
 	char * password;
 	user = MHD_basic_auth_get_username_password(request, &password);
 	if (user && password) {
-		struct RestrictedAccessProcessor * rapSession = acquireRapFromDb(user, password);
+		int sessionCount;
+		struct RestrictedAccessProcessor * rapSession = acquireRapFromDb(user, password, &sessionCount);
 		if (rapSession) {
 			return rapSession;
 		} else {
@@ -556,7 +569,7 @@ static void * rapTimeoutWorker(void * ignored) {
 		stdLog("Cleaning");
 		sem_wait(&rapDBLock);
 		for (int group = 0; group < rapDBSize; group++) {
-			for (int rap = 0; rap < rapDB[group].rapSessionCount; rap++) {
+			for (int rap = 0; rap < config.rapMaxSessionsPerUser; rap++) {
 				if (!rapDB[group].rapSession[rap].rapSessionInUse && rapDB[group].rapSession[rap].socketFd != -1
 						&& rapDB[group].rapSession[rap].rapCreated < expireTime) {
 					destroyRap(&rapDB[group].rapSession[rap]);
@@ -984,11 +997,11 @@ static void initializeRapDatabase() {
 
 ////////////////////////
 // End Initialisation //
-////////////////////////z
+////////////////////////
 
-//////////
-// Main //
-//////////
+///////////////////
+// Configuration //
+///////////////////
 
 #define CONFIG_NAMESPACE "http://couling.me/webdavd"
 
@@ -1310,6 +1323,14 @@ void configure(const char * configFile) {
 	xmlFreeTextReader(reader);
 }
 
+///////////////////////
+// End Configuration //
+///////////////////////
+
+//////////
+// Main //
+//////////
+
 int main(int argCount, char ** args) {
 	if (argCount > 1) {
 		for (int i = 1; i < argCount; i++) {
@@ -1326,9 +1347,13 @@ int main(int argCount, char ** args) {
 	// Start up the daemons
 	daemons = mallocSafe(sizeof(struct MHD_Daemon *) * config.daemonCount);
 	for (int i = 0; i < config.daemonCount; i++) {
-		daemons[i] = MHD_start_daemon(MHD_USE_SELECT_INTERNALLY | MHD_USE_PEDANTIC_CHECKS, config.daemons[i].port, NULL,
-		NULL, (MHD_AccessHandlerCallback) &answerToRequest, NULL, MHD_OPTION_END);
-
+		// TODO bind to specific ip
+		if (config.daemons[i].sslEnabled) {
+		} else {
+			daemons[i] = MHD_start_daemon(MHD_USE_SELECT_INTERNALLY | MHD_USE_PEDANTIC_CHECKS, config.daemons[i].port,
+			NULL, NULL, (MHD_AccessHandlerCallback) &answerToRequest, NULL,
+			MHD_OPTION_END);
+		}
 		if (!daemons[i]) {
 			stdLogError(errno, "Unable to initialise daemon on port %d", config.daemons[i].port);
 			exit(255);
