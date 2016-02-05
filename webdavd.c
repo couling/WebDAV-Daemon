@@ -89,6 +89,7 @@ struct WebdavdConfiguration {
 	// RAP
 	time_t rapMaxSessionLife;
 	int rapMaxSessionsPerUser;
+	const char * pamServiceName;
 
 	// files
 	const char * mimeTypesFile;
@@ -991,27 +992,295 @@ static void initializeRapDatabase() {
 
 #define CONFIG_NAMESPACE "http://couling.me/webdavd"
 
-void configureServer(xmlTextReaderPtr reader, const char * configFile) {
-	config.restrictedUser = "nobody";
-	config.daemonCount = 1;
-	config.daemonCount = 0;
-	config.daemons = NULL;
-	config.rapMaxSessionLife = 60 * 5;
-	config.rapMaxSessionsPerUser = 10;
-	config.rapBinary = "/usr/sbin/rap";
-	config.mimeTypesFile = "/etc/mime.types";
-	config.accessLog = "/var/log/webdavd-access.log";
-	config.errorLog = "/var/log/webdavd-error.log";
-	config.sslCertCount = 0;
-	config.sslCerts = NULL;
+char * copyString(const char * string) {
+	if (!string) {
+		return NULL;
+	}
+	size_t stringSize = strlen(string) + 1;
+	char * newString = mallocSafe(stringSize);
+	memcpy(newString, string, stringSize);
+	return newString;
+}
 
-	if (!stepInto(reader)) {
-		stdLogError(0, "error while reading %s", configFile);
-		exit(1);
+int configureServer(xmlTextReaderPtr reader, const char * configFile, struct WebdavdConfiguration * config) {
+	config->restrictedUser = NULL;
+	config->daemonCount = 0;
+	config->daemons = NULL;
+	config->rapMaxSessionLife = 60 * 5;
+	config->rapMaxSessionsPerUser = 10;
+	config->rapBinary = NULL;
+	config->pamServiceName = NULL;
+	config->mimeTypesFile = NULL;
+	config->accessLog = NULL;
+	config->errorLog = NULL;
+	config->sslCertCount = 0;
+	config->sslCerts = NULL;
+
+	int result = stepInto(reader);
+	while (result && xmlTextReaderDepth(reader) == 2) {
+		if (xmlTextReaderNodeType(reader) == XML_READER_TYPE_ELEMENT
+				&& !strcmp(xmlTextReaderConstNamespaceUri(reader), CONFIG_NAMESPACE)) {
+
+			//<listen><port>80</port><host>localhost</host><encryption>disabled</encryption></listen>
+			if (!strcmp(xmlTextReaderConstLocalName(reader), "listen")) {
+				int index = config->daemonCount++;
+				config->daemons = reallocSafe(config->daemons, sizeof(*config->daemons) * config->daemonCount);
+				config->daemons[index].host = NULL;
+				config->daemons[index].sslEnabled = 0;
+				config->daemons[index].port = -1;
+				result = stepInto(reader);
+				while (result && xmlTextReaderDepth(reader) == 3) {
+					if (xmlTextReaderNodeType(reader) == XML_READER_TYPE_ELEMENT
+							&& !strcmp(xmlTextReaderConstNamespaceUri(reader), CONFIG_NAMESPACE)) {
+						if (!strcmp(xmlTextReaderConstLocalName(reader), "port")) {
+							if (config->daemons[index].port != -1) {
+								stdLogError(0, "port specified for listen more than once int %s", configFile);
+								exit(1);
+							}
+							const char * portString;
+							result = stepOverText(reader, &portString);
+							if (portString != NULL) {
+								char * endP;
+								long int parsedPort = strtol(portString, &endP, 10);
+								if (!*endP && parsedPort >= 0 && parsedPort <= 0xFFFF) {
+									config->daemons[index].port = parsedPort;
+								} else {
+									stdLogError(0, "%s is not a valid port in %s", portString, configFile);
+									exit(1);
+								}
+							}
+						} else if (!strcmp(xmlTextReaderConstLocalName(reader), "host")) {
+							if (config->daemons[index].host != NULL) {
+								stdLogError(0, "host specified for listen more than once int %s", configFile);
+								exit(1);
+							}
+							const char * hostString;
+							result = stepOverText(reader, &hostString);
+							config->daemons[index].host = copyString(hostString);
+						} else if (!strcmp(xmlTextReaderConstLocalName(reader), "encryption")) {
+							const char * encryptionString;
+							result = stepOverText(reader, &encryptionString);
+							if (encryptionString) {
+								if (!strcmp(encryptionString, "none")) {
+									config->daemons[index].sslEnabled = 0;
+								} else if (!strcmp(encryptionString, "ssl")) {
+									config->daemons[index].sslEnabled = 1;
+								} else {
+									stdLogError(0, "invalid encryption method %s in %s", encryptionString, configFile);
+									exit(1);
+								}
+							}
+						}
+					} else {
+						result = stepOver(reader);
+					}
+				}
+				if (config->daemons[index].port == -1) {
+					stdLogError(0, "port not specified for listen in %s", configFile);
+					exit(1);
+				}
+			}
+
+			//<session-timeout>5:00</session-timeout>
+			else if (!strcmp(xmlTextReaderConstLocalName(reader), "session-timeout")) {
+				const char * sessionTimeoutString;
+				result = stepOverText(reader, &sessionTimeoutString);
+				if (sessionTimeoutString) {
+					long int hour = 0, minute = 0, second;
+					char * endPtr;
+					second = strtol(sessionTimeoutString, &endPtr, 10);
+					if (*endPtr) {
+						if (*endPtr != ':' || endPtr == sessionTimeoutString) {
+							stdLogError(0, "Invalid session timeout length %s in %s", sessionTimeoutString, configFile);
+							exit(1);
+						}
+						minute = second;
+
+						char * endPtr2;
+						endPtr++;
+						second = strtol(endPtr, &endPtr2, 10);
+						if (*endPtr2) {
+							if (*endPtr2 != ':' || endPtr2 == endPtr) {
+								stdLogError(0, "Invalid session timeout length %s in %s", sessionTimeoutString,
+										configFile);
+								exit(1);
+							}
+							hour = minute;
+							minute = second;
+							endPtr2++;
+							second = strtol(endPtr2, &endPtr, 10);
+							if (*endPtr != '\0') {
+								stdLogError(0, "Invalid session timeout length %s in %s", sessionTimeoutString,
+										configFile);
+								exit(1);
+							}
+						}
+					}
+					config->rapMaxSessionLife = (((hour * 60) + minute) * 60) + second;
+				}
+			}
+
+			//<max-user-sessions>10</max-user-sessions>
+			else if (!strcmp(xmlTextReaderConstLocalName(reader), "max-user-sessions")) {
+				const char * sessionCountString;
+				result = stepOverText(reader, &sessionCountString);
+				if (sessionCountString) {
+					char * endPtr;
+					long int maxUserSessions = strtol(sessionCountString, &endPtr, 10);
+					if (*endPtr || maxUserSessions < 0 || maxUserSessions > 0xFFFFFFF) {
+						stdLogError(0, "Invalid max-user-sessions %s in %s", maxUserSessions, configFile);
+						exit(1);
+					}
+					config->rapMaxSessionsPerUser = maxUserSessions;
+				}
+			}
+
+			//<restricted>nobody</restricted>
+			else if (!strcmp(xmlTextReaderConstLocalName(reader), "restricted")) {
+				if (config->restrictedUser) {
+					stdLogError(0, "restricted-user specified more than once in %s", configFile);
+					exit(1);
+				}
+				const char * restrictedUser;
+				result = stepOverText(reader, &restrictedUser);
+				config->restrictedUser = copyString(restrictedUser);
+			}
+
+			//<mime-file>/etc/mime.types</mime-file>
+			else if (!strcmp(xmlTextReaderConstLocalName(reader), "mime-file")) {
+				if (config->mimeTypesFile) {
+					stdLogError(0, "restricted-user specified more than once in %s", configFile);
+					exit(1);
+				}
+				const char * mimeTypesFile;
+				result = stepOverText(reader, &mimeTypesFile);
+				config->mimeTypesFile = copyString(mimeTypesFile);
+			}
+
+			//<rap-binary>/usr/sbin/rap</rap-binary>
+			else if (!strcmp(xmlTextReaderConstLocalName(reader), "rap-binary")) {
+				if (config->rapBinary) {
+					stdLogError(0, "restricted-user specified more than once in %s", configFile);
+					exit(1);
+				}
+				const char * rapBinary;
+				result = stepOverText(reader, &rapBinary);
+				config->rapBinary = copyString(rapBinary);
+			}
+
+			//<static-error-dir>/usr/share/webdavd</static-error-dir>
+			// TODO <static-error-dir>/usr/share/webdavd</static-error-dir>
+
+			//<pam-service>webdavd</pam-service>
+			else if (!strcmp(xmlTextReaderConstLocalName(reader), "pam-service")) {
+				if (config->pamServiceName) {
+					stdLogError(0, "restricted-user specified more than once in %s", configFile);
+					exit(1);
+				}
+				const char * pamServiceName;
+				result = stepOverText(reader, &pamServiceName);
+				config->pamServiceName = copyString(pamServiceName);
+			}
+
+			//<access-log>/var/log/access.log</access-log>
+			else if (!strcmp(xmlTextReaderConstLocalName(reader), "access-log")) {
+				if (config->accessLog) {
+					stdLogError(0, "restricted-user specified more than once in %s", configFile);
+					exit(1);
+				}
+				const char * accessLog;
+				result = stepOverText(reader, &accessLog);
+				config->accessLog = copyString(accessLog);
+			}
+
+			//<error-log>/var/log/error.log</error-log>
+			else if (!strcmp(xmlTextReaderConstLocalName(reader), "error-log")) {
+				if (config->errorLog) {
+					stdLogError(0, "restricted-user specified more than once in %s", configFile);
+					exit(1);
+				}
+				const char * errorLog;
+				result = stepOverText(reader, &errorLog);
+				config->errorLog = copyString(errorLog);
+			}
+
+			//<ssl-cert>...</ssl-cert>
+			else if (!strcmp(xmlTextReaderConstLocalName(reader), "ssl-cert")) {
+				int index = config->sslCertCount++;
+				config->sslCerts = reallocSafe(config->sslCerts, sizeof(*config->sslCerts) * config->sslCertCount);
+				config->sslCerts[index].certificate = NULL;
+				config->sslCerts[index].chainFileCount = 0;
+				config->sslCerts[index].chainFiles = NULL;
+				config->sslCerts[index].keyFile = NULL;
+				result = stepInto(reader);
+				while (result && xmlTextReaderDepth(reader) == 3) {
+					if (xmlTextReaderNodeType(reader) == XML_READER_TYPE_ELEMENT
+							&& !strcmp(xmlTextReaderConstNamespaceUri(reader), CONFIG_NAMESPACE)) {
+						if (!strcmp(xmlTextReaderConstLocalName(reader), "certificate")) {
+							if (config->sslCerts[index].certificate) {
+								stdLogError(0, "more than one certificate specified in ssl-cert %s", configFile);
+								exit(1);
+							}
+							const char * certificate;
+							result = stepOverText(reader, &certificate);
+							config->sslCerts[index].certificate = copyString(certificate);
+						} else if (!strcmp(xmlTextReaderConstLocalName(reader), "key")) {
+							if (config->sslCerts[index].keyFile) {
+								stdLogError(0, "more than one key specified in ssl-cert %s", configFile);
+								exit(1);
+							}
+							const char * keyFile;
+							result = stepOverText(reader, &keyFile);
+							config->sslCerts[index].keyFile = copyString(keyFile);
+						} else if (!strcmp(xmlTextReaderConstLocalName(reader), "chain")) {
+							const char * chainFile;
+							result = stepOverText(reader, &chainFile);
+							if (chainFile) {
+								int chainFileIndex = config->sslCerts[index].chainFileCount++;
+								config->sslCerts[index].chainFiles = reallocSafe(config->sslCerts[index].chainFiles,
+										config->sslCerts[index].chainFileCount
+												* sizeof(*config->sslCerts[index].chainFiles));
+								config->sslCerts[index].chainFiles[chainFileIndex] = copyString(chainFile);
+							}
+						} else {
+							result = stepOver(reader);
+						}
+					} else {
+						result = stepOver(reader);
+					}
+				}
+				if (!config->sslCerts[index].certificate) {
+					stdLogError(0, "certificate not specified in ssl-cert in %s", configFile);
+				}
+				if (!config->sslCerts[index].keyFile) {
+					stdLogError(0, "key not specified in ssl-cert in %s", configFile);
+				}
+			} else {
+				result = stepOver(reader);
+			}
+
+		} else {
+			result = stepOver(reader);
+		}
 	}
-	while (xmlTextReaderDepth(reader) == 2) {
-		// process config options
+
+	if (!config->rapBinary) {
+		config->rapBinary = "/usr/sbin/rap";
 	}
+	if (!config->mimeTypesFile) {
+		config->mimeTypesFile = "/etc/mime.types";
+	}
+	if (!config->accessLog) {
+		config->accessLog = "/var/log/webdavd-access.log";
+	}
+	if (!config->errorLog) {
+		config->errorLog = "/var/log/webdavd-error.log";
+	}
+	if (!config->pamServiceName) {
+		config->pamServiceName = "webdav";
+	}
+
+	return result;
 }
 
 void configure(const char * configFile) {
@@ -1024,30 +1293,26 @@ void configure(const char * configFile) {
 		stdLogError(0, "root node is not server-config in namespace %s %s", CONFIG_NAMESPACE, configFile);
 		exit(1);
 	}
-	while (1) {
-		if (!stepInto(reader)) {
-			stdLogError(0, "error while reading %s", configFile);
-			exit(1);
-		}
-		if (xmlTextReaderDepth(reader) == 1) {
-			if (elementMatches(reader, CONFIG_NAMESPACE, "server")) {
-				configureServer(reader, configFile);
-			} else {
-				if (!stepOver(reader)) {
-					stdLogError(0, "error while reading %s", configFile);
-					exit(1);
-				}
-			}
-		} else {
+
+	int result = stepInto(reader);
+
+	while (result && xmlTextReaderDepth(reader) == 1) {
+		if (elementMatches(reader, CONFIG_NAMESPACE, "server")) {
+			result = configureServer(reader, configFile, &config);
 			break;
+		} else {
+			stdLog("Warning: skipping %s:%s in %s", xmlTextReaderConstNamespaceUri(reader),
+					xmlTextReaderConstLocalName(reader), configFile);
+			result = stepOver(reader);
 		}
 	}
+
 	xmlFreeTextReader(reader);
 }
 
 int main(int argCount, char ** args) {
-	if (argCount > 0) {
-		for (int i = 0; i <= argCount; i++) {
+	if (argCount > 1) {
+		for (int i = 1; i < argCount; i++) {
 			configure(args[i]);
 		}
 	} else {
@@ -1062,7 +1327,7 @@ int main(int argCount, char ** args) {
 	daemons = mallocSafe(sizeof(struct MHD_Daemon *) * config.daemonCount);
 	for (int i = 0; i < config.daemonCount; i++) {
 		daemons[i] = MHD_start_daemon(MHD_USE_SELECT_INTERNALLY | MHD_USE_PEDANTIC_CHECKS, config.daemons[i].port, NULL,
-				NULL, (MHD_AccessHandlerCallback) &answerToRequest, NULL, MHD_OPTION_END);
+		NULL, (MHD_AccessHandlerCallback) &answerToRequest, NULL, MHD_OPTION_END);
 
 		if (!daemons[i]) {
 			stdLogError(errno, "Unable to initialise daemon on port %d", config.daemons[i].port);

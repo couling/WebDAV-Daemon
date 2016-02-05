@@ -15,49 +15,6 @@
 static int authenticated = 0;
 static const char * authenticatedUser;
 
-static const char * nodeTypeToName(int nodeType) {
-	switch (nodeType) {
-	case XML_READER_TYPE_NONE:
-		return "XML_READER_TYPE_NONE";
-	case XML_READER_TYPE_ELEMENT:
-		return "XML_READER_TYPE_ELEMENT";
-	case XML_READER_TYPE_ATTRIBUTE:
-		return "XML_READER_TYPE_ATTRIBUTE";
-	case XML_READER_TYPE_TEXT:
-		return "XML_READER_TYPE_TEXT";
-	case XML_READER_TYPE_CDATA:
-		return "XML_READER_TYPE_CDATA";
-	case XML_READER_TYPE_ENTITY_REFERENCE:
-		return "XML_READER_TYPE_ENTITY_REFERENCE";
-	case XML_READER_TYPE_ENTITY:
-		return "XML_READER_TYPE_ENTITY";
-	case XML_READER_TYPE_PROCESSING_INSTRUCTION:
-		return "XML_READER_TYPE_PROCESSING_INSTRUCTION";
-	case XML_READER_TYPE_COMMENT:
-		return "XML_READER_TYPE_COMMENT";
-	case XML_READER_TYPE_DOCUMENT:
-		return "XML_READER_TYPE_DOCUMENT";
-	case XML_READER_TYPE_DOCUMENT_TYPE:
-		return "XML_READER_TYPE_DOCUMENT_TYPE";
-	case XML_READER_TYPE_DOCUMENT_FRAGMENT:
-		return "XML_READER_TYPE_DOCUMENT_FRAGMENT";
-	case XML_READER_TYPE_NOTATION:
-		return "XML_READER_TYPE_NOTATION";
-	case XML_READER_TYPE_WHITESPACE:
-		return "XML_READER_TYPE_WHITESPACE";
-	case XML_READER_TYPE_SIGNIFICANT_WHITESPACE:
-		return "XML_READER_TYPE_SIGNIFICANT_WHITESPACE";
-	case XML_READER_TYPE_END_ELEMENT:
-		return "XML_READER_TYPE_END_ELEMENT";
-	case XML_READER_TYPE_END_ENTITY:
-		return "XML_READER_TYPE_END_ENTITY";
-	case XML_READER_TYPE_XML_DECLARATION:
-		return "XML_READER_TYPE_XML_DECLARATION";
-	default:
-		return NULL;
-	}
-}
-
 static size_t respond(enum RapConstant result, int fd) {
 	struct Message message = { .mID = result, .fd = fd, .bufferCount = 0 };
 	return sendMessage(STDOUT_FILENO, &message);
@@ -396,7 +353,7 @@ static int pamAuthenticate(const char * user, const char * password) {
 	char ** envList;
 
 	// TODO setup configurable PAM services
-	if (pam_start("webdavd", user, &pamc, &pamh) != PAM_SUCCESS) {
+	if (pam_start("webdav", user, &pamc, &pamh) != PAM_SUCCESS) {
 		stdLogError(0, "Could not start PAM");
 		return 0;
 	}

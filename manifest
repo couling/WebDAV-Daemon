@@ -41,10 +41,10 @@
 #
 control:control
 
-file:pam.conf:etc/pam.d/webdavd:644
+file:pam.conf:etc/pam.d/webdav:644
 file:conf.xml:etc/webdavd:644
 file:build/webdavd:usr/sbin/webdavd:755
 file:build/rap:usr/sbin/rap:4755
-file:share:usr/share/webdavd:755
+file:share:usr/share/webdavd:644
 
 #libgcrypt, libgnutls
