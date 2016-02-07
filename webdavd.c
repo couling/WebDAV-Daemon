@@ -27,8 +27,11 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <time.h>
 #include <unistd.h>
+#include <netinet/in.h>
 
 ////////////////
 // Structures //
@@ -175,6 +178,85 @@ static char * loadFileToBuffer(const char * file, size_t * size) {
 	}
 	*size = stat.st_size;
 	return buffer;
+}
+
+void ipToString(char * buffer, size_t bufferSize, const struct sockaddr * addressInfo) {
+	switch (addressInfo->sa_family) {
+	case AF_INET: {
+		struct sockaddr_in * v4Address = (struct sockaddr_in *) addressInfo;
+		unsigned char * address = (unsigned char *) (&v4Address->sin_addr);
+		snprintf(buffer, bufferSize, "%d.%d.%d.%d", address[0], address[1], address[2], address[3]);
+		break;
+	}
+
+	case AF_INET6: {
+		struct sockaddr_in6 * v6Address = (struct sockaddr_in6 *) addressInfo;
+		// See RFC 5952 section 4 for formatting rules
+		// find 0 run
+		unsigned char * address = (unsigned char *) (&v6Address->sin6_addr);
+		unsigned char * longestRun = NULL;
+		int longestRunSize = 0;
+		unsigned char * currentRun = NULL;
+		int currentRunSize = 0;
+		for (int i = 0; i < 16; i += 2) {
+			if (*(address + i) == 0 && *(address + i + 1) == 0) {
+				if (currentRunSize == 0) {
+					currentRunSize = 2;
+					currentRun = (address + i);
+				} else {
+					currentRunSize += 2;
+					if (currentRunSize > longestRunSize) {
+						longestRun = currentRun;
+						longestRunSize = currentRunSize;
+					}
+				}
+			}
+		}
+
+		int bytesWritten;
+		if (longestRunSize == 16) {
+			bytesWritten = snprintf(buffer, bufferSize, "::");
+			buffer += bytesWritten;
+			bufferSize -= bytesWritten;
+		} else {
+			for (int i = 0; i < 16; i += 2) {
+				if (&address[i] == longestRun) {
+					bytesWritten = snprintf(buffer, bufferSize, i > 0 ? ":" : "::");
+					buffer += bytesWritten;
+					bufferSize -= bytesWritten;
+					i += longestRunSize - 2;
+				} else {
+					if (*(address + i) == 0) {
+						bytesWritten = snprintf(buffer, bufferSize, "%x", *(address + i + 1));
+						buffer += bytesWritten;
+						bufferSize -= bytesWritten;
+					} else {
+						bytesWritten = snprintf(buffer, bufferSize, "%x%02x", *(address + i), *(address + i + 1));
+						buffer += bytesWritten;
+						bufferSize -= bytesWritten;
+					}
+					if (i < 14) {
+						bytesWritten = snprintf(buffer, bufferSize, ":");
+						buffer += bytesWritten;
+						bufferSize -= bytesWritten;
+					}
+				}
+			}
+		}
+
+		break;
+	}
+
+		// TODO find the unix user of the socket
+		/*
+		 case AF_UNIX: {
+		 struct sockaddr_un * unixAddress = (struct sockaddr_in6 *)addressInfo;
+		 break;
+		 }*/
+
+	default:
+		snprintf(buffer, bufferSize, "<unknown address>");
+	}
 }
 
 /////////////////
@@ -632,7 +714,7 @@ static void destroyRap(struct RestrictedAccessProcessor * processor) {
 }
 
 static struct RestrictedAccessProcessor * createRap(struct RestrictedAccessProcessor * processor, const char * user,
-		const char * password) {
+		const char * password, const char * rhost) {
 
 	processor->pid = forkRapProcess(config.rapBinary, &(processor->socketFd));
 	if (!processor->pid) {
@@ -642,11 +724,13 @@ static struct RestrictedAccessProcessor * createRap(struct RestrictedAccessProce
 	struct Message message;
 	message.mID = RAP_AUTHENTICATE;
 	message.fd = -1;
-	message.bufferCount = 2;
+	message.bufferCount = 3;
 	message.buffers[RAP_USER_INDEX].iov_len = strlen(user) + 1;
 	message.buffers[RAP_USER_INDEX].iov_base = (void *) user;
 	message.buffers[RAP_PASSWORD_INDEX].iov_len = strlen(password) + 1;
 	message.buffers[RAP_PASSWORD_INDEX].iov_base = (void *) password;
+	message.buffers[RAP_RHOST_INDEX].iov_len = strlen(rhost) + 1;
+	message.buffers[RAP_RHOST_INDEX].iov_base = (void *) rhost;
 
 	if (sendMessage(processor->socketFd, &message) <= 0) {
 		destroyRap(processor);
@@ -786,8 +870,15 @@ static struct RestrictedAccessProcessor * acquireRap(struct MHD_Connection *requ
 			return rapSession;
 		} else {
 			if (sessionCount < config.rapMaxSessionsPerUser) {
+
+				const struct sockaddr * connectionInfo = MHD_get_connection_info(request,
+						MHD_CONNECTION_INFO_CLIENT_ADDRESS)->client_addr;
+
+				char rhost[100];
+				ipToString(rhost, sizeof(rhost), connectionInfo);
+
 				struct RestrictedAccessProcessor newSession;
-				rapSession = createRap(&newSession, user, password);
+				rapSession = createRap(&newSession, user, password, rhost);
 				if (rapSession != &newSession) {
 					return rapSession;
 				} else {
@@ -1505,12 +1596,14 @@ int main(int argCount, char ** args) {
 	for (int i = 0; i < config.daemonCount; i++) {
 		// TODO bind to specific ip
 		if (config.daemons[i].sslEnabled) {
-			daemons[i] = MHD_start_daemon(MHD_USE_SELECT_INTERNALLY | MHD_USE_SSL | MHD_USE_PEDANTIC_CHECKS,
+			daemons[i] = MHD_start_daemon(
+					MHD_USE_SELECT_INTERNALLY | MHD_USE_DUAL_STACK | MHD_USE_SSL | MHD_USE_PEDANTIC_CHECKS,
 					config.daemons[i].port, NULL, NULL, &answerToRequest, NULL, MHD_OPTION_HTTPS_CERT_CALLBACK,
 					&sslSNICallback, MHD_OPTION_END);
 		} else {
-			daemons[i] = MHD_start_daemon(MHD_USE_SELECT_INTERNALLY | MHD_USE_PEDANTIC_CHECKS, config.daemons[i].port,
-			NULL, NULL, &answerToRequest, NULL, MHD_OPTION_END);
+			daemons[i] = MHD_start_daemon(MHD_USE_SELECT_INTERNALLY | MHD_USE_DUAL_STACK | MHD_USE_PEDANTIC_CHECKS,
+					config.daemons[i].port,
+					NULL, NULL, &answerToRequest, NULL, MHD_OPTION_END);
 		}
 		if (!daemons[i]) {
 			stdLogError(errno, "Unable to initialise daemon on port %d", config.daemons[i].port);

@@ -345,8 +345,7 @@ static void pamCleanup() {
 	pam_end(pamh, pamResult);
 }
 
-static int pamAuthenticate(const char * user, const char * password) {
-	char hostname[] = "localhost";
+static int pamAuthenticate(const char * user, const char * password, const char * hostname) {
 	static struct pam_conv pamc = { .conv = (int (*)(int num_msg, const struct pam_message **msg,
 			struct pam_response **resp, void *appdata_ptr)) &pamConverse };
 	pamc.appdata_ptr = (void *) password;
@@ -358,14 +357,15 @@ static int pamAuthenticate(const char * user, const char * password) {
 		return 0;
 	}
 
+	stdLog("auth start");
+
 	// Authenticate and start session
 	int pamResult;
 	if ((pamResult = pam_set_item(pamh, PAM_RHOST, hostname)) != PAM_SUCCESS
 			|| (pamResult = pam_set_item(pamh, PAM_RUSER, user)) != PAM_SUCCESS
-
 			|| (pamResult = pam_authenticate(pamh, PAM_SILENT | PAM_DISALLOW_NULL_AUTHTOK)) != PAM_SUCCESS
-			|| (pamResult = pam_acct_mgmt(pamh, PAM_SILENT | PAM_DISALLOW_NULL_AUTHTOK)) != PAM_SUCCESS || (pamResult =
-					pam_setcred(pamh, PAM_ESTABLISH_CRED)) != PAM_SUCCESS
+			|| (pamResult = pam_acct_mgmt(pamh, PAM_SILENT | PAM_DISALLOW_NULL_AUTHTOK)) != PAM_SUCCESS
+			|| (pamResult = pam_setcred(pamh, PAM_ESTABLISH_CRED)) != PAM_SUCCESS
 			|| (pamResult = pam_open_session(pamh, 0)) != PAM_SUCCESS) {
 		pam_end(pamh, pamResult);
 		return 0;
@@ -389,8 +389,6 @@ static int pamAuthenticate(const char * user, const char * password) {
 	}
 	free(envList);
 
-
-
 	if (!lockToUser(user)) {
 		stdLogError(errno, "Could not set uid or gid");
 		pam_close_session(pamh, 0);
@@ -404,7 +402,7 @@ static int pamAuthenticate(const char * user, const char * password) {
 	memcpy((char *) authenticatedUser, user, userLen);
 
 	authenticated = 1;
-
+	stdLog("auth end");
 	return 1;
 }
 
@@ -413,19 +411,20 @@ static size_t authenticate(struct Message * message) {
 		stdLogError(0, "authenticate request send incoming data!");
 		close(message->fd);
 	}
-	if (authenticated || message->bufferCount != 2) {
+	if (authenticated || message->bufferCount != 3) {
 		if (authenticated) {
 			stdLogError(0, "Login for already logged in RAP");
 		} else {
-			stdLogError(0, "Login did not provide both user and password and gave %d buffer(s)", message->bufferCount);
+			stdLogError(0, "Login provided %d buffer(s) instead of 3", message->bufferCount);
 		}
 		return respond(RAP_BAD_RAP_REQUEST, -1);
 	}
 
 	char * user = iovecToString(&message->buffers[RAP_USER_INDEX]);
 	char * password = iovecToString(&message->buffers[RAP_PASSWORD_INDEX]);
+	char * rhost = iovecToString(&message->buffers[RAP_RHOST_INDEX]);
 
-	if (pamAuthenticate(user, password)) {
+	if (pamAuthenticate(user, password, rhost)) {
 		//stdLog("Login accepted for %s", user);
 		return respond(RAP_SUCCESS, -1);
 	} else {

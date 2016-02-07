@@ -30,6 +30,7 @@ enum RapConstant {
 
 #define RAP_USER_INDEX 0
 #define RAP_PASSWORD_INDEX 1
+#define RAP_RHOST_INDEX 2
 
 #define RAP_HOST_INDEX  0
 #define RAP_FILE_INDEX  1

@@ -6,20 +6,20 @@
 			is "no" -->
 		<!-- The following will listening on localhost only and be unencrypted -->
 		<listen>
-			<port>8080</port>
+			<port>80</port>
 			<host>localhost</host>
 			<encryption>none</encryption>
 		</listen>
 		<!-- The following will listen on all ips and be encrypted -->
 		<listen>
-			<port>4430</port>
+			<port>443</port>
 			<!-- Only "none" and "ssl" are currently supported -->
 			<encryption>ssl</encryption>
 		</listen>
 
 		<!-- The actual rap session max life (has secirity implications) -->
 		<!-- default: 5:00 Supports format: [[[hours:]minutes:]seconds] -->
-		<session-timeout>5:00</session-timeout>
+		<session-timeout>1:00</session-timeout>
 
 		<!-- Max rap sessions per user keep this low (eg 10) -->
 		<max-user-sessions>10</max-user-sessions>
@@ -33,7 +33,7 @@
 
 		<!-- The location of the rap binary. default /usr/sbin/rap -->
 		<!-- DO NOT CHANGE UNLESS YOU KNOW WHAT YOU ARE DOING -->
-		<rap-binary>/usr/sbin/rap</rap-binary>
+		<rap-binary>/home/philip/workspace/WebDav Server/build/rap</rap-binary>
 
 		<!-- The service name for PAM. specifies the file name searched for -->
 		<!-- in /etc/pam.d/. default webdavd -->
