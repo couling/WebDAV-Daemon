@@ -4,27 +4,31 @@
 // TODO configuration file & getopt
 // TODO single root parent with multiple configured server processes
 // TODO protect RAP sessions from DOS attack using a lock per user
+// TODO find client IP and integrate this both into logging and authentication
 
 #include "shared.h"
 
+#include <errno.h>
 #include <fcntl.h>
-#include <signal.h>
-#include <stdlib.h>
-#include <stdio.h>
-#include <string.h>
-#include <pthread.h>
-#include <time.h>
+#include <gnutls/abstract.h>
+#include <gnutls/gnutls.h>
+#include <gnutls/x509.h>
 #include <limits.h>
-#include <unistd.h>
+#include <microhttpd.h>
+#include <pthread.h>
+#include <semaphore.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <sys/mman.h>
-#include <sys/types.h>
 #include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/types.h>
 #include <sys/wait.h>
-#include <semaphore.h>
-#include <microhttpd.h>
-#include <errno.h>
+#include <time.h>
+#include <unistd.h>
 
 ////////////////
 // Structures //
@@ -57,6 +61,12 @@ struct Header {
 	const char * value;
 };
 
+struct SSLCertificate {
+	const char *hostname;
+	gnutls_pcert_st cert;
+	gnutls_privkey_t key;
+};
+
 ////////////////////
 // End Structures //
 ////////////////////
@@ -74,7 +84,7 @@ struct DaemonConfig {
 struct SSLConfig {
 	int chainFileCount;
 	const char * keyFile;
-	const char * certificate;
+	const char * certificateFile;
 	const char ** chainFiles;
 
 };
@@ -108,21 +118,6 @@ struct WebdavdConfiguration {
 // End Webdavd Configuration Structures //
 //////////////////////////////////////////
 
-// All Daemons
-// Not sure why we keep these, they're not used for anything
-static struct MHD_Daemon **daemons;
-
-// Mime Database.
-// TODO find a way to move this to the RAP.
-static size_t mimeFileBufferSize;
-static char * mimeFileBuffer;
-static struct MimeType * mimeTypes = NULL;
-static int mimeTypeCount = 0;
-
-static sem_t rapDBLock;
-static int rapDBSize;
-static struct RapGroup * rapDB;
-
 #define ACCEPT_HEADER "OPTIONS, GET, HEAD, DELETE, PROPFIND, PUT, PROPPATCH, COPY, MOVE, LOCK, UNLOCK"
 
 static struct MHD_Response * INTERNAL_SERVER_ERROR_PAGE;
@@ -144,21 +139,189 @@ static const struct RestrictedAccessProcessor AUTH_ERROR_BACKOFF = { .pid = 0, .
 #define AUTH_ERROR ((struct RestrictedAccessProcessor *)&AUTH_ERROR_RAP)
 #define AUTH_BACKOFF ((struct RestrictedAccessProcessor *)&AUTH_ERROR_BACKOFF)
 
-/////////
-// Log //
-/////////
+/////////////
+// Utility //
+/////////////
 
 static void logAccess(int statusCode, const char * method, const char * user, const char * url) {
 	stdLog("%d %s %s %s", statusCode, method, user, url);
 }
 
+static char * copyString(const char * string) {
+	if (!string) {
+		return NULL;
+	}
+	size_t stringSize = strlen(string) + 1;
+	char * newString = mallocSafe(stringSize);
+	memcpy(newString, string, stringSize);
+	return newString;
+}
+
+static char * loadFileToBuffer(const char * file, size_t * size) {
+	int fd = open(file, O_RDONLY);
+	struct stat stat;
+	if (fd == -1 || fstat(fd, &stat)) {
+		stdLogError(errno, "Could not open file %s", file);
+		return NULL;
+	}
+	char * buffer = mallocSafe(stat.st_size);
+	if (stat.st_size != 0) {
+		size_t bytesRead = read(fd, buffer, stat.st_size);
+		if (bytesRead != stat.st_size) {
+			stdLogError(bytesRead < 0 ? errno : 0, "Could not read whole file %s", file);
+			free(buffer);
+			return NULL;
+		}
+	}
+	*size = stat.st_size;
+	return buffer;
+}
+
+/////////////////
+// End Utility //
+/////////////////
+
+/////////
+// SSL //
+/////////
+
+static int sslCertificateCount;
+static struct SSLCertificate * sslCertificates = NULL;
+
+int sslCertificateCompareHost(const void * a, const void * b) {
+	struct SSLCertificate * lhs = (struct SSLCertificate *) a;
+	struct SSLCertificate * rhs = (struct SSLCertificate *) b;
+	return strcmp(lhs->hostname, rhs->hostname);
+}
+
+struct SSLCertificate * findCertificateForHost(const char * hostname) {
+	// TODO deal with wildcard certificates.
+	struct SSLCertificate toFind = { .hostname = hostname };
+	return bsearch(&toFind, sslCertificates, sslCertificateCount, sizeof(struct SSLCertificate),
+			&sslCertificateCompareHost);
+}
+
+int sslSNICallback(gnutls_session_t session, const gnutls_datum_t* req_ca_dn, int nreqs,
+		const gnutls_pk_algorithm_t* pk_algos, int pk_algos_length, gnutls_pcert_st** pcert, unsigned int *pcert_length,
+		gnutls_privkey_t * pkey) {
+
+	struct SSLCertificate * found = NULL;
+
+	char name[1024];
+	size_t name_len = sizeof(name) - 1;
+	unsigned int type;
+	if (GNUTLS_E_SUCCESS == gnutls_server_name_get(session, name, &name_len, &type, 0)) {
+		name[name_len] = '\0';
+		found = findCertificateForHost(name);
+	}
+
+	// Returning certificate
+	if (!found) {
+		found = &sslCertificates[0];
+	}
+	*pkey = found->key;
+	*pcert_length = 1;
+	*pcert = &found->cert;
+	return 0;
+}
+
+int loadSSLCertificate(struct SSLConfig * sslConfig) {
+	struct SSLCertificate newCertificate;
+	gnutls_x509_crt_t x509Certificate;
+	gnutls_datum_t certData = { .data = NULL };
+	gnutls_datum_t keyData = { .data = NULL };
+	int ret;
+
+	memset(&newCertificate, 0, sizeof(newCertificate));
+	memset(&x509Certificate, 0, sizeof(x509Certificate));
+
+	if ((ret = gnutls_load_file(sslConfig->certificateFile, &certData)) < 0)
+		goto CLEANUP1;
+
+	if ((ret = gnutls_load_file(sslConfig->keyFile, &keyData)) < 0)
+		goto CLEANUP2;
+
+	if ((ret = gnutls_x509_crt_init(&x509Certificate)) < 0)
+		goto CLEANUP3;
+
+	if ((ret = gnutls_x509_crt_import(x509Certificate, &certData, GNUTLS_X509_FMT_PEM)) < 0)
+		goto CLEANUP4;
+
+	if ((ret = gnutls_pcert_import_x509(&newCertificate.cert, x509Certificate, 0)) < 0)
+		goto CLEANUP4;
+
+	if ((ret = gnutls_privkey_init(&newCertificate.key)) < 0)
+		goto CLEANUP5;
+
+	if ((ret = gnutls_privkey_import_x509_raw(newCertificate.key, &keyData, GNUTLS_X509_FMT_PEM, NULL, 0)))
+		goto CLEANUP6;
+
+	ret = 0;
+
+	int found = 0;
+	for (int i = 0; ret != GNUTLS_E_REQUESTED_DATA_NOT_AVAILABLE; i++) {
+		char domainName[1024];
+		int critical;
+		size_t dataSize = sizeof(domainName);
+		int sanType;
+		ret = gnutls_x509_crt_get_subject_alt_name2(x509Certificate, i, domainName, &dataSize, &sanType, &critical);
+		if (ret != GNUTLS_E_REQUESTED_DATA_NOT_AVAILABLE && ret != GNUTLS_E_SHORT_MEMORY_BUFFER
+				&& sanType == GNUTLS_SAN_DNSNAME) {
+
+			int index = sslCertificateCount++;
+			sslCertificates = reallocSafe(sslCertificates, sslCertificateCount);
+			sslCertificates[index] = newCertificate;
+			sslCertificates[index].hostname = copyString(domainName);
+			found = 1;
+		}
+	}
+
+	if (!found) {
+		stdLogError(0, "No alternative names found in certificate %s", sslConfig->certificateFile);
+		goto CLEANUP6;
+	}
+
+	ret = 0;
+	goto CLEANUP_SUCCESS;
+
+	// These two are only used on failure
+	CLEANUP6: gnutls_privkey_deinit(newCertificate.key);
+	CLEANUP5: gnutls_pcert_deinit(&newCertificate.cert);
+
+	// The rest are used on success also
+	CLEANUP_SUCCESS: CLEANUP4: gnutls_x509_crt_deinit(x509Certificate);
+	CLEANUP3: gnutls_free(keyData.data);
+	CLEANUP2: gnutls_free(certData.data);
+	CLEANUP1: if (ret) {
+		stdLogError(0, "Loading certificate failed for %s %s: %s", sslConfig->certificateFile, sslConfig->keyFile,
+				gnutls_strerror(ret));
+	}
+	return ret;
+}
+
+void initializeSSL() {
+	for (int i = 0; i < config.sslCertCount; i++) {
+		if (loadSSLCertificate(&config.sslCerts[i])) {
+			exit(1);
+		}
+	}
+	qsort(sslCertificates, sslCertificateCount, sizeof(*sslCertificates), &sslCertificateCompareHost);
+}
+
 /////////////
-// End Log //
+// End SSL //
 /////////////
 
 //////////
 // Mime //
 //////////
+
+// Mime Database.
+// TODO find a way to move this to the RAP.
+static size_t mimeFileBufferSize;
+static char * mimeFileBuffer;
+static struct MimeType * mimeTypes = NULL;
+static int mimeTypeCount = 0;
 
 static int compareExt(const void * a, const void * b) {
 	return strcmp(((struct MimeType *) a)->ext, ((struct MimeType *) b)->ext);
@@ -185,6 +348,79 @@ static struct MimeType * findMimeType(const char * file) {
 	}
 
 	return bsearch(&type, mimeTypes, mimeTypeCount, sizeof(struct MimeType), &compareExt);
+}
+
+static void initializeMimeTypes() {
+	// Load Mime file into memory
+	mimeFileBuffer = loadFileToBuffer(config.mimeTypesFile, &mimeFileBufferSize);
+	if (!mimeFileBuffer) {
+		exit(1);
+	}
+
+	// Parse mimeFile;
+	char * partStartPtr = mimeFileBuffer;
+	int found;
+	char * type = NULL;
+	do {
+		found = 0;
+		// find the start of the part
+		while (partStartPtr < mimeFileBuffer + mimeFileBufferSize && !found) {
+			switch (*partStartPtr) {
+			case '#':
+				// skip to the end of the line
+				while (partStartPtr < mimeFileBuffer + mimeFileBufferSize && *partStartPtr != '\n') {
+					partStartPtr++;
+				}
+				// Fall through to incrementing partStartPtr
+				partStartPtr++;
+				break;
+			case ' ':
+			case '\t':
+			case '\r':
+			case '\n':
+				if (*partStartPtr == '\n') {
+					type = NULL;
+				}
+				partStartPtr++;
+				break;
+			default:
+				found = 1;
+				break;
+			}
+		}
+
+		// Find the end of the part
+		char * partEndPtr = partStartPtr + 1;
+		found = 0;
+		while (partEndPtr < mimeFileBuffer + mimeFileBufferSize && !found) {
+			switch (*partEndPtr) {
+			case ' ':
+			case '\t':
+			case '\r':
+			case '\n':
+				if (type == NULL) {
+					type = partStartPtr;
+				} else {
+					mimeTypes = reallocSafe(mimeTypes, sizeof(struct MimeType) * (mimeTypeCount + 1));
+					mimeTypes[mimeTypeCount].type = type;
+					mimeTypes[mimeTypeCount].ext = partStartPtr;
+					mimeTypeCount++;
+				}
+				if (*partEndPtr == '\n') {
+					type = NULL;
+				}
+				*partEndPtr = '\0';
+				found = 1;
+				break;
+			default:
+				partEndPtr++;
+				break;
+			}
+		}
+		partStartPtr = partEndPtr + 1;
+	} while (partStartPtr < mimeFileBuffer + mimeFileBufferSize);
+
+	qsort(mimeTypes, mimeTypeCount, sizeof(struct MimeType), &compareExt);
 }
 
 //////////////
@@ -346,6 +582,10 @@ static int createRapResponse(struct MHD_Connection *request, struct Message * me
 // RAP Processing //
 ////////////////////
 
+static sem_t rapDBLock;
+static int rapDBSize;
+static struct RapGroup * rapDB;
+
 static int forkRapProcess(const char * path, int * newSockFd) {
 	// Create unix domain socket for
 	int sockFd[2];
@@ -497,6 +737,7 @@ static struct RestrictedAccessProcessor * addRapToDb(struct RestrictedAccessProc
 		}
 		if (!newRapSession) {
 			destroyRap(rapSession);
+			sem_post(&rapDBLock);
 			return AUTH_BACKOFF;
 		}
 	} else {
@@ -512,7 +753,15 @@ static struct RestrictedAccessProcessor * addRapToDb(struct RestrictedAccessProc
 		groupFound->user = buffer;
 		groupFound->password = buffer + userSize;
 		groupFound->rapSession = mallocSafe(sizeof(struct RestrictedAccessProcessor) * config.rapMaxSessionsPerUser);
+		memset(groupFound->rapSession, 0, sizeof(struct RestrictedAccessProcessor) * config.rapMaxSessionsPerUser);
+		for (int i = 1; i < config.rapMaxSessionsPerUser; i++) {
+			groupFound->rapSession[i].socketFd = -1;
+		}
 		newRapSession = &groupFound->rapSession[0];
+
+		for (int i = 1; i < config.rapMaxSessionsPerUser; i++) {
+
+		}
 		qsort(rapDB, rapDBSize, sizeof(struct RapGroup), &compareRapGroup);
 	}
 	*newRapSession = *rapSession;
@@ -536,12 +785,16 @@ static struct RestrictedAccessProcessor * acquireRap(struct MHD_Connection *requ
 		if (rapSession) {
 			return rapSession;
 		} else {
-			struct RestrictedAccessProcessor newSession;
-			rapSession = createRap(&newSession, user, password);
-			if (rapSession != &newSession) {
-				return rapSession;
+			if (sessionCount < config.rapMaxSessionsPerUser) {
+				struct RestrictedAccessProcessor newSession;
+				rapSession = createRap(&newSession, user, password);
+				if (rapSession != &newSession) {
+					return rapSession;
+				} else {
+					return addRapToDb(rapSession, password);
+				}
 			} else {
-				return addRapToDb(rapSession, password);
+				return AUTH_BACKOFF;
 			}
 		}
 	} else {
@@ -758,9 +1011,10 @@ static int sendResponse(struct MHD_Connection *request, int statusCode, struct M
 	}
 }
 
-static int answerToRequest(void *cls, struct MHD_Connection *request, char *url, const char *method,
-		const char *version, const char *upload_data, size_t *upload_data_size,
-		struct RestrictedAccessProcessor ** rapSession) {
+static int answerToRequest(void *cls, struct MHD_Connection *request, const char *url, const char *method,
+		const char *version, const char *upload_data, size_t *upload_data_size, void ** s) {
+
+	struct RestrictedAccessProcessor ** rapSession = (struct RestrictedAccessProcessor **) s;
 
 	if (*rapSession) {
 		if (*upload_data_size) {
@@ -794,7 +1048,7 @@ static int answerToRequest(void *cls, struct MHD_Connection *request, char *url,
 
 		// Authenticate all new requests regardless of anything else
 		*rapSession = acquireRap(request);
-		if (*rapSession == AUTH_FAILED) {
+		if (*rapSession == AUTH_FAILED || *rapSession == AUTH_BACKOFF) {
 			return sendResponse(request, MHD_HTTP_UNAUTHORIZED, NULL, *rapSession, method, url);
 		} else if (*rapSession == AUTH_ERROR) {
 			return sendResponse(request, MHD_HTTP_INTERNAL_SERVER_ERROR, NULL, *rapSession, method, url);
@@ -850,99 +1104,6 @@ static int answerToRequest(void *cls, struct MHD_Connection *request, char *url,
 ////////////////////
 // Initialisation //
 ////////////////////
-
-static char * loadFileToBuffer(const char * file, size_t * size) {
-	int fd = open(file, O_RDONLY);
-	struct stat stat;
-	if (fd == -1 || fstat(fd, &stat)) {
-		stdLogError(errno, "Could not open file %s", file);
-		return NULL;
-	}
-	char * buffer = mallocSafe(stat.st_size);
-	if (stat.st_size != 0) {
-		size_t bytesRead = read(fd, buffer, stat.st_size);
-		if (bytesRead != stat.st_size) {
-			stdLogError(bytesRead < 0 ? errno : 0, "Could not read whole file %s", file);
-			free(mimeFileBuffer);
-			return NULL;
-		}
-	}
-	*size = stat.st_size;
-	return buffer;
-}
-
-static void initializeMimeTypes() {
-	// Load Mime file into memory
-	mimeFileBuffer = loadFileToBuffer(config.mimeTypesFile, &mimeFileBufferSize);
-	if (!mimeFileBuffer) {
-		exit(1);
-	}
-
-	// Parse mimeFile;
-	char * partStartPtr = mimeFileBuffer;
-	int found;
-	char * type = NULL;
-	do {
-		found = 0;
-		// find the start of the part
-		while (partStartPtr < mimeFileBuffer + mimeFileBufferSize && !found) {
-			switch (*partStartPtr) {
-			case '#':
-				// skip to the end of the line
-				while (partStartPtr < mimeFileBuffer + mimeFileBufferSize && *partStartPtr != '\n') {
-					partStartPtr++;
-				}
-				// Fall through to incrementing partStartPtr
-				partStartPtr++;
-				break;
-			case ' ':
-			case '\t':
-			case '\r':
-			case '\n':
-				if (*partStartPtr == '\n') {
-					type = NULL;
-				}
-				partStartPtr++;
-				break;
-			default:
-				found = 1;
-				break;
-			}
-		}
-
-		// Find the end of the part
-		char * partEndPtr = partStartPtr + 1;
-		found = 0;
-		while (partEndPtr < mimeFileBuffer + mimeFileBufferSize && !found) {
-			switch (*partEndPtr) {
-			case ' ':
-			case '\t':
-			case '\r':
-			case '\n':
-				if (type == NULL) {
-					type = partStartPtr;
-				} else {
-					mimeTypes = reallocSafe(mimeTypes, sizeof(struct MimeType) * (mimeTypeCount + 1));
-					mimeTypes[mimeTypeCount].type = type;
-					mimeTypes[mimeTypeCount].ext = partStartPtr;
-					mimeTypeCount++;
-				}
-				if (*partEndPtr == '\n') {
-					type = NULL;
-				}
-				*partEndPtr = '\0';
-				found = 1;
-				break;
-			default:
-				partEndPtr++;
-				break;
-			}
-		}
-		partStartPtr = partEndPtr + 1;
-	} while (partStartPtr < mimeFileBuffer + mimeFileBufferSize);
-
-	qsort(mimeTypes, mimeTypeCount, sizeof(struct MimeType), &compareExt);
-}
 
 static void initializeStaticResponse(struct MHD_Response ** response, const char * fileName) {
 	size_t bufferSize;
@@ -1005,17 +1166,7 @@ static void initializeRapDatabase() {
 
 #define CONFIG_NAMESPACE "http://couling.me/webdavd"
 
-char * copyString(const char * string) {
-	if (!string) {
-		return NULL;
-	}
-	size_t stringSize = strlen(string) + 1;
-	char * newString = mallocSafe(stringSize);
-	memcpy(newString, string, stringSize);
-	return newString;
-}
-
-int configureServer(xmlTextReaderPtr reader, const char * configFile, struct WebdavdConfiguration * config) {
+static int configureServer(xmlTextReaderPtr reader, const char * configFile, struct WebdavdConfiguration * config) {
 	config->restrictedUser = NULL;
 	config->daemonCount = 0;
 	config->daemons = NULL;
@@ -1221,7 +1372,7 @@ int configureServer(xmlTextReaderPtr reader, const char * configFile, struct Web
 			else if (!strcmp(xmlTextReaderConstLocalName(reader), "ssl-cert")) {
 				int index = config->sslCertCount++;
 				config->sslCerts = reallocSafe(config->sslCerts, sizeof(*config->sslCerts) * config->sslCertCount);
-				config->sslCerts[index].certificate = NULL;
+				config->sslCerts[index].certificateFile = NULL;
 				config->sslCerts[index].chainFileCount = 0;
 				config->sslCerts[index].chainFiles = NULL;
 				config->sslCerts[index].keyFile = NULL;
@@ -1230,13 +1381,13 @@ int configureServer(xmlTextReaderPtr reader, const char * configFile, struct Web
 					if (xmlTextReaderNodeType(reader) == XML_READER_TYPE_ELEMENT
 							&& !strcmp(xmlTextReaderConstNamespaceUri(reader), CONFIG_NAMESPACE)) {
 						if (!strcmp(xmlTextReaderConstLocalName(reader), "certificate")) {
-							if (config->sslCerts[index].certificate) {
+							if (config->sslCerts[index].certificateFile) {
 								stdLogError(0, "more than one certificate specified in ssl-cert %s", configFile);
 								exit(1);
 							}
 							const char * certificate;
 							result = stepOverText(reader, &certificate);
-							config->sslCerts[index].certificate = copyString(certificate);
+							config->sslCerts[index].certificateFile = copyString(certificate);
 						} else if (!strcmp(xmlTextReaderConstLocalName(reader), "key")) {
 							if (config->sslCerts[index].keyFile) {
 								stdLogError(0, "more than one key specified in ssl-cert %s", configFile);
@@ -1262,7 +1413,7 @@ int configureServer(xmlTextReaderPtr reader, const char * configFile, struct Web
 						result = stepOver(reader);
 					}
 				}
-				if (!config->sslCerts[index].certificate) {
+				if (!config->sslCerts[index].certificateFile) {
 					stdLogError(0, "certificate not specified in ssl-cert in %s", configFile);
 				}
 				if (!config->sslCerts[index].keyFile) {
@@ -1331,6 +1482,10 @@ void configure(const char * configFile) {
 // Main //
 //////////
 
+// All Daemons
+// Not sure why we keep these, they're not used for anything
+static struct MHD_Daemon **daemons;
+
 int main(int argCount, char ** args) {
 	if (argCount > 1) {
 		for (int i = 1; i < argCount; i++) {
@@ -1343,16 +1498,19 @@ int main(int argCount, char ** args) {
 	initializeMimeTypes();
 	initializeStaticResponses();
 	initializeRapDatabase();
+	initializeSSL();
 
 	// Start up the daemons
-	daemons = mallocSafe(sizeof(struct MHD_Daemon *) * config.daemonCount);
+	daemons = mallocSafe(sizeof(*daemons) * config.daemonCount);
 	for (int i = 0; i < config.daemonCount; i++) {
 		// TODO bind to specific ip
 		if (config.daemons[i].sslEnabled) {
+			daemons[i] = MHD_start_daemon(MHD_USE_SELECT_INTERNALLY | MHD_USE_SSL | MHD_USE_PEDANTIC_CHECKS,
+					config.daemons[i].port, NULL, NULL, &answerToRequest, NULL, MHD_OPTION_HTTPS_CERT_CALLBACK,
+					&sslSNICallback, MHD_OPTION_END);
 		} else {
 			daemons[i] = MHD_start_daemon(MHD_USE_SELECT_INTERNALLY | MHD_USE_PEDANTIC_CHECKS, config.daemons[i].port,
-			NULL, NULL, (MHD_AccessHandlerCallback) &answerToRequest, NULL,
-			MHD_OPTION_END);
+			NULL, NULL, &answerToRequest, NULL, MHD_OPTION_END);
 		}
 		if (!daemons[i]) {
 			stdLogError(errno, "Unable to initialise daemon on port %d", config.daemons[i].port);

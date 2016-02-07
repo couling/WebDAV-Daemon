@@ -6,13 +6,13 @@
 			is "no" -->
 		<!-- The following will listening on localhost only and be unencrypted -->
 		<listen>
-			<port>80</port>
+			<port>8080</port>
 			<host>localhost</host>
 			<encryption>none</encryption>
 		</listen>
 		<!-- The following will listen on all ips and be encrypted -->
 		<listen>
-			<port>443</port>
+			<port>4430</port>
 			<!-- Only "none" and "ssl" are currently supported -->
 			<encryption>ssl</encryption>
 		</listen>
