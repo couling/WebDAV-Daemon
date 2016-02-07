@@ -57,6 +57,7 @@
 			<!-- If the certificate requires intermediary ca certificates then add 
 				<chain> nodes -->
 			<chain>/etc/ssl/certs/local/server.crt</chain>
+			<chain>/etc/ssl/certs/local/server.crt</chain>
 
 			<!-- The key for <certificate> -->
 			<key>/etc/ssl/private/server.key</key>

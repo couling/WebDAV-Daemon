@@ -65,8 +65,9 @@ struct Header {
 };
 
 struct SSLCertificate {
-	const char *hostname;
-	gnutls_pcert_st cert;
+	const char * hostname;
+	int certCount;
+	gnutls_pcert_st * certs;
 	gnutls_privkey_t key;
 };
 
@@ -181,11 +182,13 @@ static char * loadFileToBuffer(const char * file, size_t * size) {
 }
 
 void ipToString(char * buffer, size_t bufferSize, const struct sockaddr * addressInfo) {
+	static unsigned char IPV4_PREFIX[] = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF };
+	unsigned char * address;
 	switch (addressInfo->sa_family) {
 	case AF_INET: {
 		struct sockaddr_in * v4Address = (struct sockaddr_in *) addressInfo;
 		unsigned char * address = (unsigned char *) (&v4Address->sin_addr);
-		snprintf(buffer, bufferSize, "%d.%d.%d.%d", address[0], address[1], address[2], address[3]);
+		PRINT_IPV4: snprintf(buffer, bufferSize, "%d.%d.%d.%d", address[0], address[1], address[2], address[3]);
 		break;
 	}
 
@@ -194,6 +197,12 @@ void ipToString(char * buffer, size_t bufferSize, const struct sockaddr * addres
 		// See RFC 5952 section 4 for formatting rules
 		// find 0 run
 		unsigned char * address = (unsigned char *) (&v6Address->sin6_addr);
+		if (!memcmp(IPV4_PREFIX, address, sizeof(IPV4_PREFIX))) {
+			snprintf(buffer, bufferSize, "%d.%d.%d.%d", address[sizeof(IPV4_PREFIX)], address[sizeof(IPV4_PREFIX) + 1],
+					address[sizeof(IPV4_PREFIX) + 2], address[sizeof(IPV4_PREFIX) + 3]);
+			break;
+		}
+
 		unsigned char * longestRun = NULL;
 		int longestRunSize = 0;
 		unsigned char * currentRun = NULL;
@@ -210,6 +219,8 @@ void ipToString(char * buffer, size_t bufferSize, const struct sockaddr * addres
 						longestRunSize = currentRunSize;
 					}
 				}
+			} else {
+				currentRunSize = 0;
 			}
 		}
 
@@ -227,16 +238,12 @@ void ipToString(char * buffer, size_t bufferSize, const struct sockaddr * addres
 					i += longestRunSize - 2;
 				} else {
 					if (*(address + i) == 0) {
-						bytesWritten = snprintf(buffer, bufferSize, "%x", *(address + i + 1));
+						bytesWritten = snprintf(buffer, bufferSize, "%x%s", *(address + i + 1), i < 14 ? ":" : "");
 						buffer += bytesWritten;
 						bufferSize -= bytesWritten;
 					} else {
-						bytesWritten = snprintf(buffer, bufferSize, "%x%02x", *(address + i), *(address + i + 1));
-						buffer += bytesWritten;
-						bufferSize -= bytesWritten;
-					}
-					if (i < 14) {
-						bytesWritten = snprintf(buffer, bufferSize, ":");
+						bytesWritten = snprintf(buffer, bufferSize, "%x%02x%s", *(address + i), *(address + i + 1),
+								i < 14 ? ":" : "");
 						buffer += bytesWritten;
 						bufferSize -= bytesWritten;
 					}
@@ -302,43 +309,95 @@ int sslSNICallback(gnutls_session_t session, const gnutls_datum_t* req_ca_dn, in
 		found = &sslCertificates[0];
 	}
 	*pkey = found->key;
-	*pcert_length = 1;
-	*pcert = &found->cert;
+	*pcert_length = found->certCount;
+	*pcert = found->certs;
 	return 0;
+}
+
+int loadSSLCertificateFile(const char * fileName, gnutls_x509_crt_t * x509Certificate, gnutls_pcert_st * cert) {
+	gnutls_datum_t certData;
+
+	memset(cert, 0, sizeof(*cert));
+	memset(x509Certificate, 0, sizeof(*x509Certificate));
+
+	int ret;
+	if ((ret = gnutls_load_file(fileName, &certData)) < 0) {
+		return ret;
+	}
+
+	if ((ret = gnutls_x509_crt_init(x509Certificate)) < 0) {
+		return ret;
+	}
+
+	ret = gnutls_x509_crt_import(*x509Certificate, &certData, GNUTLS_X509_FMT_PEM);
+	gnutls_free(certData.data);
+	if (ret < 0) {
+		gnutls_x509_crt_deinit(*x509Certificate);
+		return ret;
+	}
+
+	if ((ret = gnutls_pcert_import_x509(cert, *x509Certificate, 0)) < 0) {
+		gnutls_x509_crt_deinit(*x509Certificate);
+		return ret;
+	}
+	return ret;
+}
+
+int loadSSLKeyFile(const char * fileName, gnutls_privkey_t * key) {
+	gnutls_datum_t keyData;
+	int ret;
+	if ((ret = gnutls_load_file(fileName, &keyData)) < 0) {
+		return ret;
+	}
+
+	ret = gnutls_privkey_init(key);
+	if (ret < 0) {
+		gnutls_free(keyData.data);
+		return ret;
+	}
+
+	ret = gnutls_privkey_import_x509_raw(*key, &keyData, GNUTLS_X509_FMT_PEM, NULL, 0);
+	gnutls_free(keyData.data);
+	if (ret < 0) {
+		gnutls_privkey_deinit(*key);
+	}
+
+	return ret;
 }
 
 int loadSSLCertificate(struct SSLConfig * sslConfig) {
 	struct SSLCertificate newCertificate;
 	gnutls_x509_crt_t x509Certificate;
-	gnutls_datum_t certData = { .data = NULL };
-	gnutls_datum_t keyData = { .data = NULL };
 	int ret;
-
-	memset(&newCertificate, 0, sizeof(newCertificate));
-	memset(&x509Certificate, 0, sizeof(x509Certificate));
-
-	if ((ret = gnutls_load_file(sslConfig->certificateFile, &certData)) < 0)
-		goto CLEANUP1;
-
-	if ((ret = gnutls_load_file(sslConfig->keyFile, &keyData)) < 0)
-		goto CLEANUP2;
-
-	if ((ret = gnutls_x509_crt_init(&x509Certificate)) < 0)
-		goto CLEANUP3;
-
-	if ((ret = gnutls_x509_crt_import(x509Certificate, &certData, GNUTLS_X509_FMT_PEM)) < 0)
-		goto CLEANUP4;
-
-	if ((ret = gnutls_pcert_import_x509(&newCertificate.cert, x509Certificate, 0)) < 0)
-		goto CLEANUP4;
-
-	if ((ret = gnutls_privkey_init(&newCertificate.key)) < 0)
-		goto CLEANUP5;
-
-	if ((ret = gnutls_privkey_import_x509_raw(newCertificate.key, &keyData, GNUTLS_X509_FMT_PEM, NULL, 0)))
-		goto CLEANUP6;
-
-	ret = 0;
+	ret = loadSSLKeyFile(sslConfig->keyFile, &newCertificate.key);
+	if (ret < 0) {
+		stdLogError(0, "Could not load %s: %s", sslConfig->keyFile, gnutls_strerror(ret));
+		return 0;
+	}
+	newCertificate.certCount = sslConfig->chainFileCount + 1;
+	newCertificate.certs = mallocSafe(newCertificate.certCount);
+	for (int i = 0; i < sslConfig->chainFileCount; i++) {
+		ret = loadSSLCertificateFile(sslConfig->chainFiles[i], &x509Certificate, &newCertificate.certs[i + 1]);
+		if (ret < 0) {
+			stdLogError(0, "Could not load %s: %s", sslConfig->chainFiles[i], gnutls_strerror(ret));
+			gnutls_privkey_deinit(newCertificate.key);
+			for (int j = 0; j < i; j++) {
+				gnutls_pcert_deinit(&newCertificate.certs[j + 1]);
+			}
+			free(newCertificate.certs);
+			return ret;
+		}
+		gnutls_x509_crt_deinit(x509Certificate);
+	}
+	ret = loadSSLCertificateFile(sslConfig->certificateFile, &x509Certificate, &newCertificate.certs[0]);
+	if (ret < 0) {
+		stdLogError(0, "Could not load %s: %s", sslConfig->certificateFile, gnutls_strerror(ret));
+		gnutls_privkey_deinit(newCertificate.key);
+		for (int i = 1; i < newCertificate.certCount; i++) {
+			gnutls_pcert_deinit(&newCertificate.certs[i]);
+		}
+		free(newCertificate.certs);
+	}
 
 	int found = 0;
 	for (int i = 0; ret != GNUTLS_E_REQUESTED_DATA_NOT_AVAILABLE; i++) {
@@ -350,6 +409,7 @@ int loadSSLCertificate(struct SSLConfig * sslConfig) {
 		if (ret != GNUTLS_E_REQUESTED_DATA_NOT_AVAILABLE && ret != GNUTLS_E_SHORT_MEMORY_BUFFER
 				&& sanType == GNUTLS_SAN_DNSNAME) {
 
+			stdLog("ssl domain %s --> %s", domainName, sslConfig->certificateFile);
 			int index = sslCertificateCount++;
 			sslCertificates = reallocSafe(sslCertificates, sslCertificateCount);
 			sslCertificates[index] = newCertificate;
@@ -358,30 +418,23 @@ int loadSSLCertificate(struct SSLConfig * sslConfig) {
 		}
 	}
 
+	gnutls_x509_crt_deinit(x509Certificate);
+
 	if (!found) {
-		stdLogError(0, "No alternative names found in certificate %s", sslConfig->certificateFile);
-		goto CLEANUP6;
+		stdLogError(0, "No subject alternative name found in %s", sslConfig->certificateFile);
+		gnutls_privkey_deinit(newCertificate.key);
+		for (int i = 0; i < newCertificate.certCount; i++) {
+			gnutls_pcert_deinit(&newCertificate.certs[i]);
+		}
+		free(newCertificate.certs);
+		return -1;
 	}
 
-	ret = 0;
-	goto CLEANUP_SUCCESS;
-
-	// These two are only used on failure
-	CLEANUP6: gnutls_privkey_deinit(newCertificate.key);
-	CLEANUP5: gnutls_pcert_deinit(&newCertificate.cert);
-
-	// The rest are used on success also
-	CLEANUP_SUCCESS: CLEANUP4: gnutls_x509_crt_deinit(x509Certificate);
-	CLEANUP3: gnutls_free(keyData.data);
-	CLEANUP2: gnutls_free(certData.data);
-	CLEANUP1: if (ret) {
-		stdLogError(0, "Loading certificate failed for %s %s: %s", sslConfig->certificateFile, sslConfig->keyFile,
-				gnutls_strerror(ret));
-	}
-	return ret;
+	return 0;
 }
 
 void initializeSSL() {
+	sslCertificates = mallocSafe(sslCertificateCount * sizeof(*sslCertificates));
 	for (int i = 0; i < config.sslCertCount; i++) {
 		if (loadSSLCertificate(&config.sslCerts[i])) {
 			exit(1);
@@ -910,7 +963,6 @@ static void * rapTimeoutWorker(void * ignored) {
 		time_t expireTime;
 		time(&expireTime);
 		expireTime -= config.rapMaxSessionLife;
-		stdLog("Cleaning");
 		sem_wait(&rapDBLock);
 		for (int group = 0; group < rapDBSize; group++) {
 			for (int rap = 0; rap < config.rapMaxSessionsPerUser; rap++) {
