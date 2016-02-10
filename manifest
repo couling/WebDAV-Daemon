@@ -39,12 +39,13 @@
 #       execute permissions are automatically given to directories.
 #       this is ignored for control and source actions
 #
-control:control
+control:package-with/dpkg.control
 
-file:pam.conf:etc/pam.d/webdav:644
-file:conf.xml:etc/webdavd:644
+file:package-with/dpkg.conffiles:DEBIAN/conffiles:644
+
+file:package-with/pam.conf:etc/pam.d/webdav:644
+file:package-with/conf.xml:etc/webdavd:644
+file:package-with/share:usr/share/webdav:644
 file:build/webdavd:usr/sbin/webdavd:755
 file:build/rap:usr/sbin/rap:4755
-file:share:usr/share/webdavd:644
 
-#libgcrypt, libgnutls

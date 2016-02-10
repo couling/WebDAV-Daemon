@@ -61,6 +61,7 @@ struct Message {
 	struct iovec buffers[MAX_BUFFER_PARTS];
 };
 
+char * timeNow(char * t);
 ssize_t sendMessage(int sock, struct Message * message);
 ssize_t recvMessage(int sock, struct Message * message, char * incomingBuffer, size_t incomingBufferSize);
 char * iovecToString(struct iovec * iovec);

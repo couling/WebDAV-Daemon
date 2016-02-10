@@ -11,12 +11,11 @@
 #include <pwd.h>
 #include <grp.h>
 
-static char * timeNow() {
+char * timeNow(char * t) {
 	time_t rawtime;
 	time(&rawtime);
 	struct tm * timeinfo;
 	timeinfo = localtime(&rawtime);
-	static char t[100];
 	strftime(t, 100, "%a %b %d %H:%M:%S %Y", timeinfo);
 	return t;
 }
@@ -25,7 +24,8 @@ void stdLog(const char * str, ...) {
 	char buffer[10240];
 	int remaining = 10240;
 	char * ptr = buffer;
-	int written = snprintf(ptr, remaining, "%s [%d] ", timeNow(), getpid());
+	char t[100];
+	int written = snprintf(ptr, remaining, "%s [%d] ", timeNow(t), getpid());
 	ptr += written;
 	remaining -= written;
 	va_list ap;
@@ -44,7 +44,8 @@ void stdLogError(int errorNumber, const char * str, ...) {
 	char buffer[10240];
 	int remaining = 10240;
 	char * ptr = buffer;
-	int written = snprintf(ptr, remaining, "%s [%d] Error: ", timeNow(), getpid());
+	char t[100];
+	int written = snprintf(ptr, remaining, "%s [%d] Error: ", timeNow(t), getpid());
 	ptr += written;
 	remaining -= written;
 	va_list ap;
@@ -57,7 +58,7 @@ void stdLogError(int errorNumber, const char * str, ...) {
 	ptr += written;
 	remaining -= written;
 	if (errorNumber) {
-		written = snprintf(ptr, remaining, "%s [%d] Error: %s\n", timeNow(), getpid(), strerror(errorNumber));
+		written = snprintf(ptr, remaining, "%s [%d] Error: %s\n", t, getpid(), strerror(errorNumber));
 		ptr += written;
 		//remaining -= written;
 	}

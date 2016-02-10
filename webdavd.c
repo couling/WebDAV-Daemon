@@ -147,8 +147,30 @@ static const struct RestrictedAccessProcessor AUTH_ERROR_BACKOFF = { .pid = 0, .
 // Utility //
 /////////////
 
-static void logAccess(int statusCode, const char * method, const char * user, const char * url) {
-	stdLog("%d %s %s %s", statusCode, method, user, url);
+static FILE * accessLog;
+
+static void logAccess(int statusCode, const char * method, const char * user, const char * url, const char * client) {
+	char t[100];
+	fprintf(accessLog, "%s %s %s %d %s %s\n", timeNow(t), client, user, statusCode, method, url);
+	fflush(accessLog);
+}
+
+static void initializeLogs() {
+	// Error log first
+	int errorLog = open(config.errorLog, O_CREAT | O_APPEND | O_WRONLY, 416);
+	if (errorLog == -1 || dup2(errorLog, STDERR_FILENO) == -1) {
+		stdLogError(errno, "Could not open error log file %s", config.errorLog);
+		exit(1);
+	}
+	close(errorLog);
+
+	int accessLogFd = open(config.accessLog, O_CREAT | O_APPEND | O_WRONLY, 416);
+	if (accessLogFd == -1) {
+		stdLogError(errno, "Could not open access log file %s", config.accessLog);
+		exit(1);
+	}
+
+	accessLog = fdopen(accessLogFd, "w");
 }
 
 static char * copyString(const char * string) {
@@ -181,7 +203,9 @@ static char * loadFileToBuffer(const char * file, size_t * size) {
 	return buffer;
 }
 
-void ipToString(char * buffer, size_t bufferSize, const struct sockaddr * addressInfo) {
+void getRequestIP(char * buffer, size_t bufferSize, struct MHD_Connection * request) {
+	const struct sockaddr * addressInfo =
+			MHD_get_connection_info(request, MHD_CONNECTION_INFO_CLIENT_ADDRESS)->client_addr;
 	static unsigned char IPV4_PREFIX[] = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF };
 	unsigned char * address;
 	switch (addressInfo->sa_family) {
@@ -687,15 +711,15 @@ static int createRapResponse(struct MHD_Connection *request, struct Message * me
 	}
 
 	case RAP_ACCESS_DENIED:
-		*response = createFileResponse(request, "/usr/share/webdavd/HTTP_FORBIDDEN.html");
+		*response = createFileResponse(request, "/usr/share/webdav/HTTP_FORBIDDEN.html");
 		return MHD_HTTP_FORBIDDEN;
 
 	case RAP_NOT_FOUND:
-		*response = createFileResponse(request, "/usr/share/webdavd/HTTP_NOT_FOUND.html");
+		*response = createFileResponse(request, "/usr/share/webdav/HTTP_NOT_FOUND.html");
 		return MHD_HTTP_FORBIDDEN;
 
 	case RAP_BAD_CLIENT_REQUEST:
-		*response = createFileResponse(request, "/usr/share/webdavd/HTTP_BAD_REQUEST.html");
+		*response = createFileResponse(request, "/usr/share/webdav/HTTP_BAD_REQUEST.html");
 		return MHD_HTTP_BAD_REQUEST;
 
 	default:
@@ -753,7 +777,7 @@ static int forkRapProcess(const char * path, int * newSockFd) {
 			stdLogError(errno, "Could not assign new socket (%d) to stdin/stdout", newSockFd[1]);
 			exit(255);
 		}
-		char * argv[] = { NULL };
+		char * argv[] = { (char *) config.rapBinary, (char *) config.pamServiceName, NULL };
 		execv(path, argv);
 		stdLogError(errno, "Could not start rap: %s", path);
 		exit(255);
@@ -762,7 +786,6 @@ static int forkRapProcess(const char * path, int * newSockFd) {
 
 static void destroyRap(struct RestrictedAccessProcessor * processor) {
 	close(processor->socketFd);
-	stdLog("destroying rap %d on %d", processor->pid, processor->socketFd);
 	processor->socketFd = -1;
 }
 
@@ -808,8 +831,6 @@ static struct RestrictedAccessProcessor * createRap(struct RestrictedAccessProce
 
 	processor->user = user;
 	time(&processor->rapCreated);
-
-	stdLog("RAP %d authenticated on %d", processor->pid, processor->socketFd);
 
 	return processor;
 }
@@ -923,12 +944,8 @@ static struct RestrictedAccessProcessor * acquireRap(struct MHD_Connection *requ
 			return rapSession;
 		} else {
 			if (sessionCount < config.rapMaxSessionsPerUser) {
-
-				const struct sockaddr * connectionInfo = MHD_get_connection_info(request,
-						MHD_CONNECTION_INFO_CLIENT_ADDRESS)->client_addr;
-
 				char rhost[100];
-				ipToString(rhost, sizeof(rhost), connectionInfo);
+				getRequestIP(rhost, sizeof(rhost), request);
 
 				struct RestrictedAccessProcessor newSession;
 				rapSession = createRap(&newSession, user, password, rhost);
@@ -1003,7 +1020,7 @@ static int completeUpload(struct MHD_Connection *request, struct RestrictedAcces
 		struct MHD_Response ** response) {
 
 	if (processor->writeDataFd == -1) {
-		*response = createFileResponse(request, "/usr/share/webdavd/HTTP_INSUFFICIENT_STORAGE.html");
+		*response = createFileResponse(request, "/usr/share/webdav/HTTP_INSUFFICIENT_STORAGE.html");
 		return MHD_HTTP_INSUFFICIENT_STORAGE;
 	} else {
 		// Closing this pipe signals to the rap that there is no more data
@@ -1080,7 +1097,7 @@ static int processNewRequest(struct MHD_Connection * request, const char * url, 
 		}
 		message.bufferCount = 3;
 	} else if (!strcmp("OPTIONS", method)) {
-		*response = createFileResponse(request, "/usr/share/webdavd/OPTIONS.html");
+		*response = createFileResponse(request, "/usr/share/webdav/OPTIONS.html");
 		addHeaderSafe(*response, "Accept", ACCEPT_HEADER);
 		return MHD_HTTP_OK;
 	} else {
@@ -1138,14 +1155,16 @@ static int sendResponse(struct MHD_Connection *request, int statusCode, struct M
 		rapSession->writeDataFd = -1;
 	}
 
-	logAccess(statusCode, method, rapSession->user, url);
+	char clientIp[100];
+	getRequestIP(clientIp, sizeof(clientIp), request);
+	logAccess(statusCode, method, rapSession->user, url, clientIp);
 	switch (statusCode) {
 	case MHD_HTTP_INTERNAL_SERVER_ERROR:
 		return MHD_queue_response(request, MHD_HTTP_INTERNAL_SERVER_ERROR, INTERNAL_SERVER_ERROR_PAGE);
 	case MHD_HTTP_UNAUTHORIZED:
 		return MHD_queue_response(request, MHD_HTTP_UNAUTHORIZED, UNAUTHORIZED_PAGE);
-	case MHD_HTTP_METHOD_NOT_ACCEPTABLE:
-		return MHD_queue_response(request, MHD_HTTP_METHOD_NOT_ACCEPTABLE, METHOD_NOT_SUPPORTED_PAGE);
+	case MHD_HTTP_METHOD_NOT_ALLOWED:
+		return MHD_queue_response(request, MHD_HTTP_METHOD_NOT_ALLOWED, METHOD_NOT_SUPPORTED_PAGE);
 	default: {
 		int queueResult = MHD_queue_response(request, statusCode, response);
 		MHD_destroy_response(response);
@@ -1269,10 +1288,10 @@ static void initializeStaticResponse(struct MHD_Response ** response, const char
 }
 
 static void initializeStaticResponses() {
-	initializeStaticResponse(&INTERNAL_SERVER_ERROR_PAGE, "/usr/share/webdavd/HTTP_INTERNAL_SERVER_ERROR.html");
-	initializeStaticResponse(&UNAUTHORIZED_PAGE, "/usr/share/webdavd/HTTP_UNAUTHORIZED.html");
+	initializeStaticResponse(&INTERNAL_SERVER_ERROR_PAGE, "/usr/share/webdav/HTTP_INTERNAL_SERVER_ERROR.html");
+	initializeStaticResponse(&UNAUTHORIZED_PAGE, "/usr/share/webdav/HTTP_UNAUTHORIZED.html");
 	addHeaderSafe(UNAUTHORIZED_PAGE, "WWW-Authenticate", "Basic realm=\"My Server\"");
-	initializeStaticResponse(&METHOD_NOT_SUPPORTED_PAGE, "/usr/share/webdavd/HTTP_METHOD_NOT_SUPPORTED.html");
+	initializeStaticResponse(&METHOD_NOT_SUPPORTED_PAGE, "/usr/share/webdav/HTTP_METHOD_NOT_SUPPORTED.html");
 	addHeaderSafe(METHOD_NOT_SUPPORTED_PAGE, "Allow",
 			"OPTIONS, GET, HEAD, DELETE, PROPFIND, PUT, PROPPATCH, COPY, MOVE, LOCK, UNLOCK");
 }
@@ -1638,6 +1657,7 @@ int main(int argCount, char ** args) {
 		configure("/etc/webdavd");
 	}
 
+	initializeLogs();
 	initializeMimeTypes();
 	initializeStaticResponses();
 	initializeRapDatabase();

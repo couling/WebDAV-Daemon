@@ -9,11 +9,13 @@
 #include <sys/stat.h>
 #include <dirent.h>
 #include <security/pam_appl.h>
+#include <libxml/xmlwriter.h>
 
 #define BUFFER_SIZE 4096
 
 static int authenticated = 0;
 static const char * authenticatedUser;
+static const char * pamService;
 
 static size_t respond(enum RapConstant result, int fd) {
 	struct Message message = { .mID = result, .fd = fd, .bufferCount = 0 };
@@ -29,6 +31,41 @@ struct PropertySet {
 	char lastModified;
 	char resourceType;
 };
+
+/////////////////////
+// XML Text Writer //
+/////////////////////
+static int xmlFdOutputCloseCallback(void * context) {
+	close(*((int *) context));
+	free(context);
+	return 0;
+}
+
+static int xmlFdOutputWriteCallback(void * context, const char * buffer, int len) {
+	ssize_t ignored = write(*((int *) context), buffer, len);
+	return ignored;
+}
+
+static xmlTextWriterPtr xmlNewFdTextWriter(int out) {
+	xmlOutputBufferPtr outStruct = xmlAllocOutputBuffer(NULL);
+	outStruct->writecallback = &xmlFdOutputWriteCallback;
+	outStruct->closecallback = &xmlFdOutputCloseCallback;
+	outStruct->context = mallocSafe(sizeof(int));
+	*((int *) outStruct->context) = out;
+	return xmlNewTextWriter(outStruct);
+}
+
+static int xmlTextWriterWriteElementString(xmlTextWriterPtr writer, const char * elementName, const char * string) {
+	int ret;
+	(ret = xmlTextWriterStartElementNS(writer, "d", elementName, NULL)) < 0
+			|| (ret = xmlTextWriterWriteString(writer, string)) < 0 || (ret = xmlTextWriterEndElement(writer));
+
+	return ret;
+}
+
+/////////////////////////
+// End XML Text Writer //
+/////////////////////////
 
 static int parsePropFind(int fd, struct PropertySet * properties) {
 	memset(properties, 0, sizeof(struct PropertySet));
@@ -76,7 +113,7 @@ static int parsePropFind(int fd, struct PropertySet * properties) {
 		goto CLEANUP;
 	}
 
-	// finish up
+// finish up
 	while (stepOver(reader))
 		// consume the rest of the input
 		;
@@ -89,36 +126,46 @@ static int parsePropFind(int fd, struct PropertySet * properties) {
 }
 
 static void writePropFindResponsePart(const char * fileName, struct PropertySet * properties, struct stat * fileStat,
-		FILE * writeHandle) {
-	fprintf(writeHandle, "<d:response><d:href>%s</d:href><d:propstat><d:prop>", fileName);
+		xmlTextWriterPtr writer) {
+
+	xmlTextWriterStartElementNS(writer, "d", "response", NULL);
+	xmlTextWriterWriteElementString(writer, "href", fileName);
+	xmlTextWriterStartElementNS(writer, "d", "propstat", NULL);
+	xmlTextWriterStartElementNS(writer, "d", "prop", NULL);
 	if (properties->contentLength) {
-		fprintf(writeHandle, "<d:contentlength>%zd</d:contentlength>", fileStat->st_size);
+		char buffer[100];
+		snprintf(buffer, sizeof(buffer), "%zd", fileStat->st_size);
+		xmlTextWriterWriteElementString(writer, "contentlength", buffer);
 	}
 	if (properties->creationDate) {
-		char dateBuffer[100];
-		getWebDate(fileStat->st_ctime, dateBuffer, 100);
-		fprintf(writeHandle, "<d:creationdate>%s</d:creationdate>", dateBuffer);
+		char buffer[100];
+		getWebDate(fileStat->st_ctime, buffer, 100);
+		xmlTextWriterWriteElementString(writer, "creationdate", buffer);
 	}
 	if (properties->lastModified) {
-		char dateBuffer[100];
-		getWebDate(fileStat->st_mtime, dateBuffer, 100);
-		fprintf(writeHandle, "<d:lastmodified>%s</d:lastmodified>", dateBuffer);
+		char buffer[100];
+		getWebDate(fileStat->st_ctime, buffer, 100);
+		xmlTextWriterWriteElementString(writer, "lastmodified", buffer);
 	}
 	if (properties->resourceType) {
+		xmlTextWriterStartElementNS(writer, "d", "resourcetype", NULL);
 		if ((fileStat->st_mode & S_IFMT) == S_IFDIR) {
-			fprintf(writeHandle, "<d:resourcetype><d:collection /></d:resourcetype>");
-		} else {
-			fprintf(writeHandle, "<d:resourcetype></d:resourcetype>");
+			xmlTextWriterStartElementNS(writer, "d", "collection", NULL);
+			xmlTextWriterEndElement(writer);
 		}
+		xmlTextWriterEndElement(writer);
 	}
-	fprintf(writeHandle, "</d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>");
-
 	//<d:getetag>"56a341a7873fd"</d:getetag>
 	//<d:getlastmodified>Sat, 23 Jan 2016 09:02:31 GMT</d:getlastmodified>
+	xmlTextWriterEndElement(writer);
+	xmlTextWriterWriteElementString(writer, "status", "HTTP/1.1 200 OK");
+	xmlTextWriterEndElement(writer);
+	xmlTextWriterEndElement(writer);
+
 }
 
 static int respondToPropFind(const char * file, const char * host, struct PropertySet * properties, int depth) {
-	// stdLog("propfind respnd %d", depth);
+// stdLog("propfind respnd %d", depth);
 	struct stat fileStat;
 
 	if (stat(file, &fileStat)) {
@@ -171,10 +218,11 @@ static int respondToPropFind(const char * file, const char * host, struct Proper
 	}
 
 	// We've set up the pipe and sent read end across so now write the result
-	FILE * outPipe = fdopen(pipeEnds[PIPE_WRITE], "w");
+	xmlTextWriterPtr writer = xmlNewFdTextWriter(pipeEnds[PIPE_WRITE]);
 	DIR * dir;
-	fprintf(outPipe, "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<d:multistatus xmlns:d=\"DAV:\">");
-	writePropFindResponsePart(filePath, properties, &fileStat, outPipe);
+	xmlTextWriterStartDocument(writer, "1.0", "UTF-8", NULL);
+	xmlTextWriterStartElementNS(writer, "d", "multistatus", "DAV:");
+	writePropFindResponsePart(filePath, properties, &fileStat, writer);
 	if (depth > 1 && (fileStat.st_mode & S_IFMT) == S_IFDIR && (dir = opendir(filePath))) {
 		struct dirent * dp;
 		char * childFileName = mallocSafe(filePathSize + 257);
@@ -193,14 +241,14 @@ static int respondToPropFind(const char * file, const char * host, struct Proper
 						childFileName[filePathSize + nameSize] = '/';
 						childFileName[filePathSize + nameSize + 1] = '\0';
 					}
-					writePropFindResponsePart(childFileName, properties, &fileStat, outPipe);
+					writePropFindResponsePart(childFileName, properties, &fileStat, writer);
 				}
 			}
 		}
 		free(childFileName);
 	}
-	fprintf(outPipe, "</d:multistatus>");
-	fclose(outPipe);
+	xmlTextWriterEndElement(writer);
+	xmlFreeTextWriter(writer);
 	if (filePath != file) {
 		free(filePath);
 	}
@@ -351,27 +399,24 @@ static int pamAuthenticate(const char * user, const char * password, const char 
 	pamc.appdata_ptr = (void *) password;
 	char ** envList;
 
-	// TODO setup configurable PAM services
-	if (pam_start("webdav", user, &pamc, &pamh) != PAM_SUCCESS) {
+	if (pam_start(pamService, user, &pamc, &pamh) != PAM_SUCCESS) {
 		stdLogError(0, "Could not start PAM");
 		return 0;
 	}
 
-	stdLog("auth start");
-
-	// Authenticate and start session
+// Authenticate and start session
 	int pamResult;
 	if ((pamResult = pam_set_item(pamh, PAM_RHOST, hostname)) != PAM_SUCCESS
 			|| (pamResult = pam_set_item(pamh, PAM_RUSER, user)) != PAM_SUCCESS
 			|| (pamResult = pam_authenticate(pamh, PAM_SILENT | PAM_DISALLOW_NULL_AUTHTOK)) != PAM_SUCCESS
-			|| (pamResult = pam_acct_mgmt(pamh, PAM_SILENT | PAM_DISALLOW_NULL_AUTHTOK)) != PAM_SUCCESS
-			|| (pamResult = pam_setcred(pamh, PAM_ESTABLISH_CRED)) != PAM_SUCCESS
+			|| (pamResult = pam_acct_mgmt(pamh, PAM_SILENT | PAM_DISALLOW_NULL_AUTHTOK)) != PAM_SUCCESS || (pamResult =
+					pam_setcred(pamh, PAM_ESTABLISH_CRED)) != PAM_SUCCESS
 			|| (pamResult = pam_open_session(pamh, 0)) != PAM_SUCCESS) {
 		pam_end(pamh, pamResult);
 		return 0;
 	}
 
-	// Get user details
+// Get user details
 	if ((pamResult = pam_get_item(pamh, PAM_USER, (const void **) &user)) != PAM_SUCCESS
 			|| (envList = pam_getenvlist(pamh)) == NULL) {
 
@@ -381,7 +426,7 @@ static int pamAuthenticate(const char * user, const char * password, const char 
 		return 0;
 	}
 
-	// Set up environment and switch user
+// Set up environment and switch user
 	clearenv();
 	for (char ** pam_env = envList; *pam_env != NULL; ++pam_env) {
 		putenv(*pam_env);
@@ -402,7 +447,6 @@ static int pamAuthenticate(const char * user, const char * password, const char 
 	memcpy((char *) authenticatedUser, user, userLen);
 
 	authenticated = 1;
-	stdLog("auth end");
 	return 1;
 }
 
@@ -435,10 +479,16 @@ static size_t authenticate(struct Message * message) {
 typedef size_t (*handlerMethod)(struct Message * message);
 static handlerMethod handlerMethods[] = { authenticate, readFile, writeFile, propfind };
 
-int main(int argCount, char ** args) {
+int main(int argCount, char * args[]) {
 	size_t ioResult;
 	struct Message message;
 	char incomingBuffer[INCOMING_BUFFER_SIZE];
+	if (argCount > 1) {
+		pamService = args[1];
+	}
+	else {
+		pamService = "webdav";
+	}
 	do {
 		// Read a message
 		ioResult = recvMessage(STDIN_FILENO, &message, incomingBuffer, INCOMING_BUFFER_SIZE);

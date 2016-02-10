@@ -1,3 +1,4 @@
+<?xml version="1.0" encoding="UTF-8" ?>
 <server-config xmlns="http://couling.me/webdavd">
 	<!-- Each <server> will occupy its own process -->
 	<server>
@@ -44,8 +45,8 @@
 		<static-error-dir>/usr/share/webdavd</static-error-dir>
 
 		<!-- File location for logs. Default /var/log/error.log and /var/log/access.log -->
-		<error-log>/var/log/error.log</error-log>
-		<access-log>/var/log/access.log</access-log>
+		<error-log>/var/log/webdav-error.log</error-log>
+		<access-log>/var/log/webdav-access.log</access-log>
 
 		<ssl-cert>
 
