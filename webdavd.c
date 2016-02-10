@@ -1050,7 +1050,6 @@ static void processUploadData(struct MHD_Connection * request, const char * uplo
 		struct RestrictedAccessProcessor * processor) {
 
 	if (processor->writeDataFd != -1) {
-		// size_t ignore = write(STDERR_FILENO, upload_data, *upload_data_size);
 		size_t bytesWritten = write(processor->writeDataFd, upload_data, upload_data_size);
 		if (bytesWritten < upload_data_size) {
 			// not all data could be written to the file handle and therefore
@@ -1105,6 +1104,7 @@ static int processNewRequest(struct MHD_Connection * request, const char * url, 
 				(rapSession->writeDataFd != -1 ? "with" : "without"));
 		return MHD_HTTP_METHOD_NOT_ALLOWED;
 	}
+	stdLog("%s %s data", method, rapSession->writeDataFd != -1 ? "with" : "without");
 
 	// Send the request to the RAP
 	size_t ioResult = sendMessage(rapSession->socketFd, &message);
@@ -1175,7 +1175,7 @@ static int sendResponse(struct MHD_Connection *request, int statusCode, struct M
 
 static int answerToRequest(void *cls, struct MHD_Connection *request, const char *url, const char *method,
 		const char *version, const char *upload_data, size_t *upload_data_size, void ** s) {
-
+	
 	struct RestrictedAccessProcessor ** rapSession = (struct RestrictedAccessProcessor **) s;
 
 	if (*rapSession) {

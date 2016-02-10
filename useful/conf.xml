@@ -33,7 +33,7 @@
 
 		<!-- The location of the rap binary. default /usr/sbin/rap -->
 		<!-- DO NOT CHANGE UNLESS YOU KNOW WHAT YOU ARE DOING -->
-		<rap-binary>/home/philip/workspace/WebDav Server/build/rap</rap-binary>
+		<rap-binary>/home/philip/workspace/WebDavServer/build/rap</rap-binary>
 
 		<!-- The service name for PAM. specifies the file name searched for -->
 		<!-- in /etc/pam.d/. default webdavd -->

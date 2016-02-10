@@ -77,6 +77,13 @@ static int parsePropFind(int fd, struct PropertySet * properties) {
 		return 0;
 	}
 
+	if (xmlTextReaderNodeType(reader) == XML_READER_TYPE_NONE) {
+		// No body has been sent
+		// send everything
+		memset(properties, 1, sizeof(*properties));
+		goto CLEANUP;
+	}
+
 	if (!elementMatches(reader, "DAV:", "propfind")) {
 		stdLogError(0, "Request body was not a propfind document");
 		readResult = 0;
