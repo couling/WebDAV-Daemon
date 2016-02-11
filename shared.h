@@ -74,4 +74,6 @@ int stepOut(xmlTextReaderPtr reader);
 int stepOverText(xmlTextReaderPtr reader, const char ** text);
 int elementMatches(xmlTextReaderPtr reader, const char * namespace, const char * nodeName);
 const char * nodeTypeToName(int nodeType);
+
+char * loadFileToBuffer(const char * file, size_t * size);
 #endif

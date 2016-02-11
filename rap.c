@@ -24,13 +24,139 @@ static size_t respond(enum RapConstant result, int fd) {
 
 struct PropertySet {
 	char creationDate;
-	// TODO char displayName;
+	char displayName;
 	char contentLength;
-	// TODO char contentType;
+	char contentType;
 	// TODO etag
 	char lastModified;
 	char resourceType;
 };
+
+//////////
+// Mime //
+//////////
+
+struct MimeType {
+	const char * ext;
+	const char * type;
+	size_t typeStringSize;
+};
+
+// Mime Database.
+// TODO find a way to move this to the RAP.
+static size_t mimeFileBufferSize;
+static char * mimeFileBuffer;
+static struct MimeType * mimeTypes = NULL;
+static int mimeTypeCount = 0;
+static struct MimeType _UNKNOWN_MIME_TYPE = { .ext = "", .type = "application/octet-stream", .typeStringSize =
+		sizeof("application/octet-stream") }, *UNKNOWN_MIME_TYPE = &_UNKNOWN_MIME_TYPE;
+
+static int compareExt(const void * a, const void * b) {
+	return strcmp(((struct MimeType *) a)->ext, ((struct MimeType *) b)->ext);
+}
+
+static struct MimeType * findMimeType(const char * file) {
+
+	if (!file) {
+		return UNKNOWN_MIME_TYPE;
+	}
+	struct MimeType type;
+	type.ext = file + strlen(file) - 1;
+	while (1) {
+		if (*type.ext == '/') {
+			return UNKNOWN_MIME_TYPE;
+		} else if (*type.ext == '.') {
+			type.ext++;
+			break;
+		} else {
+			type.ext--;
+			if (type.ext < file) {
+				return UNKNOWN_MIME_TYPE;
+			}
+		}
+	}
+
+	struct MimeType * result = bsearch(&type, mimeTypes, mimeTypeCount, sizeof(struct MimeType), &compareExt);
+	return result ? result : UNKNOWN_MIME_TYPE;
+}
+
+static void initializeMimeTypes(const char * mimeTypesFile) {
+	// Load Mime file into memory
+	mimeFileBuffer = loadFileToBuffer(mimeTypesFile, &mimeFileBufferSize);
+	if (!mimeFileBuffer) {
+		exit(1);
+	}
+
+	// Parse mimeFile;
+	char * partStartPtr = mimeFileBuffer;
+	int found;
+	char * type = NULL;
+	do {
+		found = 0;
+		// find the start of the part
+		while (partStartPtr < mimeFileBuffer + mimeFileBufferSize && !found) {
+			switch (*partStartPtr) {
+			case '#':
+				// skip to the end of the line
+				while (partStartPtr < mimeFileBuffer + mimeFileBufferSize && *partStartPtr != '\n') {
+					partStartPtr++;
+				}
+				// Fall through to incrementing partStartPtr
+				partStartPtr++;
+				break;
+			case ' ':
+			case '\t':
+			case '\r':
+			case '\n':
+				if (*partStartPtr == '\n') {
+					type = NULL;
+				}
+				partStartPtr++;
+				break;
+			default:
+				found = 1;
+				break;
+			}
+		}
+
+		// Find the end of the part
+		char * partEndPtr = partStartPtr + 1;
+		found = 0;
+		while (partEndPtr < mimeFileBuffer + mimeFileBufferSize && !found) {
+			switch (*partEndPtr) {
+			case ' ':
+			case '\t':
+			case '\r':
+			case '\n':
+				if (type == NULL) {
+					type = partStartPtr;
+				} else {
+					mimeTypes = reallocSafe(mimeTypes, sizeof(struct MimeType) * (mimeTypeCount + 1));
+					mimeTypes[mimeTypeCount].type = type;
+					mimeTypes[mimeTypeCount].ext = partStartPtr;
+					mimeTypes[mimeTypeCount].typeStringSize = partEndPtr - partStartPtr + 1;
+					mimeTypeCount++;
+				}
+				if (*partEndPtr == '\n') {
+					type = NULL;
+				}
+				*partEndPtr = '\0';
+				found = 1;
+				break;
+			default:
+				partEndPtr++;
+				break;
+			}
+		}
+		partStartPtr = partEndPtr + 1;
+	} while (partStartPtr < mimeFileBuffer + mimeFileBufferSize);
+
+	qsort(mimeTypes, mimeTypeCount, sizeof(struct MimeType), &compareExt);
+}
+
+//////////////
+// End Mime //
+//////////////
 
 /////////////////////
 // XML Text Writer //
@@ -68,7 +194,6 @@ static int xmlTextWriterWriteElementString(xmlTextWriterPtr writer, const char *
 /////////////////////////
 
 static int parsePropFind(int fd, struct PropertySet * properties) {
-	memset(properties, 0, sizeof(struct PropertySet));
 	xmlTextReaderPtr reader = xmlReaderForFd(fd, NULL, NULL, XML_PARSE_NOENT);
 	int readResult;
 	if (!reader || !stepInto(reader)) {
@@ -79,9 +204,11 @@ static int parsePropFind(int fd, struct PropertySet * properties) {
 
 	if (xmlTextReaderNodeType(reader) == XML_READER_TYPE_NONE) {
 		// No body has been sent
-		// send everything
+		// so assume the client is asking for everything.
 		memset(properties, 1, sizeof(*properties));
 		goto CLEANUP;
+	} else {
+		memset(properties, 0, sizeof(struct PropertySet));
 	}
 
 	if (!elementMatches(reader, "DAV:", "propfind")) {
@@ -111,6 +238,10 @@ static int parsePropFind(int fd, struct PropertySet * properties) {
 				properties->contentLength = 1;
 			} else if (!strcmp(nodeName, "lastmodified")) {
 				properties->lastModified = 1;
+			} else if (!strcmp(nodeName, "displaydame")) {
+				properties->displayName = 1;
+			} else if (!strcmp(nodeName, "contenttype")) {
+				properties->contentType = 1;
 			}
 		}
 		stepOver(reader);
@@ -120,7 +251,7 @@ static int parsePropFind(int fd, struct PropertySet * properties) {
 		goto CLEANUP;
 	}
 
-// finish up
+	// finish up
 	while (stepOver(reader))
 		// consume the rest of the input
 		;
@@ -132,8 +263,8 @@ static int parsePropFind(int fd, struct PropertySet * properties) {
 	return readResult;
 }
 
-static void writePropFindResponsePart(const char * fileName, struct PropertySet * properties, struct stat * fileStat,
-		xmlTextWriterPtr writer) {
+static void writePropFindResponsePart(const char * fileName, const char * displayName, struct PropertySet * properties,
+		struct stat * fileStat, xmlTextWriterPtr writer) {
 
 	xmlTextWriterStartElementNS(writer, "d", "response", NULL);
 	xmlTextWriterWriteElementString(writer, "href", fileName);
@@ -162,6 +293,12 @@ static void writePropFindResponsePart(const char * fileName, struct PropertySet 
 		}
 		xmlTextWriterEndElement(writer);
 	}
+	if (properties->displayName) {
+		xmlTextWriterWriteElementString(writer, "displayname", displayName);
+	}
+	if (properties->contentType) {
+		xmlTextWriterWriteElementString(writer, "contenttype", findMimeType(fileName)->type);
+	}
 	//<d:getetag>"56a341a7873fd"</d:getetag>
 	//<d:getlastmodified>Sat, 23 Jan 2016 09:02:31 GMT</d:getlastmodified>
 	xmlTextWriterEndElement(writer);
@@ -172,7 +309,6 @@ static void writePropFindResponsePart(const char * fileName, struct PropertySet 
 }
 
 static int respondToPropFind(const char * file, const char * host, struct PropertySet * properties, int depth) {
-// stdLog("propfind respnd %d", depth);
 	struct stat fileStat;
 
 	if (stat(file, &fileStat)) {
@@ -196,7 +332,8 @@ static int respondToPropFind(const char * file, const char * host, struct Proper
 
 	char * filePath;
 	size_t filePathSize = strlen(file);
-	if ((fileStat.st_mode & S_IFMT) == S_IFDIR && file[filePathSize - 1] != '/') {
+	size_t fileNameSize = filePathSize;
+	if (fileStat.st_mode & S_IFMT) {
 		filePath = mallocSafe(filePathSize + 2);
 		memcpy(filePath, file, filePathSize);
 		filePath[filePathSize] = '/';
@@ -204,6 +341,11 @@ static int respondToPropFind(const char * file, const char * host, struct Proper
 		filePathSize++;
 	} else {
 		filePath = (char *) file;
+	}
+
+	const char * displayName = &file[fileNameSize - 2];
+	while (displayName > file && *displayName != '/') {
+		displayName--;
 	}
 
 	time_t fileTime;
@@ -229,7 +371,7 @@ static int respondToPropFind(const char * file, const char * host, struct Proper
 	DIR * dir;
 	xmlTextWriterStartDocument(writer, "1.0", "UTF-8", NULL);
 	xmlTextWriterStartElementNS(writer, "d", "multistatus", "DAV:");
-	writePropFindResponsePart(filePath, properties, &fileStat, writer);
+	writePropFindResponsePart(filePath, displayName, properties, &fileStat, writer);
 	if (depth > 1 && (fileStat.st_mode & S_IFMT) == S_IFDIR && (dir = opendir(filePath))) {
 		struct dirent * dp;
 		char * childFileName = mallocSafe(filePathSize + 257);
@@ -248,7 +390,7 @@ static int respondToPropFind(const char * file, const char * host, struct Proper
 						childFileName[filePathSize + nameSize] = '/';
 						childFileName[filePathSize + nameSize + 1] = '\0';
 					}
-					writePropFindResponsePart(childFileName, properties, &fileStat, writer);
+					writePropFindResponsePart(childFileName, dp->d_name, properties, &fileStat, writer);
 				}
 			}
 		}
@@ -288,8 +430,13 @@ static size_t propfind(struct Message * requestMessage) {
 		return respond(RAP_BAD_CLIENT_REQUEST, -1);
 	}
 
-	return respondToPropFind(iovecToString(&requestMessage->buffers[RAP_FILE_INDEX]),
-			iovecToString(&requestMessage->buffers[RAP_HOST_INDEX]), &properties, (strcmp("0", depthString) ? 2 : 1));
+	char * file = iovecToString(&requestMessage->buffers[RAP_FILE_INDEX]);
+	size_t filePathSize = strlen(file);
+	if (S_IFDIR && file[filePathSize - 1] == '/') {
+		file[filePathSize - 1] = '\0';
+	}
+	return respondToPropFind(file, iovecToString(&requestMessage->buffers[RAP_HOST_INDEX]), &properties,
+			(strcmp("0", depthString) ? 2 : 1));
 }
 
 static size_t writeFile(struct Message * requestMessage) {
@@ -375,8 +522,9 @@ static size_t readFile(struct Message * requestMessage) {
 			struct Message message = { .mID = RAP_SUCCESS, .fd = fd, .bufferCount = 3 };
 			message.buffers[RAP_DATE_INDEX].iov_base = &statinfo.st_mtime;
 			message.buffers[RAP_DATE_INDEX].iov_len = sizeof(statinfo.st_mtime);
-			message.buffers[RAP_MIME_INDEX].iov_base = "";
-			message.buffers[RAP_MIME_INDEX].iov_len = sizeof("");
+			struct MimeType * mimeType = findMimeType(file);
+			message.buffers[RAP_MIME_INDEX].iov_base = (char *) mimeType->type;
+			message.buffers[RAP_MIME_INDEX].iov_len = mimeType->typeStringSize;
 			message.buffers[RAP_LOCATION_INDEX] = requestMessage->buffers[RAP_FILE_INDEX];
 			return sendMessage(STDOUT_FILENO, &message);
 		}
@@ -492,10 +640,16 @@ int main(int argCount, char * args[]) {
 	char incomingBuffer[INCOMING_BUFFER_SIZE];
 	if (argCount > 1) {
 		pamService = args[1];
-	}
-	else {
+	} else {
 		pamService = "webdav";
 	}
+
+	if (argCount > 2) {
+		initializeMimeTypes(args[2]);
+	} else {
+		initializeMimeTypes("/etc/mime.types");
+	}
+
 	do {
 		// Read a message
 		ioResult = recvMessage(STDIN_FILENO, &message, incomingBuffer, INCOMING_BUFFER_SIZE);

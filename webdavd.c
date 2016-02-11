@@ -54,11 +54,6 @@ struct RapGroup {
 	struct RestrictedAccessProcessor * rapSession;
 };
 
-struct MimeType {
-	const char * ext;
-	const char * type;
-};
-
 struct Header {
 	const char * key;
 	const char * value;
@@ -183,27 +178,7 @@ static char * copyString(const char * string) {
 	return newString;
 }
 
-static char * loadFileToBuffer(const char * file, size_t * size) {
-	int fd = open(file, O_RDONLY);
-	struct stat stat;
-	if (fd == -1 || fstat(fd, &stat)) {
-		stdLogError(errno, "Could not open file %s", file);
-		return NULL;
-	}
-	char * buffer = mallocSafe(stat.st_size);
-	if (stat.st_size != 0) {
-		size_t bytesRead = read(fd, buffer, stat.st_size);
-		if (bytesRead != stat.st_size) {
-			stdLogError(bytesRead < 0 ? errno : 0, "Could not read whole file %s", file);
-			free(buffer);
-			return NULL;
-		}
-	}
-	*size = stat.st_size;
-	return buffer;
-}
-
-void getRequestIP(char * buffer, size_t bufferSize, struct MHD_Connection * request) {
+static void getRequestIP(char * buffer, size_t bufferSize, struct MHD_Connection * request) {
 	const struct sockaddr * addressInfo =
 			MHD_get_connection_info(request, MHD_CONNECTION_INFO_CLIENT_ADDRESS)->client_addr;
 	static unsigned char IPV4_PREFIX[] = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF };
@@ -471,121 +446,6 @@ void initializeSSL() {
 // End SSL //
 /////////////
 
-//////////
-// Mime //
-//////////
-
-// Mime Database.
-// TODO find a way to move this to the RAP.
-static size_t mimeFileBufferSize;
-static char * mimeFileBuffer;
-static struct MimeType * mimeTypes = NULL;
-static int mimeTypeCount = 0;
-
-static int compareExt(const void * a, const void * b) {
-	return strcmp(((struct MimeType *) a)->ext, ((struct MimeType *) b)->ext);
-}
-
-static struct MimeType * findMimeType(const char * file) {
-	if (!file) {
-		return NULL;
-	}
-	struct MimeType type;
-	type.ext = file + strlen(file) - 1;
-	while (1) {
-		if (*type.ext == '/') {
-			return NULL;
-		} else if (*type.ext == '.') {
-			type.ext++;
-			break;
-		} else {
-			type.ext--;
-			if (type.ext < file) {
-				return NULL;
-			}
-		}
-	}
-
-	return bsearch(&type, mimeTypes, mimeTypeCount, sizeof(struct MimeType), &compareExt);
-}
-
-static void initializeMimeTypes() {
-	// Load Mime file into memory
-	mimeFileBuffer = loadFileToBuffer(config.mimeTypesFile, &mimeFileBufferSize);
-	if (!mimeFileBuffer) {
-		exit(1);
-	}
-
-	// Parse mimeFile;
-	char * partStartPtr = mimeFileBuffer;
-	int found;
-	char * type = NULL;
-	do {
-		found = 0;
-		// find the start of the part
-		while (partStartPtr < mimeFileBuffer + mimeFileBufferSize && !found) {
-			switch (*partStartPtr) {
-			case '#':
-				// skip to the end of the line
-				while (partStartPtr < mimeFileBuffer + mimeFileBufferSize && *partStartPtr != '\n') {
-					partStartPtr++;
-				}
-				// Fall through to incrementing partStartPtr
-				partStartPtr++;
-				break;
-			case ' ':
-			case '\t':
-			case '\r':
-			case '\n':
-				if (*partStartPtr == '\n') {
-					type = NULL;
-				}
-				partStartPtr++;
-				break;
-			default:
-				found = 1;
-				break;
-			}
-		}
-
-		// Find the end of the part
-		char * partEndPtr = partStartPtr + 1;
-		found = 0;
-		while (partEndPtr < mimeFileBuffer + mimeFileBufferSize && !found) {
-			switch (*partEndPtr) {
-			case ' ':
-			case '\t':
-			case '\r':
-			case '\n':
-				if (type == NULL) {
-					type = partStartPtr;
-				} else {
-					mimeTypes = reallocSafe(mimeTypes, sizeof(struct MimeType) * (mimeTypeCount + 1));
-					mimeTypes[mimeTypeCount].type = type;
-					mimeTypes[mimeTypeCount].ext = partStartPtr;
-					mimeTypeCount++;
-				}
-				if (*partEndPtr == '\n') {
-					type = NULL;
-				}
-				*partEndPtr = '\0';
-				found = 1;
-				break;
-			default:
-				partEndPtr++;
-				break;
-			}
-		}
-		partStartPtr = partEndPtr + 1;
-	} while (partStartPtr < mimeFileBuffer + mimeFileBufferSize);
-
-	qsort(mimeTypes, mimeTypeCount, sizeof(struct MimeType), &compareExt);
-}
-
-//////////////
-// End Mime //
-//////////////
-
 ///////////////////////
 // Response Creation //
 ///////////////////////
@@ -661,7 +521,8 @@ static struct MHD_Response * createFdFileResponse(size_t size, int fd, const cha
 	return response;
 }
 
-static struct MHD_Response * createFileResponse(struct MHD_Connection *request, const char * fileName) {
+static struct MHD_Response * createFileResponse(struct MHD_Connection *request, const char * fileName,
+		const char * mimeType) {
 	int fd = open(fileName, O_RDONLY);
 	if (fd == -1) {
 		stdLogError(errno, "Could not open file for response", fileName);
@@ -670,9 +531,7 @@ static struct MHD_Response * createFileResponse(struct MHD_Connection *request, 
 
 	struct stat statBuffer;
 	fstat(fd, &statBuffer);
-	struct MimeType * mimeType = findMimeType(fileName);
-
-	return createFdFileResponse(statBuffer.st_size, fd, mimeType ? mimeType->type : NULL, statBuffer.st_mtime);
+	return createFdFileResponse(statBuffer.st_size, fd, mimeType, statBuffer.st_mtime);
 }
 
 static int createRapResponse(struct MHD_Connection *request, struct Message * message, struct MHD_Response ** response) {
@@ -689,12 +548,7 @@ static int createRapResponse(struct MHD_Connection *request, struct Message * me
 		struct stat stat;
 		fstat(message->fd, &stat);
 		if (mimeType[0] == '\0') {
-			if (location) {
-				struct MimeType * found = findMimeType(location);
-				mimeType = found ? found->type : NULL;
-			} else {
-				mimeType = NULL;
-			}
+			mimeType = NULL;
 		}
 
 		if ((stat.st_mode & S_IFMT) == S_IFREG) {
@@ -711,15 +565,15 @@ static int createRapResponse(struct MHD_Connection *request, struct Message * me
 	}
 
 	case RAP_ACCESS_DENIED:
-		*response = createFileResponse(request, "/usr/share/webdav/HTTP_FORBIDDEN.html");
+		*response = createFileResponse(request, "/usr/share/webdav/HTTP_FORBIDDEN.html", "text/html");
 		return MHD_HTTP_FORBIDDEN;
 
 	case RAP_NOT_FOUND:
-		*response = createFileResponse(request, "/usr/share/webdav/HTTP_NOT_FOUND.html");
+		*response = createFileResponse(request, "/usr/share/webdav/HTTP_NOT_FOUND.html", "text/html");
 		return MHD_HTTP_FORBIDDEN;
 
 	case RAP_BAD_CLIENT_REQUEST:
-		*response = createFileResponse(request, "/usr/share/webdav/HTTP_BAD_REQUEST.html");
+		*response = createFileResponse(request, "/usr/share/webdav/HTTP_BAD_REQUEST.html", "text/html");
 		return MHD_HTTP_BAD_REQUEST;
 
 	default:
@@ -777,7 +631,8 @@ static int forkRapProcess(const char * path, int * newSockFd) {
 			stdLogError(errno, "Could not assign new socket (%d) to stdin/stdout", newSockFd[1]);
 			exit(255);
 		}
-		char * argv[] = { (char *) config.rapBinary, (char *) config.pamServiceName, NULL };
+		char * argv[] =
+				{ (char *) config.rapBinary, (char *) config.pamServiceName, (char *) config.mimeTypesFile, NULL };
 		execv(path, argv);
 		stdLogError(errno, "Could not start rap: %s", path);
 		exit(255);
@@ -1020,7 +875,7 @@ static int completeUpload(struct MHD_Connection *request, struct RestrictedAcces
 		struct MHD_Response ** response) {
 
 	if (processor->writeDataFd == -1) {
-		*response = createFileResponse(request, "/usr/share/webdav/HTTP_INSUFFICIENT_STORAGE.html");
+		*response = createFileResponse(request, "/usr/share/webdav/HTTP_INSUFFICIENT_STORAGE.html", "text/html");
 		return MHD_HTTP_INSUFFICIENT_STORAGE;
 	} else {
 		// Closing this pipe signals to the rap that there is no more data
@@ -1096,7 +951,7 @@ static int processNewRequest(struct MHD_Connection * request, const char * url, 
 		}
 		message.bufferCount = 3;
 	} else if (!strcmp("OPTIONS", method)) {
-		*response = createFileResponse(request, "/usr/share/webdav/OPTIONS.html");
+		*response = createFileResponse(request, "/usr/share/webdav/OPTIONS.html", "text/html");
 		addHeaderSafe(*response, "Accept", ACCEPT_HEADER);
 		return MHD_HTTP_OK;
 	} else {
@@ -1175,7 +1030,7 @@ static int sendResponse(struct MHD_Connection *request, int statusCode, struct M
 
 static int answerToRequest(void *cls, struct MHD_Connection *request, const char *url, const char *method,
 		const char *version, const char *upload_data, size_t *upload_data_size, void ** s) {
-	
+
 	struct RestrictedAccessProcessor ** rapSession = (struct RestrictedAccessProcessor **) s;
 
 	if (*rapSession) {
@@ -1267,7 +1122,7 @@ static int answerToRequest(void *cls, struct MHD_Connection *request, const char
 // Initialisation //
 ////////////////////
 
-static void initializeStaticResponse(struct MHD_Response ** response, const char * fileName) {
+static void initializeStaticResponse(struct MHD_Response ** response, const char * fileName, const char * mimeType) {
 	size_t bufferSize;
 	char * buffer;
 
@@ -1281,17 +1136,16 @@ static void initializeStaticResponse(struct MHD_Response ** response, const char
 		exit(255);
 	}
 
-	struct MimeType * type = findMimeType(fileName);
-	if (type) {
-		addHeaderSafe(*response, "Content-Type", type->type);
+	if (mimeType) {
+		addHeaderSafe(*response, "Content-Type", mimeType);
 	}
 }
 
 static void initializeStaticResponses() {
-	initializeStaticResponse(&INTERNAL_SERVER_ERROR_PAGE, "/usr/share/webdav/HTTP_INTERNAL_SERVER_ERROR.html");
-	initializeStaticResponse(&UNAUTHORIZED_PAGE, "/usr/share/webdav/HTTP_UNAUTHORIZED.html");
+	initializeStaticResponse(&INTERNAL_SERVER_ERROR_PAGE, "/usr/share/webdav/HTTP_INTERNAL_SERVER_ERROR.html", "text/html");
+	initializeStaticResponse(&UNAUTHORIZED_PAGE, "/usr/share/webdav/HTTP_UNAUTHORIZED.html", "text/html");
 	addHeaderSafe(UNAUTHORIZED_PAGE, "WWW-Authenticate", "Basic realm=\"My Server\"");
-	initializeStaticResponse(&METHOD_NOT_SUPPORTED_PAGE, "/usr/share/webdav/HTTP_METHOD_NOT_SUPPORTED.html");
+	initializeStaticResponse(&METHOD_NOT_SUPPORTED_PAGE, "/usr/share/webdav/HTTP_METHOD_NOT_SUPPORTED.html", "text/html");
 	addHeaderSafe(METHOD_NOT_SUPPORTED_PAGE, "Allow",
 			"OPTIONS, GET, HEAD, DELETE, PROPFIND, PUT, PROPPATCH, COPY, MOVE, LOCK, UNLOCK");
 }
@@ -1658,7 +1512,6 @@ int main(int argCount, char ** args) {
 	}
 
 	initializeLogs();
-	initializeMimeTypes();
 	initializeStaticResponses();
 	initializeRapDatabase();
 	initializeSSL();

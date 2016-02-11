@@ -6,6 +6,7 @@
 #include <unistd.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <errno.h>
 #include <time.h>
 #include <pwd.h>
@@ -335,4 +336,33 @@ const char * nodeTypeToName(int nodeType) {
 	default:
 		return NULL;
 	}
+}
+
+char * loadFileToBuffer(const char * file, size_t * size) {
+	int fd = open(file, O_RDONLY);
+	struct stat stat;
+	if (fd == -1 || fstat(fd, &stat)) {
+		stdLogError(errno, "Could not open file %s", file);
+		return NULL;
+	}
+
+	size_t totalBytesRead = 0;
+	char * buffer = mallocSafe(stat.st_size);
+	while (totalBytesRead < stat.st_size) {
+		if (stat.st_size != 0) {
+			size_t bytesRead = read(fd, buffer + totalBytesRead, stat.st_size - totalBytesRead);
+			if (bytesRead <= 0) {
+				stdLogError(bytesRead < 0 ? errno : 0, "Could not read whole file %s", file);
+				free(buffer);
+				close(fd);
+				return NULL;
+			}
+			else {
+				totalBytesRead += bytesRead;
+			}
+		}
+	}
+	*size = stat.st_size;
+	close(fd);
+	return buffer;
 }
