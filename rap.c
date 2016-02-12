@@ -7,6 +7,7 @@
 #include <string.h>
 #include <time.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <dirent.h>
 #include <security/pam_appl.h>
 #include <libxml/xmlwriter.h>
@@ -38,7 +39,8 @@ static size_t mimeFileBufferSize;
 static char * mimeFileBuffer;
 static struct MimeType * mimeTypes = NULL;
 static int mimeTypeCount = 0;
-static struct MimeType UNKNOWN_MIME_TYPE = { .ext = "", .type = "application/octet-stream", .typeStringSize = sizeof("application/octet-stream") };
+static struct MimeType UNKNOWN_MIME_TYPE = { .ext = "", .type = "application/octet-stream", .typeStringSize =
+		sizeof("application/octet-stream") };
 static struct MimeType XML_MIME_TYPE = { .ext = "", .type = "text/xml", .typeStringSize = sizeof("text/xml") };
 
 static int compareExt(const void * a, const void * b) {
@@ -195,15 +197,16 @@ static int xmlTextWriterWriteElementString(xmlTextWriterPtr writer, const char *
 #define PROPFIND_CONTENT_TYPE "getcontenttype"
 #define PROPFIND_USED_BYTES "quota-used-bytes"
 #define PROPFIND_AVAILABLE_BYTES "quota-available-bytes"
+#define PROPFIND_ETAG "getetag"
 
 struct PropertySet {
-    char creationDate;
-    char displayName;
-    char contentLength;
-    char contentType;
-    // TODO etag
-    char lastModified;
-    char resourceType;
+	char creationDate;
+	char displayName;
+	char contentLength;
+	char contentType;
+	char etag;
+	char lastModified;
+	char resourceType;
 	char usedBytes;
 	char availableBytes;
 };
@@ -263,6 +266,8 @@ static int parsePropFind(int fd, struct PropertySet * properties) {
 				properties->availableBytes = 1;
 			} else if (!strcmp(nodeName, PROPFIND_USED_BYTES)) {
 				properties->usedBytes = 1;
+			} else if (!strcmp(nodeName, PROPFIND_ETAG)) {
+				properties->etag = 1;
 			}
 		}
 		stepOver(reader);
@@ -291,13 +296,11 @@ static void writePropFindResponsePart(const char * fileName, const char * displa
 	xmlTextWriterWriteElementString(writer, "href", fileName);
 	xmlTextWriterStartElementNS(writer, "d", "propstat", NULL);
 	xmlTextWriterStartElementNS(writer, "d", "prop", NULL);
-	
-	int isDir = (fileStat->st_mode & S_IFMT) == S_IFDIR;
 
-	if (properties->contentLength && !isDir) {
-		char buffer[100];
-		snprintf(buffer, sizeof(buffer), "%zd", fileStat->st_size);
-		xmlTextWriterWriteElementString(writer, PROPFIND_CONTENT_LENGTH, buffer);
+	if (properties->etag) {
+		char buffer[200];
+		snprintf(buffer, sizeof(buffer), "\"%zd-%lld\"", fileStat->st_size, (long long)fileStat->st_mtime);
+		xmlTextWriterWriteElementString(writer, PROPFIND_ETAG, buffer);
 	}
 	if (properties->creationDate) {
 		char buffer[100];
@@ -320,17 +323,39 @@ static void writePropFindResponsePart(const char * fileName, const char * displa
 	if (properties->displayName) {
 		xmlTextWriterWriteElementString(writer, PROPFIND_DISPLAY_NAME, displayName);
 	}
-	if (properties->contentType && !isDir) {
-		xmlTextWriterWriteElementString(writer, PROPFIND_CONTENT_TYPE, findMimeType(fileName)->type);
+	if ((fileStat->st_mode & S_IFMT) == S_IFDIR) {
+		if (properties->availableBytes) {
+			struct statvfs fsStat;
+			if (!statvfs(fileName, &fsStat)) {
+				char buffer[100];
+				unsigned long long size = fsStat.f_bavail * fsStat.f_bsize;
+				snprintf(buffer, sizeof(buffer), "%llu", size);
+				xmlTextWriterWriteElementString(writer, PROPFIND_AVAILABLE_BYTES, buffer);
+				if (properties->usedBytes) {
+					size = (fsStat.f_blocks - fsStat.f_bfree) * fsStat.f_bsize;
+					snprintf(buffer, sizeof(buffer), "%llu", size);
+					xmlTextWriterWriteElementString(writer, PROPFIND_USED_BYTES, buffer);
+				}
+			}
+		} else if (properties->usedBytes) {
+			struct statvfs fsStat;
+			if (!statvfs(fileName, &fsStat)) {
+				char buffer[100];
+				unsigned long long size = (fsStat.f_blocks - fsStat.f_bfree) * fsStat.f_bsize;
+				snprintf(buffer, sizeof(buffer), "%llu", size);
+				xmlTextWriterWriteElementString(writer, PROPFIND_USED_BYTES, buffer);
+			}
+		}
+	} else {
+		if (properties->contentLength) {
+			char buffer[100];
+			snprintf(buffer, sizeof(buffer), "%zd", fileStat->st_size);
+			xmlTextWriterWriteElementString(writer, PROPFIND_CONTENT_LENGTH, buffer);
+		}
+		if (properties->contentType) {
+			xmlTextWriterWriteElementString(writer, PROPFIND_CONTENT_TYPE, findMimeType(fileName)->type);
+		}
 	}
-	if (properties->availableBytes && isDir) {
-		// TODO	
-	}
-    if (properties->usedBytes && isDir) {
-		// TODO
-	}
-
-	//<d:getetag>"56a341a7873fd"</d:getetag>
 	xmlTextWriterEndElement(writer);
 	xmlTextWriterWriteElementString(writer, "status", "HTTP/1.1 200 OK");
 	xmlTextWriterEndElement(writer);
@@ -340,7 +365,6 @@ static void writePropFindResponsePart(const char * fileName, const char * displa
 
 static int respondToPropFind(const char * file, const char * host, struct PropertySet * properties, int depth) {
 	struct stat fileStat;
-
 	if (stat(file, &fileStat)) {
 		int e = errno;
 		switch (e) {
