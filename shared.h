@@ -68,6 +68,7 @@ char * iovecToString(struct iovec * iovec);
 size_t getWebDate(time_t rawtime, char * buf, size_t bufSize);
 int lockToUser(const char * user);
 
+void suppressReaderErrors(xmlTextReaderPtr reader);
 int stepInto(xmlTextReaderPtr reader);
 int stepOver(xmlTextReaderPtr reader);
 int stepOut(xmlTextReaderPtr reader);

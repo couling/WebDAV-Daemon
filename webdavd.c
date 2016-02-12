@@ -570,7 +570,7 @@ static int createRapResponse(struct MHD_Connection *request, struct Message * me
 
 	case RAP_NOT_FOUND:
 		*response = createFileResponse(request, "/usr/share/webdav/HTTP_NOT_FOUND.html", "text/html");
-		return MHD_HTTP_FORBIDDEN;
+		return MHD_HTTP_NOT_FOUND;
 
 	case RAP_BAD_CLIENT_REQUEST:
 		*response = createFileResponse(request, "/usr/share/webdav/HTTP_BAD_REQUEST.html", "text/html");
@@ -1465,6 +1465,7 @@ static int configureServer(xmlTextReaderPtr reader, const char * configFile, str
 
 void configure(const char * configFile) {
 	xmlTextReaderPtr reader = xmlReaderForFile(configFile, NULL, XML_PARSE_NOENT);
+	suppressReaderErrors(reader);
 	if (!reader || !stepInto(reader)) {
 		stdLogError(0, "could not create xml reader for %s", configFile);
 		exit(1);

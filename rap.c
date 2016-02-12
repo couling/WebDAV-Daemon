@@ -22,16 +22,6 @@ static size_t respond(enum RapConstant result, int fd) {
 	return sendMessage(STDOUT_FILENO, &message);
 }
 
-struct PropertySet {
-	char creationDate;
-	char displayName;
-	char contentLength;
-	char contentType;
-	// TODO etag
-	char lastModified;
-	char resourceType;
-};
-
 //////////
 // Mime //
 //////////
@@ -48,8 +38,8 @@ static size_t mimeFileBufferSize;
 static char * mimeFileBuffer;
 static struct MimeType * mimeTypes = NULL;
 static int mimeTypeCount = 0;
-static struct MimeType _UNKNOWN_MIME_TYPE = { .ext = "", .type = "application/octet-stream", .typeStringSize =
-		sizeof("application/octet-stream") }, *UNKNOWN_MIME_TYPE = &_UNKNOWN_MIME_TYPE;
+static struct MimeType UNKNOWN_MIME_TYPE = { .ext = "", .type = "application/octet-stream", .typeStringSize = sizeof("application/octet-stream") };
+static struct MimeType XML_MIME_TYPE = { .ext = "", .type = "text/xml", .typeStringSize = sizeof("text/xml") };
 
 static int compareExt(const void * a, const void * b) {
 	return strcmp(((struct MimeType *) a)->ext, ((struct MimeType *) b)->ext);
@@ -58,26 +48,26 @@ static int compareExt(const void * a, const void * b) {
 static struct MimeType * findMimeType(const char * file) {
 
 	if (!file) {
-		return UNKNOWN_MIME_TYPE;
+		return &UNKNOWN_MIME_TYPE;
 	}
 	struct MimeType type;
 	type.ext = file + strlen(file) - 1;
 	while (1) {
 		if (*type.ext == '/') {
-			return UNKNOWN_MIME_TYPE;
+			return &UNKNOWN_MIME_TYPE;
 		} else if (*type.ext == '.') {
 			type.ext++;
 			break;
 		} else {
 			type.ext--;
 			if (type.ext < file) {
-				return UNKNOWN_MIME_TYPE;
+				return &UNKNOWN_MIME_TYPE;
 			}
 		}
 	}
 
 	struct MimeType * result = bsearch(&type, mimeTypes, mimeTypeCount, sizeof(struct MimeType), &compareExt);
-	return result ? result : UNKNOWN_MIME_TYPE;
+	return result ? result : &UNKNOWN_MIME_TYPE;
 }
 
 static void initializeMimeTypes(const char * mimeTypesFile) {
@@ -193,8 +183,35 @@ static int xmlTextWriterWriteElementString(xmlTextWriterPtr writer, const char *
 // End XML Text Writer //
 /////////////////////////
 
+//////////////
+// PROPFIND //
+//////////////
+
+#define PROPFIND_RESOURCE_TYPE "resourcetype"
+#define PROPFIND_CREATION_DATE "creationdate"
+#define PROPFIND_CONTENT_LENGTH "getcontentlength"
+#define PROPFIND_LAST_MODIFIED "getlastmodified"
+#define PROPFIND_DISPLAY_NAME "displayname"
+#define PROPFIND_CONTENT_TYPE "getcontenttype"
+#define PROPFIND_USED_BYTES "quota-used-bytes"
+#define PROPFIND_AVAILABLE_BYTES "quota-available-bytes"
+
+struct PropertySet {
+    char creationDate;
+    char displayName;
+    char contentLength;
+    char contentType;
+    // TODO etag
+    char lastModified;
+    char resourceType;
+	char usedBytes;
+	char availableBytes;
+};
+
 static int parsePropFind(int fd, struct PropertySet * properties) {
 	xmlTextReaderPtr reader = xmlReaderForFd(fd, NULL, NULL, XML_PARSE_NOENT);
+	suppressReaderErrors(reader);
+
 	int readResult;
 	if (!reader || !stepInto(reader)) {
 		stdLogError(0, "could not create xml reader");
@@ -230,18 +247,22 @@ static int parsePropFind(int fd, struct PropertySet * properties) {
 	while (readResult && xmlTextReaderDepth(reader) > 1) {
 		if (!strcmp(xmlTextReaderConstNamespaceUri(reader), "DAV:")) {
 			const char * nodeName = xmlTextReaderConstLocalName(reader);
-			if (!strcmp(nodeName, "resourcetype")) {
+			if (!strcmp(nodeName, PROPFIND_RESOURCE_TYPE)) {
 				properties->resourceType = 1;
-			} else if (!strcmp(nodeName, "creationdate")) {
+			} else if (!strcmp(nodeName, PROPFIND_CREATION_DATE)) {
 				properties->creationDate = 1;
-			} else if (!strcmp(nodeName, "contentlength")) {
+			} else if (!strcmp(nodeName, PROPFIND_CONTENT_LENGTH)) {
 				properties->contentLength = 1;
-			} else if (!strcmp(nodeName, "lastmodified")) {
+			} else if (!strcmp(nodeName, PROPFIND_LAST_MODIFIED)) {
 				properties->lastModified = 1;
-			} else if (!strcmp(nodeName, "displaydame")) {
+			} else if (!strcmp(nodeName, PROPFIND_DISPLAY_NAME)) {
 				properties->displayName = 1;
-			} else if (!strcmp(nodeName, "contenttype")) {
+			} else if (!strcmp(nodeName, PROPFIND_CONTENT_TYPE)) {
 				properties->contentType = 1;
+			} else if (!strcmp(nodeName, PROPFIND_AVAILABLE_BYTES)) {
+				properties->availableBytes = 1;
+			} else if (!strcmp(nodeName, PROPFIND_USED_BYTES)) {
+				properties->usedBytes = 1;
 			}
 		}
 		stepOver(reader);
@@ -270,23 +291,26 @@ static void writePropFindResponsePart(const char * fileName, const char * displa
 	xmlTextWriterWriteElementString(writer, "href", fileName);
 	xmlTextWriterStartElementNS(writer, "d", "propstat", NULL);
 	xmlTextWriterStartElementNS(writer, "d", "prop", NULL);
-	if (properties->contentLength) {
+	
+	int isDir = (fileStat->st_mode & S_IFMT) == S_IFDIR;
+
+	if (properties->contentLength && !isDir) {
 		char buffer[100];
 		snprintf(buffer, sizeof(buffer), "%zd", fileStat->st_size);
-		xmlTextWriterWriteElementString(writer, "contentlength", buffer);
+		xmlTextWriterWriteElementString(writer, PROPFIND_CONTENT_LENGTH, buffer);
 	}
 	if (properties->creationDate) {
 		char buffer[100];
 		getWebDate(fileStat->st_ctime, buffer, 100);
-		xmlTextWriterWriteElementString(writer, "creationdate", buffer);
+		xmlTextWriterWriteElementString(writer, PROPFIND_CREATION_DATE, buffer);
 	}
 	if (properties->lastModified) {
 		char buffer[100];
 		getWebDate(fileStat->st_ctime, buffer, 100);
-		xmlTextWriterWriteElementString(writer, "lastmodified", buffer);
+		xmlTextWriterWriteElementString(writer, PROPFIND_LAST_MODIFIED, buffer);
 	}
 	if (properties->resourceType) {
-		xmlTextWriterStartElementNS(writer, "d", "resourcetype", NULL);
+		xmlTextWriterStartElementNS(writer, "d", PROPFIND_RESOURCE_TYPE, NULL);
 		if ((fileStat->st_mode & S_IFMT) == S_IFDIR) {
 			xmlTextWriterStartElementNS(writer, "d", "collection", NULL);
 			xmlTextWriterEndElement(writer);
@@ -294,13 +318,19 @@ static void writePropFindResponsePart(const char * fileName, const char * displa
 		xmlTextWriterEndElement(writer);
 	}
 	if (properties->displayName) {
-		xmlTextWriterWriteElementString(writer, "displayname", displayName);
+		xmlTextWriterWriteElementString(writer, PROPFIND_DISPLAY_NAME, displayName);
 	}
-	if (properties->contentType) {
-		xmlTextWriterWriteElementString(writer, "contenttype", findMimeType(fileName)->type);
+	if (properties->contentType && !isDir) {
+		xmlTextWriterWriteElementString(writer, PROPFIND_CONTENT_TYPE, findMimeType(fileName)->type);
 	}
+	if (properties->availableBytes && isDir) {
+		// TODO	
+	}
+    if (properties->usedBytes && isDir) {
+		// TODO
+	}
+
 	//<d:getetag>"56a341a7873fd"</d:getetag>
-	//<d:getlastmodified>Sat, 23 Jan 2016 09:02:31 GMT</d:getlastmodified>
 	xmlTextWriterEndElement(writer);
 	xmlTextWriterWriteElementString(writer, "status", "HTTP/1.1 200 OK");
 	xmlTextWriterEndElement(writer);
@@ -353,8 +383,8 @@ static int respondToPropFind(const char * file, const char * host, struct Proper
 	struct Message message = { .mID = RAP_MULTISTATUS, .fd = pipeEnds[PIPE_READ], .bufferCount = 2 };
 	message.buffers[RAP_DATE_INDEX].iov_base = &fileTime;
 	message.buffers[RAP_DATE_INDEX].iov_len = sizeof(fileTime);
-	message.buffers[RAP_MIME_INDEX].iov_base = "application/xml";
-	message.buffers[RAP_MIME_INDEX].iov_len = sizeof("application/xml");
+	message.buffers[RAP_MIME_INDEX].iov_base = (void *) XML_MIME_TYPE.type;
+	message.buffers[RAP_MIME_INDEX].iov_len = XML_MIME_TYPE.typeStringSize;
 	message.buffers[RAP_LOCATION_INDEX].iov_base = filePath;
 	message.buffers[RAP_LOCATION_INDEX].iov_len = filePathSize + 1;
 	size_t messageResult = sendMessage(STDOUT_FILENO, &message);
@@ -438,6 +468,10 @@ static size_t propfind(struct Message * requestMessage) {
 	return respondToPropFind(file, iovecToString(&requestMessage->buffers[RAP_HOST_INDEX]), &properties,
 			(strcmp("0", depthString) ? 2 : 1));
 }
+
+//////////////////
+// End PROPFIND //
+//////////////////
 
 static size_t writeFile(struct Message * requestMessage) {
 	return respond(RAP_BAD_RAP_REQUEST, -1);

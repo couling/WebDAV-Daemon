@@ -235,6 +235,13 @@ int lockToUser(const char * user) {
 	return 1;
 }
 
+static void xmlTextNOOPErrorFunction (void * arg, const char * msg, xmlParserSeverities severity, xmlTextReaderLocatorPtr locator) {
+}
+
+void suppressReaderErrors(xmlTextReaderPtr reader) {
+	xmlTextReaderSetErrorHandler(reader, &xmlTextNOOPErrorFunction, NULL);
+}
+
 int stepInto(xmlTextReaderPtr reader) {
 	// Skip all significant white space
 	int result;

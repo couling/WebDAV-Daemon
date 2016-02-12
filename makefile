@@ -1,5 +1,3 @@
--include build/*.d
-
 all: build/webdavd build/rap
 
 #-O3
@@ -17,3 +15,4 @@ build:
 clean:
 	rm -rf build
 
+-include build/*.d
