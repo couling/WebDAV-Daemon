@@ -41,7 +41,7 @@ static struct MimeType * mimeTypes = NULL;
 static int mimeTypeCount = 0;
 static struct MimeType UNKNOWN_MIME_TYPE = { .ext = "", .type = "application/octet-stream", .typeStringSize =
 		sizeof("application/octet-stream") };
-static struct MimeType XML_MIME_TYPE = { .ext = "", .type = "text/xml", .typeStringSize = sizeof("text/xml") };
+static struct MimeType XML_MIME_TYPE = { .ext = "", .type = "application/xml; charset=utf-8", .typeStringSize = sizeof("application/xml; charset=utf-8") };
 
 static int compareExt(const void * a, const void * b) {
 	return strcmp(((struct MimeType *) a)->ext, ((struct MimeType *) b)->ext);
@@ -154,6 +154,9 @@ static void initializeMimeTypes(const char * mimeTypesFile) {
 // XML Text Writer //
 /////////////////////
 static int xmlFdOutputCloseCallback(void * context) {
+	// TODO remove this
+	char c = '\n';
+	size_t ignored = write(*((int *)context), &c, 1);
 	close(*((int *) context));
 	free(context);
 	return 0;
@@ -320,9 +323,9 @@ static void writePropFindResponsePart(const char * fileName, const char * displa
 		}
 		xmlTextWriterEndElement(writer);
 	}
-	if (properties->displayName) {
-		xmlTextWriterWriteElementString(writer, PROPFIND_DISPLAY_NAME, displayName);
-	}
+	//if (properties->displayName) {
+	//	xmlTextWriterWriteElementString(writer, PROPFIND_DISPLAY_NAME, displayName);
+	//}
 	if ((fileStat->st_mode & S_IFMT) == S_IFDIR) {
 		if (properties->availableBytes) {
 			struct statvfs fsStat;
@@ -383,11 +386,11 @@ static int respondToPropFind(const char * file, const char * host, struct Proper
 		stdLogError(errno, "Could not create pipe to write content");
 		return respond(RAP_INTERNAL_ERROR, -1);
 	}
-
+	
 	char * filePath;
 	size_t filePathSize = strlen(file);
 	size_t fileNameSize = filePathSize;
-	if (fileStat.st_mode & S_IFMT) {
+	if ((fileStat.st_mode & S_IFMT) == S_IFDIR && file[filePathSize - 1] != '/') {
 		filePath = mallocSafe(filePathSize + 2);
 		memcpy(filePath, file, filePathSize);
 		filePath[filePathSize] = '/';
@@ -398,9 +401,10 @@ static int respondToPropFind(const char * file, const char * host, struct Proper
 	}
 
 	const char * displayName = &file[fileNameSize - 2];
-	while (displayName > file && *displayName != '/') {
+	while (displayName >= file && *displayName != '/') {
 		displayName--;
 	}
+	displayName++;
 
 	time_t fileTime;
 	time(&fileTime);
@@ -423,7 +427,7 @@ static int respondToPropFind(const char * file, const char * host, struct Proper
 	// We've set up the pipe and sent read end across so now write the result
 	xmlTextWriterPtr writer = xmlNewFdTextWriter(pipeEnds[PIPE_WRITE]);
 	DIR * dir;
-	xmlTextWriterStartDocument(writer, "1.0", "UTF-8", NULL);
+	xmlTextWriterStartDocument(writer, "1.0", "utf-8", NULL);
 	xmlTextWriterStartElementNS(writer, "d", "multistatus", "DAV:");
 	writePropFindResponsePart(filePath, displayName, properties, &fileStat, writer);
 	if (depth > 1 && (fileStat.st_mode & S_IFMT) == S_IFDIR && (dir = opendir(filePath))) {
@@ -485,10 +489,6 @@ static size_t propfind(struct Message * requestMessage) {
 	}
 
 	char * file = iovecToString(&requestMessage->buffers[RAP_FILE_INDEX]);
-	size_t filePathSize = strlen(file);
-	if (S_IFDIR && file[filePathSize - 1] == '/') {
-		file[filePathSize - 1] = '\0';
-	}
 	return respondToPropFind(file, iovecToString(&requestMessage->buffers[RAP_HOST_INDEX]), &properties,
 			(strcmp("0", depthString) ? 2 : 1));
 }

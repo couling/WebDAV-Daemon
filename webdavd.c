@@ -117,7 +117,8 @@ struct WebdavdConfiguration {
 // End Webdavd Configuration Structures //
 //////////////////////////////////////////
 
-#define ACCEPT_HEADER "OPTIONS, GET, HEAD, DELETE, PROPFIND, PUT, PROPPATCH, COPY, MOVE, LOCK, UNLOCK"
+// TODO remove REPORT or implement it
+#define ACCEPT_HEADER "OPTIONS, GET, HEAD, DELETE, PROPFIND, PUT, PROPPATCH, COPY, MOVE, REPORT, LOCK, UNLOCK"
 
 static struct MHD_Response * INTERNAL_SERVER_ERROR_PAGE;
 static struct MHD_Response * UNAUTHORIZED_PAGE;
@@ -461,6 +462,19 @@ static void addHeaderSafe(struct MHD_Response * response, const char * headerKey
 	}
 }
 
+static void addStaticHeaders(struct MHD_Response * response) {
+	// TODO corect this header
+	addHeaderSafe(response, "DAV", "1");
+	// addHeaderSafe(response, "MS-Author-Via", "DAV");
+	addHeaderSafe(response, "Accept-Ranges", "bytes");
+	addHeaderSafe(response, "Keep-Alive", "timeout=30");
+	addHeaderSafe(response, "Connection", "Keep-Alive");
+	addHeaderSafe(response, "Server", "couling-webdavd");
+	addHeaderSafe(response, "Expires", "Thu, 19 Nov 1981 08:52:00 GMT");
+	addHeaderSafe(response, "Cache-Control", "no-store, no-cache, must-revalidate, post-check=0, pre-check=0");
+	addHeaderSafe(response, "Pragma", "no-cache");
+}
+
 static ssize_t fdContentReader(int *fd, uint64_t pos, char *buf, size_t max) {
 	size_t bytesRead = read(*fd, buf, max);
 	if (bytesRead < 0) {
@@ -501,7 +515,7 @@ static struct MHD_Response * createFdStreamResponse(int fd, const char * mimeTyp
 	if (mimeType != NULL) {
 		addHeaderSafe(response, "Content-Type", mimeType);
 	}
-	addHeaderSafe(response, "Dav", "1");
+	addStaticHeaders(response);
 	return response;
 }
 
@@ -517,7 +531,7 @@ static struct MHD_Response * createFdFileResponse(size_t size, int fd, const cha
 	if (mimeType != NULL) {
 		addHeaderSafe(response, "Content-Type", mimeType);
 	}
-	addHeaderSafe(response, "Dav", "1");
+	addStaticHeaders(response);
 	return response;
 }
 
@@ -959,7 +973,6 @@ static int processNewRequest(struct MHD_Connection * request, const char * url, 
 				(rapSession->writeDataFd != -1 ? "with" : "without"));
 		return MHD_HTTP_METHOD_NOT_ALLOWED;
 	}
-	stdLog("%s %s data", method, rapSession->writeDataFd != -1 ? "with" : "without");
 
 	// Send the request to the RAP
 	size_t ioResult = sendMessage(rapSession->socketFd, &message);

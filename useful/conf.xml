@@ -1,4 +1,4 @@
-<?xml version="1.0" encoding="UTF-8" ?>
+<?xml version="1.0" encoding="utf-8" ?>
 <server-config xmlns="http://couling.me/webdavd">
 	<server>
 		<listen>

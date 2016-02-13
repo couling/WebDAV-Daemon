@@ -218,7 +218,7 @@ char * iovecToString(struct iovec * iovec) {
 }
 
 size_t getWebDate(time_t rawtime, char * buf, size_t bufSize) {
-	struct tm * timeinfo = localtime(&rawtime);
+	struct tm * timeinfo = gmtime(&rawtime);
 	return strftime(buf, bufSize, "%a, %d %b %Y %H:%M:%S %Z", timeinfo);
 }
 
