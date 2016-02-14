@@ -34,14 +34,14 @@ struct MimeType {
 };
 
 // Mime Database.
-// TODO find a way to move this to the RAP.
 static size_t mimeFileBufferSize;
 static char * mimeFileBuffer;
 static struct MimeType * mimeTypes = NULL;
 static int mimeTypeCount = 0;
 static struct MimeType UNKNOWN_MIME_TYPE = { .ext = "", .type = "application/octet-stream", .typeStringSize =
 		sizeof("application/octet-stream") };
-static struct MimeType XML_MIME_TYPE = { .ext = "", .type = "application/xml; charset=utf-8", .typeStringSize = sizeof("application/xml; charset=utf-8") };
+static struct MimeType XML_MIME_TYPE = { .ext = "", .type = "application/xml; charset=utf-8", .typeStringSize =
+		sizeof("application/xml; charset=utf-8") };
 
 static int compareExt(const void * a, const void * b) {
 	return strcmp(((struct MimeType *) a)->ext, ((struct MimeType *) b)->ext);
@@ -154,9 +154,6 @@ static void initializeMimeTypes(const char * mimeTypesFile) {
 // XML Text Writer //
 /////////////////////
 static int xmlFdOutputCloseCallback(void * context) {
-	// TODO remove this
-	char c = '\n';
-	size_t ignored = write(*((int *)context), &c, 1);
 	close(*((int *) context));
 	free(context);
 	return 0;
@@ -302,7 +299,7 @@ static void writePropFindResponsePart(const char * fileName, const char * displa
 
 	if (properties->etag) {
 		char buffer[200];
-		snprintf(buffer, sizeof(buffer), "\"%zd-%lld\"", fileStat->st_size, (long long)fileStat->st_mtime);
+		snprintf(buffer, sizeof(buffer), "\"%zd-%lld\"", fileStat->st_size, (long long) fileStat->st_mtime);
 		xmlTextWriterWriteElementString(writer, PROPFIND_ETAG, buffer);
 	}
 	if (properties->creationDate) {
@@ -386,7 +383,7 @@ static int respondToPropFind(const char * file, const char * host, struct Proper
 		stdLogError(errno, "Could not create pipe to write content");
 		return respond(RAP_INTERNAL_ERROR, -1);
 	}
-	
+
 	char * filePath;
 	size_t filePathSize = strlen(file);
 	size_t fileNameSize = filePathSize;

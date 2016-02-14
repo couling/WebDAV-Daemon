@@ -1,66 +1,122 @@
 <?xml version="1.0" encoding="utf-8" ?>
 <server-config xmlns="http://couling.me/webdavd">
+
 	<!-- Each <server> will occupy its own process -->
+	<!-- At the moment only one server tag can be specified -->
 	<server>
-		<!-- Each listen port opens an individual listening daemon -->
-		<!-- There is no default port. Default host is "*" (any ip). Default ssl-enabled 
-			is "no" -->
-		<!-- The following will listening on localhost only and be unencrypted -->
+
+		<!-- Each listen port opens an individual listening daemon. There is no 
+			default port. Default host "any ip". Default encryption is "none". The following 
+			will listening on localhost only and be unencrypted -->
+
 		<listen>
+
 			<port>80</port>
-			<host>localhost</host>
+
+			<!-- A host tag will bind the server to listen on that IP. Domains will 
+				be convertied to an IP before binding. -->
+			<!-- <host>myHost.domain.tld</host> -->
+
 			<encryption>none</encryption>
+
+			<!-- It is NOT recomended to host content on unencrypted chanels. So this 
+				port will just forward to an encrypted one -->
+
+			<forward-to>
+
+				<port>443</port>
+
+				<!-- Forwarding by default forwards to the same domain as the request. 
+					If you want to specify a static domain then set it here -->
+				<!-- <host>another-domain.tld</host> -->
+
+				<!-- Is the client being forwarded to http ("none") or https ("ssl"). 
+					The following defaults to "ssl" if fowarding to port 443 and "none" for all 
+					other ports -->
+				<!-- <encryption>ssl</encryption> -->
+
+			</forward-to>
+
 		</listen>
+
+
 		<!-- The following will listen on all ips and be encrypted -->
 		<listen>
+
 			<port>443</port>
-			<!-- Only "none" and "ssl" are currently supported -->
+
+			<!-- Only "none" and "ssl" are currently supported. Encrypting with SSL 
+				requires one or more <ssl-cert> certificates (see below) -->
+
 			<encryption>ssl</encryption>
+
 		</listen>
 
-		<!-- The actual rap session max life (has secirity implications) -->
-		<!-- default: 5:00 Supports format: [[[hours:]minutes:]seconds] -->
+
+		<!-- The authenticated session life span (has secirity implications). Sessions 
+			will stay open for this length of time and user/passwords matching the session 
+			may not be checked with PAM. For this reason it is best to leave this open 
+			only for a few minutes incase the system password changes. default: 5:00 
+			Supports format: [[[hours:]minutes:]seconds] -->
 		<session-timeout>5:00</session-timeout>
 
-		<!-- Max rap sessions per user keep this low (eg 10) -->
+		<!-- Max rap sessions per user keep this low (eg 10). Multiple connections 
+			can share a sessoion. More than one session will only be required if more 
+			than one concurrent request is sent -->
 		<max-user-sessions>10</max-user-sessions>
 
-		<!-- Not yet supported until multiple servers. Will be very important defaut 
-			to root -->
+		<!-- Not yet supported until multiple servers is implemeted (see <server> 
+			above). Planned to setup a lockdown on the main session -->
 		<restricted>nobody</restricted>
 
 		<!-- mime.types file default /etc/mime.types -->
 		<mime-file>/etc/mime.types</mime-file>
 
-		<!-- The location of the rap binary. default /usr/sbin/rap -->
-		<!-- DO NOT CHANGE UNLESS YOU KNOW WHAT YOU ARE DOING -->
+		<!-- The location of the rap binary. DO NOT CHANGE UNLESS YOU KNOW WHAT 
+			YOU ARE DOING! This is primarily here for testing but on non-standard systems 
+			where binaries are not stored in /usr/sbin this will need to be changed to 
+			the location of "webdav-rap" -->
 		<rap-binary>/usr/sbin/rap</rap-binary>
 
-		<!-- The service name for PAM. specifies the file name searched for -->
-		<!-- in /etc/pam.d/. default webdavd -->
+		<!-- The service name for PAM. This corresponds to a file of the same name 
+			in /etc/pam.d/ on linux systems. default webdavd -->
 		<pam-service>webdavd</pam-service>
 
-		<!-- Directory containing static error responses -->
-		<!-- default /usr/share/webdavd -->
-		<static-error-dir>/usr/share/webdavd</static-error-dir>
+		<!-- Directory containing static error responses default /usr/share/webdavd. 
+			Again this should only be changed on non-standard sytems or for testing when 
+			the files can not be placed in /usr/share/webdavd -->
+		<static-response-dir>/usr/share/webdavd</static-response-dir>
 
-		<!-- File location for logs. Default /var/log/error.log and /var/log/access.log -->
+		<!-- File location for logs. If not specified or left blank the error log 
+			will print to stdout and the access log to stderr -->
 		<error-log>/var/log/webdav-error.log</error-log>
 		<access-log>/var/log/webdav-access.log</access-log>
 
+		<!-- At least one of these must be configured if you want an SSL encrypted 
+			connection. Certificates MUST have a Subject Alternative Name specified. 
+			Currently wildcard certificates are not supported. These will be used to 
+			determine the correct certificate to provide to a client. During server startup 
+			the domain name to certificate ascociation will be written to the error log 
+			for information purposes. If a client asks for a domain which is not known 
+			then the first <ssl-cert> will be the one returned. -->
 		<ssl-cert>
 
-			<!-- Hostname for SNI (multiple certificates -->
-			<!-- The FIRST <cert> is always used for unknown hosts -->
-			<!-- The certificate file -->
+			<!-- The PEM encoded certificate file -->
 			<certificate>/etc/ssl/certs/local/server.crt</certificate>
 
 			<!-- If the certificate requires intermediary ca certificates then add 
-				<chain> nodes -->
-			<chain>/etc/ssl/certs/local/server.crt</chain>
+				as many <chain> nodes as required. These must be added in order starting 
+				with the closest to the <certificate> and finishing with the closest to the 
+				root ca -->
+			<!-- <chain>/etc/ssl/certs/local/chain_server.crt</chain> -->
 
 			<!-- The key for <certificate> -->
 			<key>/etc/ssl/private/server.key</key>
 		</ssl-cert>
+		
+		<!-- As required.... -->
+		<!-- <ssl-cert>
+			...
+		</ssl-cert> -->
 	</server>
 </server-config>

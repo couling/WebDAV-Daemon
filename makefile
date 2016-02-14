@@ -1,13 +1,18 @@
+GCC_COMPILE_PART=gcc -std=gnu99 -pthread -Werror -g -o $@ -MMD $(filter %.c,$^) $(filter %.o,$^)
+
 all: build/webdavd build/rap
 
 #-O3
 #-g
 
-build/webdavd: webdavd.c shared.c | build
-	gcc -std=gnu99 -Werror -o $@ -g -pthread -I/usr/include/libxml2 $(filter %.c,$^) -MMD -lmicrohttpd -lxml2 -lgnutls
+build/webdavd: build/webdavd.o build/shared.o build/configuration.o | build
+	${GCC_COMPILE_PART} -lmicrohttpd -lxml2 -lgnutls
 
-build/rap: rap.c shared.c | build
-	gcc -std=gnu99 -Werror -o $@ -g -I/usr/include/libxml2 $(filter %.c,$^) -MMD -lpam -lxml2
+build/rap: build/rap.o build/shared.o | build
+	${GCC_COMPILE_PART} -lpam -lxml2
+
+build/%.o: %.c | build
+	${GCC_COMPILE_PART} -I/usr/include/libxml2 -c
 
 build:
 	mkdir $@

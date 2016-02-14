@@ -1,12 +1,10 @@
-// TODO ssl
 // TODO auth modes other than basic?
 // TODO correct failure codes on collections
-// TODO configuration file & getopt
 // TODO single root parent with multiple configured server processes
 // TODO protect RAP sessions from DOS attack using a lock per user
-// TODO find client IP and integrate this both into logging and authentication
 
 #include "shared.h"
+#include "configuration.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -29,9 +27,9 @@
 #include <sys/wait.h>
 #include <sys/socket.h>
 #include <sys/un.h>
-#include <time.h>
 #include <unistd.h>
 #include <netinet/in.h>
+#include <netdb.h>
 
 ////////////////
 // Structures //
@@ -70,59 +68,17 @@ struct SSLCertificate {
 // End Structures //
 ////////////////////
 
-//////////////////////////////////////
-// Webdavd Configuration Structures //
-//////////////////////////////////////
-
-struct DaemonConfig {
-	int port;
-	const char * host;
-	int sslEnabled;
-};
-
-struct SSLConfig {
-	int chainFileCount;
-	const char * keyFile;
-	const char * certificateFile;
-	const char ** chainFiles;
-
-};
-
-struct WebdavdConfiguration {
-	const char * restrictedUser;
-
-	// Daemons
-	int daemonCount;
-	struct DaemonConfig * daemons;
-
-	// RAP
-	time_t rapMaxSessionLife;
-	int rapMaxSessionsPerUser;
-	const char * pamServiceName;
-
-	// files
-	const char * mimeTypesFile;
-	const char * rapBinary;
-	const char * accessLog;
-	const char * errorLog;
-
-	// Add static files
-
-	// SSL
-	int sslCertCount;
-	struct SSLConfig * sslCerts;
-}static config;
-
-//////////////////////////////////////////
-// End Webdavd Configuration Structures //
-//////////////////////////////////////////
-
-// TODO remove REPORT or implement it
-#define ACCEPT_HEADER "OPTIONS, GET, HEAD, DELETE, PROPFIND, PUT, PROPPATCH, COPY, MOVE, REPORT, LOCK, UNLOCK"
+#define ACCEPT_HEADER "OPTIONS, GET, HEAD, DELETE, PROPFIND, PUT, PROPPATCH, COPY, MOVE, LOCK, UNLOCK"
 
 static struct MHD_Response * INTERNAL_SERVER_ERROR_PAGE;
 static struct MHD_Response * UNAUTHORIZED_PAGE;
 static struct MHD_Response * METHOD_NOT_SUPPORTED_PAGE;
+
+const char * FORBIDDEN_PAGE;
+const char * NOT_FOUND_PAGE;
+const char * BAD_REQUEST_PAGE;
+const char * INSUFFICIENT_STORAGE_PAGE;
+const char * OPTIONS_PAGE;
 
 // Used as a place holder for failed auth requests which failed due to invalid credentials
 static const struct RestrictedAccessProcessor AUTH_FAILED_RAP = { .pid = 0, .socketFd = -1, .user = "<auth failed>",
@@ -139,44 +95,48 @@ static const struct RestrictedAccessProcessor AUTH_ERROR_BACKOFF = { .pid = 0, .
 #define AUTH_ERROR ((struct RestrictedAccessProcessor *)&AUTH_ERROR_RAP)
 #define AUTH_BACKOFF ((struct RestrictedAccessProcessor *)&AUTH_ERROR_BACKOFF)
 
+static int sslCertificateCount;
+static struct SSLCertificate * sslCertificates = NULL;
+
+static sem_t rapDBLock;
+static int rapDBSize;
+static struct RapGroup * rapDB;
+
+struct WebdavdConfiguration config;
+
+// All Daemons
+// Not sure why we keep these, they're not used for anything
+static struct MHD_Daemon **daemons;
+
 /////////////
 // Utility //
 /////////////
 
-static FILE * accessLog;
-
 static void logAccess(int statusCode, const char * method, const char * user, const char * url, const char * client) {
 	char t[100];
-	fprintf(accessLog, "%s %s %s %d %s %s\n", timeNow(t), client, user, statusCode, method, url);
-	fflush(accessLog);
+	printf("%s %s %s %d %s %s\n", timeNow(t), client, user, statusCode, method, url);
+	fflush(stdout);
 }
 
 static void initializeLogs() {
 	// Error log first
-	int errorLog = open(config.errorLog, O_CREAT | O_APPEND | O_WRONLY, 416);
-	if (errorLog == -1 || dup2(errorLog, STDERR_FILENO) == -1) {
-		stdLogError(errno, "Could not open error log file %s", config.errorLog);
-		exit(1);
-	}
-	close(errorLog);
-
-	int accessLogFd = open(config.accessLog, O_CREAT | O_APPEND | O_WRONLY, 416);
-	if (accessLogFd == -1) {
-		stdLogError(errno, "Could not open access log file %s", config.accessLog);
-		exit(1);
+	if (config.errorLog) {
+		int errorLog = open(config.errorLog, O_CREAT | O_APPEND | O_WRONLY, 420);
+		if (errorLog == -1 || dup2(errorLog, STDERR_FILENO) == -1) {
+			stdLogError(errno, "Could not open error log file %s", config.errorLog);
+			exit(1);
+		}
+		close(errorLog);
 	}
 
-	accessLog = fdopen(accessLogFd, "w");
-}
-
-static char * copyString(const char * string) {
-	if (!string) {
-		return NULL;
+	if (config.accessLog) {
+		int accessLogFd = open(config.accessLog, O_CREAT | O_APPEND | O_WRONLY, 420);
+		if (accessLogFd == -1 || dup2(accessLogFd, STDOUT_FILENO) == -1) {
+			stdLogError(errno, "Could not open access log file %s", config.accessLog);
+			exit(1);
+		}
 	}
-	size_t stringSize = strlen(string) + 1;
-	char * newString = mallocSafe(stringSize);
-	memcpy(newString, string, stringSize);
-	return newString;
+
 }
 
 static void getRequestIP(char * buffer, size_t bufferSize, struct MHD_Connection * request) {
@@ -273,9 +233,6 @@ static void getRequestIP(char * buffer, size_t bufferSize, struct MHD_Connection
 /////////
 // SSL //
 /////////
-
-static int sslCertificateCount;
-static struct SSLCertificate * sslCertificates = NULL;
 
 int sslCertificateCompareHost(const void * a, const void * b) {
 	struct SSLCertificate * lhs = (struct SSLCertificate *) a;
@@ -465,7 +422,6 @@ static void addHeaderSafe(struct MHD_Response * response, const char * headerKey
 static void addStaticHeaders(struct MHD_Response * response) {
 	// TODO corect this header
 	addHeaderSafe(response, "DAV", "1");
-	// addHeaderSafe(response, "MS-Author-Via", "DAV");
 	addHeaderSafe(response, "Accept-Ranges", "bytes");
 	addHeaderSafe(response, "Keep-Alive", "timeout=30");
 	addHeaderSafe(response, "Connection", "Keep-Alive");
@@ -579,15 +535,15 @@ static int createRapResponse(struct MHD_Connection *request, struct Message * me
 	}
 
 	case RAP_ACCESS_DENIED:
-		*response = createFileResponse(request, "/usr/share/webdav/HTTP_FORBIDDEN.html", "text/html");
+		*response = createFileResponse(request, FORBIDDEN_PAGE, "text/html");
 		return MHD_HTTP_FORBIDDEN;
 
 	case RAP_NOT_FOUND:
-		*response = createFileResponse(request, "/usr/share/webdav/HTTP_NOT_FOUND.html", "text/html");
+		*response = createFileResponse(request, NOT_FOUND_PAGE, "text/html");
 		return MHD_HTTP_NOT_FOUND;
 
 	case RAP_BAD_CLIENT_REQUEST:
-		*response = createFileResponse(request, "/usr/share/webdav/HTTP_BAD_REQUEST.html", "text/html");
+		*response = createFileResponse(request, BAD_REQUEST_PAGE, "text/html");
 		return MHD_HTTP_BAD_REQUEST;
 
 	default:
@@ -608,10 +564,6 @@ static int createRapResponse(struct MHD_Connection *request, struct Message * me
 ////////////////////
 // RAP Processing //
 ////////////////////
-
-static sem_t rapDBLock;
-static int rapDBSize;
-static struct RapGroup * rapDB;
 
 static int forkRapProcess(const char * path, int * newSockFd) {
 	// Create unix domain socket for
@@ -863,6 +815,28 @@ static void * rapTimeoutWorker(void * ignored) {
 	return NULL;
 }
 
+static void initializeRapDatabase() {
+	struct sigaction act;
+	memset(&act, 0, sizeof(act));
+	act.sa_sigaction = &cleanupAfterRap;
+	act.sa_flags = SA_SIGINFO;
+	if (sigaction(SIGCHLD, &act, NULL) < 0) {
+		stdLogError(errno, "Could not set handler method for finished child threads");
+		exit(255);
+	}
+
+	sem_init(&rapDBLock, 0, 1);
+
+	rapDBSize = 0;
+	rapDB = NULL;
+
+	pthread_t newThread;
+	if (pthread_create(&newThread, NULL, &rapTimeoutWorker, NULL)) {
+		stdLogError(errno, "Could not create worker thread for rap db");
+		exit(255);
+	}
+}
+
 ////////////////////////
 // End RAP Processing //
 ////////////////////////
@@ -889,7 +863,7 @@ static int completeUpload(struct MHD_Connection *request, struct RestrictedAcces
 		struct MHD_Response ** response) {
 
 	if (processor->writeDataFd == -1) {
-		*response = createFileResponse(request, "/usr/share/webdav/HTTP_INSUFFICIENT_STORAGE.html", "text/html");
+		*response = createFileResponse(request, INSUFFICIENT_STORAGE_PAGE, "text/html");
 		return MHD_HTTP_INSUFFICIENT_STORAGE;
 	} else {
 		// Closing this pipe signals to the rap that there is no more data
@@ -965,7 +939,7 @@ static int processNewRequest(struct MHD_Connection * request, const char * url, 
 		}
 		message.bufferCount = 3;
 	} else if (!strcmp("OPTIONS", method)) {
-		*response = createFileResponse(request, "/usr/share/webdav/OPTIONS.html", "text/html");
+		*response = createFileResponse(request, OPTIONS_PAGE, "text/html");
 		addHeaderSafe(*response, "Accept", ACCEPT_HEADER);
 		return MHD_HTTP_OK;
 	} else {
@@ -1127,6 +1101,44 @@ static int answerToRequest(void *cls, struct MHD_Connection *request, const char
 	}
 }
 
+static int answerForwardToRequest(void *cls, struct MHD_Connection *request, const char *url, const char *method,
+		const char *version, const char *upload_data, size_t *upload_data_size, void ** s) {
+	if (*s != NULL) {
+		return MHD_YES;
+	}
+	*s = cls;
+
+	struct DaemonConfig * daemon = (struct DaemonConfig *) cls;
+	struct MHD_Response * response = MHD_create_response_from_buffer(0, NULL, MHD_RESPMEM_MUST_COPY);
+	if (!response) {
+		stdLogError(errno, "Unable to create 301 response");
+		return MHD_queue_response(request, MHD_HTTP_INTERNAL_SERVER_ERROR, INTERNAL_SERVER_ERROR_PAGE);
+	}
+
+	const char * host = daemon->forwardToHost ? daemon->forwardToHost : getHeader(request, "Host");
+
+	if (!host) {
+		// TODO fix this
+		host = "localhost";
+	}
+
+	size_t bufferSize = strlen(host) + strlen(url) + 10;
+	char * buffer = mallocSafe(bufferSize);
+	if ((daemon->forwardToIsEncrypted && daemon->forwardToPort == 443)
+			|| (!daemon->forwardToIsEncrypted && daemon->forwardToPort == 80)) {
+		// default ports
+		snprintf(buffer, bufferSize, "%s://%s%s", daemon->forwardToIsEncrypted ? "https" : "http", host, url);
+	} else {
+		snprintf(buffer, bufferSize, "%s://%s:%d%s", daemon->forwardToIsEncrypted ? "https" : "http", host,
+				daemon->forwardToPort, url);
+	}
+
+	addHeaderSafe(response, "Location", buffer);
+	int result = MHD_queue_response(request, MHD_HTTP_MOVED_PERMANENTLY, response);
+	MHD_destroy_response(response);
+	return result;
+}
+
 ///////////////////////////////////////////
 // End Low Level HTTP handling (Signpost //
 ///////////////////////////////////////////
@@ -1154,368 +1166,73 @@ static void initializeStaticResponse(struct MHD_Response ** response, const char
 	}
 }
 
-static void initializeStaticResponses() {
-	initializeStaticResponse(&INTERNAL_SERVER_ERROR_PAGE, "/usr/share/webdav/HTTP_INTERNAL_SERVER_ERROR.html", "text/html");
-	initializeStaticResponse(&UNAUTHORIZED_PAGE, "/usr/share/webdav/HTTP_UNAUTHORIZED.html", "text/html");
-	addHeaderSafe(UNAUTHORIZED_PAGE, "WWW-Authenticate", "Basic realm=\"My Server\"");
-	initializeStaticResponse(&METHOD_NOT_SUPPORTED_PAGE, "/usr/share/webdav/HTTP_METHOD_NOT_SUPPORTED.html", "text/html");
-	addHeaderSafe(METHOD_NOT_SUPPORTED_PAGE, "Allow",
-			"OPTIONS, GET, HEAD, DELETE, PROPFIND, PUT, PROPPATCH, COPY, MOVE, LOCK, UNLOCK");
+static char * createStaticFile(const char * string) {
+	size_t staticSize = strlen(config.staticResponseDir);
+	size_t stringSize = strlen(string);
+	char * result = mallocSafe(staticSize + stringSize + 2);
+	memcpy(result, config.staticResponseDir, staticSize);
+	result[staticSize] = '/';
+	memcpy(result + staticSize + 1, string, stringSize + 1);
+	return result;
 }
 
-static void initializeRapDatabase() {
-	struct sigaction act;
-	memset(&act, 0, sizeof(act));
-	act.sa_sigaction = &cleanupAfterRap;
-	act.sa_flags = SA_SIGINFO;
-	if (sigaction(SIGCHLD, &act, NULL) < 0) {
-		stdLogError(errno, "Could not set handler method for finished child threads");
-		exit(255);
-	}
+static void initializeStaticResponses() {
+	char * string;
+	string = createStaticFile("HTTP_INTERNAL_SERVER_ERROR.html");
+	initializeStaticResponse(&INTERNAL_SERVER_ERROR_PAGE, string, "text/html");
+	free(string);
 
-	sem_init(&rapDBLock, 0, 1);
+	string = createStaticFile("HTTP_UNAUTHORIZED.html");
+	initializeStaticResponse(&UNAUTHORIZED_PAGE, string, "text/html");
+	addHeaderSafe(UNAUTHORIZED_PAGE, "WWW-Authenticate", "Basic realm=\"My Server\"");
+	free(string);
 
-	rapDBSize = 0;
-	rapDB = NULL;
+	string = createStaticFile("HTTP_METHOD_NOT_SUPPORTED.html");
+	initializeStaticResponse(&METHOD_NOT_SUPPORTED_PAGE, string, "text/html");
+	addHeaderSafe(METHOD_NOT_SUPPORTED_PAGE, "Allow", ACCEPT_HEADER);
+	free(string);
 
-	pthread_t newThread;
-	if (pthread_create(&newThread, NULL, &rapTimeoutWorker, NULL)) {
-		stdLogError(errno, "Could not create worker thread for rap db");
-		exit(255);
-	}
+	FORBIDDEN_PAGE = createStaticFile("HTTP_FORBIDDEN.html");
+	NOT_FOUND_PAGE = createStaticFile("HTTP_NOT_FOUND.html");
+	BAD_REQUEST_PAGE = createStaticFile("HTTP_BAD_REQUEST.html");
+	INSUFFICIENT_STORAGE_PAGE = createStaticFile("HTTP_INSUFFICIENT_STORAGE.html");
+	OPTIONS_PAGE = createStaticFile("OPTIONS.html");
 }
 
 ////////////////////////
 // End Initialisation //
 ////////////////////////
 
-///////////////////
-// Configuration //
-///////////////////
-
-#define CONFIG_NAMESPACE "http://couling.me/webdavd"
-
-static int configureServer(xmlTextReaderPtr reader, const char * configFile, struct WebdavdConfiguration * config) {
-	config->restrictedUser = NULL;
-	config->daemonCount = 0;
-	config->daemons = NULL;
-	config->rapMaxSessionLife = 60 * 5;
-	config->rapMaxSessionsPerUser = 10;
-	config->rapBinary = NULL;
-	config->pamServiceName = NULL;
-	config->mimeTypesFile = NULL;
-	config->accessLog = NULL;
-	config->errorLog = NULL;
-	config->sslCertCount = 0;
-	config->sslCerts = NULL;
-
-	int result = stepInto(reader);
-	while (result && xmlTextReaderDepth(reader) == 2) {
-		if (xmlTextReaderNodeType(reader) == XML_READER_TYPE_ELEMENT
-				&& !strcmp(xmlTextReaderConstNamespaceUri(reader), CONFIG_NAMESPACE)) {
-
-			//<listen><port>80</port><host>localhost</host><encryption>disabled</encryption></listen>
-			if (!strcmp(xmlTextReaderConstLocalName(reader), "listen")) {
-				int index = config->daemonCount++;
-				config->daemons = reallocSafe(config->daemons, sizeof(*config->daemons) * config->daemonCount);
-				config->daemons[index].host = NULL;
-				config->daemons[index].sslEnabled = 0;
-				config->daemons[index].port = -1;
-				result = stepInto(reader);
-				while (result && xmlTextReaderDepth(reader) == 3) {
-					if (xmlTextReaderNodeType(reader) == XML_READER_TYPE_ELEMENT
-							&& !strcmp(xmlTextReaderConstNamespaceUri(reader), CONFIG_NAMESPACE)) {
-						if (!strcmp(xmlTextReaderConstLocalName(reader), "port")) {
-							if (config->daemons[index].port != -1) {
-								stdLogError(0, "port specified for listen more than once int %s", configFile);
-								exit(1);
-							}
-							const char * portString;
-							result = stepOverText(reader, &portString);
-							if (portString != NULL) {
-								char * endP;
-								long int parsedPort = strtol(portString, &endP, 10);
-								if (!*endP && parsedPort >= 0 && parsedPort <= 0xFFFF) {
-									config->daemons[index].port = parsedPort;
-								} else {
-									stdLogError(0, "%s is not a valid port in %s", portString, configFile);
-									exit(1);
-								}
-							}
-						} else if (!strcmp(xmlTextReaderConstLocalName(reader), "host")) {
-							if (config->daemons[index].host != NULL) {
-								stdLogError(0, "host specified for listen more than once int %s", configFile);
-								exit(1);
-							}
-							const char * hostString;
-							result = stepOverText(reader, &hostString);
-							config->daemons[index].host = copyString(hostString);
-						} else if (!strcmp(xmlTextReaderConstLocalName(reader), "encryption")) {
-							const char * encryptionString;
-							result = stepOverText(reader, &encryptionString);
-							if (encryptionString) {
-								if (!strcmp(encryptionString, "none")) {
-									config->daemons[index].sslEnabled = 0;
-								} else if (!strcmp(encryptionString, "ssl")) {
-									config->daemons[index].sslEnabled = 1;
-								} else {
-									stdLogError(0, "invalid encryption method %s in %s", encryptionString, configFile);
-									exit(1);
-								}
-							}
-						}
-					} else {
-						result = stepOver(reader);
-					}
-				}
-				if (config->daemons[index].port == -1) {
-					stdLogError(0, "port not specified for listen in %s", configFile);
-					exit(1);
-				}
-			}
-
-			//<session-timeout>5:00</session-timeout>
-			else if (!strcmp(xmlTextReaderConstLocalName(reader), "session-timeout")) {
-				const char * sessionTimeoutString;
-				result = stepOverText(reader, &sessionTimeoutString);
-				if (sessionTimeoutString) {
-					long int hour = 0, minute = 0, second;
-					char * endPtr;
-					second = strtol(sessionTimeoutString, &endPtr, 10);
-					if (*endPtr) {
-						if (*endPtr != ':' || endPtr == sessionTimeoutString) {
-							stdLogError(0, "Invalid session timeout length %s in %s", sessionTimeoutString, configFile);
-							exit(1);
-						}
-						minute = second;
-
-						char * endPtr2;
-						endPtr++;
-						second = strtol(endPtr, &endPtr2, 10);
-						if (*endPtr2) {
-							if (*endPtr2 != ':' || endPtr2 == endPtr) {
-								stdLogError(0, "Invalid session timeout length %s in %s", sessionTimeoutString,
-										configFile);
-								exit(1);
-							}
-							hour = minute;
-							minute = second;
-							endPtr2++;
-							second = strtol(endPtr2, &endPtr, 10);
-							if (*endPtr != '\0') {
-								stdLogError(0, "Invalid session timeout length %s in %s", sessionTimeoutString,
-										configFile);
-								exit(1);
-							}
-						}
-					}
-					config->rapMaxSessionLife = (((hour * 60) + minute) * 60) + second;
-				}
-			}
-
-			//<max-user-sessions>10</max-user-sessions>
-			else if (!strcmp(xmlTextReaderConstLocalName(reader), "max-user-sessions")) {
-				const char * sessionCountString;
-				result = stepOverText(reader, &sessionCountString);
-				if (sessionCountString) {
-					char * endPtr;
-					long int maxUserSessions = strtol(sessionCountString, &endPtr, 10);
-					if (*endPtr || maxUserSessions < 0 || maxUserSessions > 0xFFFFFFF) {
-						stdLogError(0, "Invalid max-user-sessions %s in %s", maxUserSessions, configFile);
-						exit(1);
-					}
-					config->rapMaxSessionsPerUser = maxUserSessions;
-				}
-			}
-
-			//<restricted>nobody</restricted>
-			else if (!strcmp(xmlTextReaderConstLocalName(reader), "restricted")) {
-				if (config->restrictedUser) {
-					stdLogError(0, "restricted-user specified more than once in %s", configFile);
-					exit(1);
-				}
-				const char * restrictedUser;
-				result = stepOverText(reader, &restrictedUser);
-				config->restrictedUser = copyString(restrictedUser);
-			}
-
-			//<mime-file>/etc/mime.types</mime-file>
-			else if (!strcmp(xmlTextReaderConstLocalName(reader), "mime-file")) {
-				if (config->mimeTypesFile) {
-					stdLogError(0, "restricted-user specified more than once in %s", configFile);
-					exit(1);
-				}
-				const char * mimeTypesFile;
-				result = stepOverText(reader, &mimeTypesFile);
-				config->mimeTypesFile = copyString(mimeTypesFile);
-			}
-
-			//<rap-binary>/usr/sbin/rap</rap-binary>
-			else if (!strcmp(xmlTextReaderConstLocalName(reader), "rap-binary")) {
-				if (config->rapBinary) {
-					stdLogError(0, "restricted-user specified more than once in %s", configFile);
-					exit(1);
-				}
-				const char * rapBinary;
-				result = stepOverText(reader, &rapBinary);
-				config->rapBinary = copyString(rapBinary);
-			}
-
-			//<static-error-dir>/usr/share/webdavd</static-error-dir>
-			// TODO <static-error-dir>/usr/share/webdavd</static-error-dir>
-
-			//<pam-service>webdavd</pam-service>
-			else if (!strcmp(xmlTextReaderConstLocalName(reader), "pam-service")) {
-				if (config->pamServiceName) {
-					stdLogError(0, "restricted-user specified more than once in %s", configFile);
-					exit(1);
-				}
-				const char * pamServiceName;
-				result = stepOverText(reader, &pamServiceName);
-				config->pamServiceName = copyString(pamServiceName);
-			}
-
-			//<access-log>/var/log/access.log</access-log>
-			else if (!strcmp(xmlTextReaderConstLocalName(reader), "access-log")) {
-				if (config->accessLog) {
-					stdLogError(0, "restricted-user specified more than once in %s", configFile);
-					exit(1);
-				}
-				const char * accessLog;
-				result = stepOverText(reader, &accessLog);
-				config->accessLog = copyString(accessLog);
-			}
-
-			//<error-log>/var/log/error.log</error-log>
-			else if (!strcmp(xmlTextReaderConstLocalName(reader), "error-log")) {
-				if (config->errorLog) {
-					stdLogError(0, "restricted-user specified more than once in %s", configFile);
-					exit(1);
-				}
-				const char * errorLog;
-				result = stepOverText(reader, &errorLog);
-				config->errorLog = copyString(errorLog);
-			}
-
-			//<ssl-cert>...</ssl-cert>
-			else if (!strcmp(xmlTextReaderConstLocalName(reader), "ssl-cert")) {
-				int index = config->sslCertCount++;
-				config->sslCerts = reallocSafe(config->sslCerts, sizeof(*config->sslCerts) * config->sslCertCount);
-				config->sslCerts[index].certificateFile = NULL;
-				config->sslCerts[index].chainFileCount = 0;
-				config->sslCerts[index].chainFiles = NULL;
-				config->sslCerts[index].keyFile = NULL;
-				result = stepInto(reader);
-				while (result && xmlTextReaderDepth(reader) == 3) {
-					if (xmlTextReaderNodeType(reader) == XML_READER_TYPE_ELEMENT
-							&& !strcmp(xmlTextReaderConstNamespaceUri(reader), CONFIG_NAMESPACE)) {
-						if (!strcmp(xmlTextReaderConstLocalName(reader), "certificate")) {
-							if (config->sslCerts[index].certificateFile) {
-								stdLogError(0, "more than one certificate specified in ssl-cert %s", configFile);
-								exit(1);
-							}
-							const char * certificate;
-							result = stepOverText(reader, &certificate);
-							config->sslCerts[index].certificateFile = copyString(certificate);
-						} else if (!strcmp(xmlTextReaderConstLocalName(reader), "key")) {
-							if (config->sslCerts[index].keyFile) {
-								stdLogError(0, "more than one key specified in ssl-cert %s", configFile);
-								exit(1);
-							}
-							const char * keyFile;
-							result = stepOverText(reader, &keyFile);
-							config->sslCerts[index].keyFile = copyString(keyFile);
-						} else if (!strcmp(xmlTextReaderConstLocalName(reader), "chain")) {
-							const char * chainFile;
-							result = stepOverText(reader, &chainFile);
-							if (chainFile) {
-								int chainFileIndex = config->sslCerts[index].chainFileCount++;
-								config->sslCerts[index].chainFiles = reallocSafe(config->sslCerts[index].chainFiles,
-										config->sslCerts[index].chainFileCount
-												* sizeof(*config->sslCerts[index].chainFiles));
-								config->sslCerts[index].chainFiles[chainFileIndex] = copyString(chainFile);
-							}
-						} else {
-							result = stepOver(reader);
-						}
-					} else {
-						result = stepOver(reader);
-					}
-				}
-				if (!config->sslCerts[index].certificateFile) {
-					stdLogError(0, "certificate not specified in ssl-cert in %s", configFile);
-				}
-				if (!config->sslCerts[index].keyFile) {
-					stdLogError(0, "key not specified in ssl-cert in %s", configFile);
-				}
-			} else {
-				result = stepOver(reader);
-			}
-
-		} else {
-			result = stepOver(reader);
-		}
-	}
-
-	if (!config->rapBinary) {
-		config->rapBinary = "/usr/sbin/rap";
-	}
-	if (!config->mimeTypesFile) {
-		config->mimeTypesFile = "/etc/mime.types";
-	}
-	if (!config->accessLog) {
-		config->accessLog = "/var/log/webdavd-access.log";
-	}
-	if (!config->errorLog) {
-		config->errorLog = "/var/log/webdavd-error.log";
-	}
-	if (!config->pamServiceName) {
-		config->pamServiceName = "webdav";
-	}
-
-	return result;
-}
-
-void configure(const char * configFile) {
-	xmlTextReaderPtr reader = xmlReaderForFile(configFile, NULL, XML_PARSE_NOENT);
-	suppressReaderErrors(reader);
-	if (!reader || !stepInto(reader)) {
-		stdLogError(0, "could not create xml reader for %s", configFile);
-		exit(1);
-	}
-	if (!elementMatches(reader, CONFIG_NAMESPACE, "server-config")) {
-		stdLogError(0, "root node is not server-config in namespace %s %s", CONFIG_NAMESPACE, configFile);
-		exit(1);
-	}
-
-	int result = stepInto(reader);
-
-	while (result && xmlTextReaderDepth(reader) == 1) {
-		if (elementMatches(reader, CONFIG_NAMESPACE, "server")) {
-			result = configureServer(reader, configFile, &config);
-			break;
-		} else {
-			stdLog("Warning: skipping %s:%s in %s", xmlTextReaderConstNamespaceUri(reader),
-					xmlTextReaderConstLocalName(reader), configFile);
-			result = stepOver(reader);
-		}
-	}
-
-	xmlFreeTextReader(reader);
-}
-
-///////////////////////
-// End Configuration //
-///////////////////////
-
 //////////
 // Main //
 //////////
 
-// All Daemons
-// Not sure why we keep these, they're not used for anything
-static struct MHD_Daemon **daemons;
+static int getBindAddress(struct sockaddr_in6 * address, int port, const char * bindAddress) {
+	memset(address, 0, sizeof(*bindAddress));
+	address->sin6_family = AF_INET6;
+	address->sin6_port = htons(port);
+	if (bindAddress) {
+		struct hostent * host = gethostbyname(bindAddress);
+		if (!host) {
+			stdLogError(errno, "Could not determine ip for hostname %s", bindAddress);
+			return 0;
+		}
+		if (host->h_addrtype == AF_INET) {
+			unsigned char addrBytes[16] = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF };
+			memcpy(&addrBytes[12], host->h_addr_list[0], 4);
+			memcpy(&address->sin6_addr, addrBytes, 16);
+		} else if (host->h_addrtype == AF_INET6) {
+			memcpy(&address->sin6_addr, host->h_addr_list[0], 16);
+		} else {
+			stdLogError(0, "Could not determin address type for %s", bindAddress);
+		}
+	} else {
+		address->sin6_addr = in6addr_any;
+	}
+	return 1;
+}
 
+#define flaggs MHD_USE_SELECT_INTERNALLY | MHD_USE_DUAL_STACK | MHD_USE_PEDANTIC_CHECKS
 int main(int argCount, char ** args) {
 	if (argCount > 1) {
 		for (int i = 1; i < argCount; i++) {
@@ -1531,22 +1248,42 @@ int main(int argCount, char ** args) {
 	initializeSSL();
 
 	// Start up the daemons
+
 	daemons = mallocSafe(sizeof(*daemons) * config.daemonCount);
 	for (int i = 0; i < config.daemonCount; i++) {
-		// TODO bind to specific ip
-		if (config.daemons[i].sslEnabled) {
-			daemons[i] = MHD_start_daemon(
-					MHD_USE_SELECT_INTERNALLY | MHD_USE_DUAL_STACK | MHD_USE_SSL | MHD_USE_PEDANTIC_CHECKS,
-					config.daemons[i].port, NULL, NULL, &answerToRequest, NULL, MHD_OPTION_HTTPS_CERT_CALLBACK,
-					&sslSNICallback, MHD_OPTION_END);
-		} else {
-			daemons[i] = MHD_start_daemon(MHD_USE_SELECT_INTERNALLY | MHD_USE_DUAL_STACK | MHD_USE_PEDANTIC_CHECKS,
-					config.daemons[i].port,
-					NULL, NULL, &answerToRequest, NULL, MHD_OPTION_END);
-		}
-		if (!daemons[i]) {
-			stdLogError(errno, "Unable to initialise daemon on port %d", config.daemons[i].port);
-			exit(255);
+		struct sockaddr_in6 address;
+		if (getBindAddress(&address, config.daemons[i].port, config.daemons[i].host)) {
+			MHD_AccessHandlerCallback callback;
+			if (config.daemons[i].forwardToPort) {
+				callback = &answerForwardToRequest;
+			} else {
+				callback = &answerToRequest;
+			}
+
+			if (config.daemons[i].sslEnabled) {
+				// https
+				if (sslCertificateCount == 0) {
+					stdLogError(0, "No certificates available for ssl %s:%d",
+							config.daemons[i].host ? config.daemons[i].host : "", config.daemons[i].port);
+					continue;
+				}
+				daemons[i] = MHD_start_daemon(flaggs | MHD_USE_SSL, 0 /* ignored */, NULL, NULL, //
+						callback, &config.daemons[i],                    //
+						MHD_OPTION_SOCK_ADDR, &address,                  // Specifies both host and port
+						MHD_OPTION_PER_IP_CONNECTION_LIMIT, 10,          // max connections per ip
+						MHD_OPTION_HTTPS_CERT_CALLBACK, &sslSNICallback, // enable ssl
+						MHD_OPTION_END);
+			} else {
+				// http
+				daemons[i] = MHD_start_daemon(flaggs, 0 /* ignored */, NULL, NULL, //
+						callback, &config.daemons[i],                    //
+						MHD_OPTION_SOCK_ADDR, &address,                  // Specifies both host and port
+						MHD_OPTION_PER_IP_CONNECTION_LIMIT, 10,          // max connections per ip
+						MHD_OPTION_END);
+			}
+			if (!daemons[i]) {
+				stdLogError(errno, "Unable to initialise daemon on port %d", config.daemons[i].port);
+			}
 		}
 	}
 

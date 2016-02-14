@@ -47,6 +47,10 @@ enum RapConstant {
 
 void * mallocSafe(size_t size);
 void * reallocSafe(void * mem, size_t newSize);
+char * copyString(const char * string);
+
+char * timeNow(char * t);
+size_t getWebDate(time_t rawtime, char * buf, size_t bufSize);
 
 void stdLog(const char * str, ...);
 void stdLogError(int errorNumber, const char * str, ...);
@@ -61,13 +65,13 @@ struct Message {
 	struct iovec buffers[MAX_BUFFER_PARTS];
 };
 
-char * timeNow(char * t);
 ssize_t sendMessage(int sock, struct Message * message);
 ssize_t recvMessage(int sock, struct Message * message, char * incomingBuffer, size_t incomingBufferSize);
 char * iovecToString(struct iovec * iovec);
-size_t getWebDate(time_t rawtime, char * buf, size_t bufSize);
+
 int lockToUser(const char * user);
 
+// XML
 void suppressReaderErrors(xmlTextReaderPtr reader);
 int stepInto(xmlTextReaderPtr reader);
 int stepOver(xmlTextReaderPtr reader);

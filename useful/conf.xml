@@ -3,25 +3,20 @@
 	<server>
 		<listen>
 			<port>80</port>
-			<host>localhost</host>
 			<encryption>none</encryption>
+			<forward-to><port>443</port></forward-to>
 		</listen>
 		<listen>
 			<port>443</port>
 			<encryption>ssl</encryption>
 		</listen>
 		<session-timeout>1:00</session-timeout>
-		<max-user-sessions>10</max-user-sessions>
-		<restricted>nobody</restricted>
-		<mime-file>/etc/mime.types</mime-file>
-		<rap-binary>/home/philip/workspace/WebDavServer/build/rap</rap-binary>
-		<pam-service>webdavd</pam-service>
-		<static-error-dir>/usr/share/webdavd</static-error-dir>
-		<error-log>../webdav.log</error-log>
-		<access-log>../webdav.log</access-log>
+		<rap-binary>build/rap</rap-binary>
+		<static-response-dir>package-with/share</static-response-dir>
 		<ssl-cert>
 			<certificate>/etc/ssl/certs/local/server.crt</certificate>
 			<key>/etc/ssl/private/server.key</key>
 		</ssl-cert>
 	</server>
 </server-config>
+

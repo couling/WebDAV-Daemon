@@ -373,3 +373,14 @@ char * loadFileToBuffer(const char * file, size_t * size) {
 	close(fd);
 	return buffer;
 }
+
+char * copyString(const char * string) {
+	if (!string) {
+		return NULL;
+	}
+	size_t stringSize = strlen(string) + 1;
+	char * newString = mallocSafe(stringSize);
+	memcpy(newString, string, stringSize);
+	return newString;
+}
+
