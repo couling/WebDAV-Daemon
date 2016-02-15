@@ -226,6 +226,20 @@ static void getRequestIP(char * buffer, size_t bufferSize, struct MHD_Connection
 	}
 }
 
+static int filterGetHeader(struct Header * header, enum MHD_ValueKind kind, const char *key, const char *value) {
+	if (!strcmp(key, header->key)) {
+		header->value = value;
+		return MHD_NO;
+	}
+	return MHD_YES;
+}
+
+static const char * getHeader(struct MHD_Connection *request, const char * headerKey) {
+	struct Header header = { .key = headerKey, .value = NULL };
+	MHD_get_connection_values(request, MHD_HEADER_KIND, (MHD_KeyValueIterator) &filterGetHeader, &header);
+	return header.value;
+}
+
 /////////////////
 // End Utility //
 /////////////////
@@ -475,8 +489,8 @@ static struct MHD_Response * createFdStreamResponse(int fd, const char * mimeTyp
 	return response;
 }
 
-static struct MHD_Response * createFdFileResponse(size_t size, int fd, const char * mimeType, time_t date) {
-	struct MHD_Response * response = MHD_create_response_from_fd(size, fd);
+static struct MHD_Response * createFdFileResponse(off_t offset, size_t size, int fd, const char * mimeType, time_t date) {
+	struct MHD_Response * response = MHD_create_response_from_fd_at_offset(size, fd, offset);
 	if (!response) {
 		close(fd);
 		return NULL;
@@ -501,7 +515,57 @@ static struct MHD_Response * createFileResponse(struct MHD_Connection *request, 
 
 	struct stat statBuffer;
 	fstat(fd, &statBuffer);
-	return createFdFileResponse(statBuffer.st_size, fd, mimeType, statBuffer.st_mtime);
+	return createFdFileResponse(0, statBuffer.st_size, fd, mimeType, statBuffer.st_mtime);
+}
+
+static int processRangeHeader(off_t * offset, size_t * fileSize, const char *range) {
+	stdLog("Processing range header %s", range);
+	int result = strncmp(range, "bytes=", sizeof("bytes=") - 1);
+	if (result) {
+		return 0;
+	}
+
+	long long from, to;
+
+	range += sizeof("bytes=") - 1;
+	if (*range == '\0') {
+		return 0;
+	}
+
+	if (*range == '-') {
+		from = 0;
+	} else {
+		char * endPtr;
+		from = strtoll(range, &endPtr, 10);
+		if (endPtr == range) {
+			return 0;
+		} else {
+			range = endPtr;
+		}
+	}
+
+	if (*range == '\0') {
+		return 0;
+	}
+
+	range++;
+
+	if (*range == '\0') {
+		to = *fileSize;
+	} else {
+		char * endPtr;
+		to = strtoll(range, &endPtr, 10);
+		if (endPtr == range) {
+			return 0;
+		}
+	}
+
+	stdLog("Range header result %lld - %lld", from, to);
+
+	*offset = from;
+	*fileSize = to - from;
+
+	return 1;
 }
 
 static int createRapResponse(struct MHD_Connection *request, struct Message * message, struct MHD_Response ** response) {
@@ -512,23 +576,40 @@ static int createRapResponse(struct MHD_Connection *request, struct Message * me
 		// Get Mime type and date
 		const char * mimeType = iovecToString(&message->buffers[RAP_FILE_INDEX]);
 		time_t date = *((time_t *) message->buffers[RAP_DATE_INDEX].iov_base);
-		const char * location =
-				message->bufferCount > RAP_LOCATION_INDEX ? iovecToString(&message->buffers[RAP_LOCATION_INDEX]) : NULL;
 
 		struct stat stat;
 		fstat(message->fd, &stat);
-		if (mimeType[0] == '\0') {
-			mimeType = NULL;
-		}
 
+		int statusCode;
 		if ((stat.st_mode & S_IFMT) == S_IFREG) {
-			*response = createFdFileResponse(stat.st_size, message->fd, mimeType, date);
+			if (message->mID == RAP_SUCCESS) {
+				const char * rangeHeader = getHeader(request, "range");
+				off_t offset = 0;
+				size_t fileSize = stat.st_size;
+				if (rangeHeader && processRangeHeader(&offset, &fileSize, rangeHeader)) {
+					statusCode = MHD_HTTP_PARTIAL_CONTENT;
+					*response = createFdFileResponse(0, stat.st_size, message->fd, mimeType, date);
+				} else {
+					statusCode = MHD_HTTP_OK;
+					*response = createFdFileResponse(0, stat.st_size, message->fd, mimeType, date);
+				}
+				char contentRangeHeader[200];
+
+				snprintf(contentRangeHeader, sizeof(contentRangeHeader), "bytes %lld-%lld/%lld", (long long) offset,
+						(long long) (fileSize + offset), (long long) stat.st_size);
+
+				addHeaderSafe(*response, "Content-Range", contentRangeHeader);
+			} else {
+				statusCode = 207;
+				*response = createFdFileResponse(0, stat.st_size, message->fd, mimeType, date);
+			}
 		} else {
+			statusCode = message->mID == RAP_SUCCESS ? MHD_HTTP_OK : 207;
 			*response = createFdStreamResponse(message->fd, mimeType, date);
 		}
 
-		if (location) {
-			addHeaderSafe(*response, "Location", location);
+		if (message->bufferCount > RAP_LOCATION_INDEX) {
+			addHeaderSafe(*response, "Location", iovecToString(&message->buffers[RAP_LOCATION_INDEX]));
 		}
 
 		return (message->mID == RAP_SUCCESS ? MHD_HTTP_OK : 207);
@@ -844,20 +925,6 @@ static void initializeRapDatabase() {
 ///////////////////////////////////////
 // Low Level HTTP handling (Signpost //
 ///////////////////////////////////////
-
-static int filterGetHeader(struct Header * header, enum MHD_ValueKind kind, const char *key, const char *value) {
-	if (!strcmp(key, header->key)) {
-		header->value = value;
-		return MHD_NO;
-	}
-	return MHD_YES;
-}
-
-static const char * getHeader(struct MHD_Connection *request, const char * headerKey) {
-	struct Header header = { .key = headerKey, .value = NULL };
-	MHD_get_connection_values(request, MHD_HEADER_KIND, (MHD_KeyValueIterator) &filterGetHeader, &header);
-	return header.value;
-}
 
 static int completeUpload(struct MHD_Connection *request, struct RestrictedAccessProcessor * processor,
 		struct MHD_Response ** response) {
