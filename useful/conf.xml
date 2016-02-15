@@ -17,6 +17,8 @@
 			<certificate>/etc/ssl/certs/local/server.crt</certificate>
 			<key>/etc/ssl/private/server.key</key>
 		</ssl-cert>
+		<access-log>../access.log</access-log>
+		<error-log>../error.log</error-log>
 	</server>
 </server-config>
 

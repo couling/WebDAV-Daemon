@@ -68,7 +68,7 @@ struct SSLCertificate {
 // End Structures //
 ////////////////////
 
-#define ACCEPT_HEADER "OPTIONS, GET, HEAD, DELETE, PROPFIND, PUT, PROPPATCH, COPY, MOVE, LOCK, UNLOCK"
+#define ACCEPT_HEADER "OPTIONS, GET, HEAD, DELETE, PROPFIND, PUT, PROPPATCH, COPY, MOVE" //, LOCK, UNLOCK"
 
 static struct MHD_Response * INTERNAL_SERVER_ERROR_PAGE;
 static struct MHD_Response * UNAUTHORIZED_PAGE;
@@ -519,7 +519,6 @@ static struct MHD_Response * createFileResponse(struct MHD_Connection *request, 
 }
 
 static int processRangeHeader(off_t * offset, size_t * fileSize, const char *range) {
-	stdLog("Processing range header %s", range);
 	int result = strncmp(range, "bytes=", sizeof("bytes=") - 1);
 	if (result) {
 		return 0;
@@ -560,8 +559,6 @@ static int processRangeHeader(off_t * offset, size_t * fileSize, const char *ran
 		}
 	}
 
-	stdLog("Range header result %lld - %lld", from, to);
-
 	*offset = from;
 	*fileSize = to - from;
 
@@ -583,7 +580,7 @@ static int createRapResponse(struct MHD_Connection *request, struct Message * me
 		int statusCode;
 		if ((stat.st_mode & S_IFMT) == S_IFREG) {
 			if (message->mID == RAP_SUCCESS) {
-				const char * rangeHeader = getHeader(request, "range");
+				const char * rangeHeader = getHeader(request, "Range");
 				off_t offset = 0;
 				size_t fileSize = stat.st_size;
 				if (rangeHeader && processRangeHeader(&offset, &fileSize, rangeHeader)) {
@@ -612,7 +609,7 @@ static int createRapResponse(struct MHD_Connection *request, struct Message * me
 			addHeaderSafe(*response, "Location", iovecToString(&message->buffers[RAP_LOCATION_INDEX]));
 		}
 
-		return (message->mID == RAP_SUCCESS ? MHD_HTTP_OK : 207);
+		return statusCode;
 	}
 
 	case RAP_ACCESS_DENIED:

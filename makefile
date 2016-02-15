@@ -1,4 +1,4 @@
-GCC_COMPILE_PART=gcc -std=gnu99 -pthread -Werror -g -o $@ -MMD $(filter %.c,$^) $(filter %.o,$^)
+GCC_COMPILE_PART=gcc -std=gnu99 -pthread -g -o $@ -MMD $(filter %.c,$^) $(filter %.o,$^)
 
 all: build/webdavd build/rap
 
