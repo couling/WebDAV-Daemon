@@ -235,7 +235,8 @@ int lockToUser(const char * user) {
 	return 1;
 }
 
-static void xmlTextNOOPErrorFunction (void * arg, const char * msg, xmlParserSeverities severity, xmlTextReaderLocatorPtr locator) {
+static void xmlTextNOOPErrorFunction(void * arg, const char * msg, xmlParserSeverities severity,
+		xmlTextReaderLocatorPtr locator) {
 }
 
 void suppressReaderErrors(xmlTextReaderPtr reader) {
@@ -287,6 +288,7 @@ int stepOut(xmlTextReaderPtr reader) {
 int stepOverText(xmlTextReaderPtr reader, const char ** text) {
 	int depth = xmlTextReaderDepth(reader);
 	int result = stepInto(reader);
+	*text = NULL;
 	if (result && xmlTextReaderDepth(reader) > depth) {
 		if (xmlTextReaderNodeType(reader) == XML_READER_TYPE_TEXT) {
 			*text = xmlTextReaderValue(reader);
@@ -363,8 +365,7 @@ char * loadFileToBuffer(const char * file, size_t * size) {
 				free(buffer);
 				close(fd);
 				return NULL;
-			}
-			else {
+			} else {
 				totalBytesRead += bytesRead;
 			}
 		}

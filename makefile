@@ -1,9 +1,7 @@
-GCC_COMPILE_PART=gcc -std=gnu99 -pthread -g -o $@ -MMD $(filter %.c,$^) $(filter %.o,$^)
+CFLAGS=-O3 -s
+GCC_COMPILE_PART=gcc ${CFLAGS} -std=gnu99 -pthread -o $@ -MMD $(filter %.c,$^) $(filter %.o,$^)
 
 all: build/webdavd build/rap
-
-#-O3
-#-g
 
 build/webdavd: build/webdavd.o build/shared.o build/configuration.o | build
 	${GCC_COMPILE_PART} -lmicrohttpd -lxml2 -lgnutls

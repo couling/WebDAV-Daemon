@@ -315,20 +315,23 @@ int loadSSLCertificateFile(const char * fileName, gnutls_x509_crt_t * x509Certif
 }
 
 int loadSSLKeyFile(const char * fileName, gnutls_privkey_t * key) {
+	size_t fileSize;
 	gnutls_datum_t keyData;
-	int ret;
-	if ((ret = gnutls_load_file(fileName, &keyData)) < 0) {
-		return ret;
+	keyData.data = loadFileToBuffer(fileName, &fileSize);
+	if (!keyData.data) {
+		return -1;
 	}
 
-	ret = gnutls_privkey_init(key);
+	keyData.size = fileSize;
+
+	int ret = gnutls_privkey_init(key);
 	if (ret < 0) {
-		gnutls_free(keyData.data);
+		free(keyData.data);
 		return ret;
 	}
 
 	ret = gnutls_privkey_import_x509_raw(*key, &keyData, GNUTLS_X509_FMT_PEM, NULL, 0);
-	gnutls_free(keyData.data);
+	free(keyData.data);
 	if (ret < 0) {
 		gnutls_privkey_deinit(*key);
 	}
@@ -337,6 +340,7 @@ int loadSSLKeyFile(const char * fileName, gnutls_privkey_t * key) {
 }
 
 int loadSSLCertificate(struct SSLConfig * sslConfig) {
+	// Now load the files in earnest
 	struct SSLCertificate newCertificate;
 	gnutls_x509_crt_t x509Certificate;
 	int ret;

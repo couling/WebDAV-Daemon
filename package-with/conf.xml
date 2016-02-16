@@ -85,7 +85,7 @@
 		<!-- Directory containing static error responses default /usr/share/webdavd. 
 			Again this should only be changed on non-standard sytems or for testing when 
 			the files can not be placed in /usr/share/webdavd -->
-		<static-response-dir>/usr/share/webdavd</static-response-dir>
+		<static-response-dir>/usr/share/webdav</static-response-dir>
 
 		<!-- File location for logs. If not specified or left blank the error log 
 			will print to stdout and the access log to stderr -->
