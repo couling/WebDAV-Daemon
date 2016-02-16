@@ -952,22 +952,21 @@ static void initializeRapDatabase() {
 static int completeUpload(struct MHD_Connection *request, struct RestrictedAccessProcessor * processor,
 		struct MHD_Response ** response) {
 
-	if (processor->writeDataFd == -1) {
+    // Closing this pipe signals to the rap that there is no more data
+    // This MUST happen before the recvMessage a few lines below or the RAP
+    // will NOT send a message and recvMessage will hang.
+	if (processor->writeDataFd != -1) {
 		close(processor->writeDataFd);
 		processor->writeDataFd = -1;
 	}
-	// Closing this pipe signals to the rap that there is no more data
-	// This MUST happen before the recvMessage a few lines below or the RAP
-	// will NOT send a message and recvMessage will hang.
-	close(processor->writeDataFd);
-	processor->writeDataFd = -1;
+	
 	struct Message message;
 	char incomingBuffer[INCOMING_BUFFER_SIZE];
 	int readResult = recvMessage(processor->socketFd, &message, incomingBuffer, INCOMING_BUFFER_SIZE);
 	if (readResult <= 0) {
 		if (readResult == 0) {
 			stdLogError(0, "RAP closed socket unexpectedly while waiting for response");
-		}
+		} // else { stdLogError ... has already been sent by recvMessage ... }
 		return MHD_HTTP_INTERNAL_SERVER_ERROR;
 	}
 

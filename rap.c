@@ -225,6 +225,7 @@ static int parsePropFind(int fd, struct PropertySet * properties) {
 	if (xmlTextReaderNodeType(reader) == XML_READER_TYPE_NONE) {
 		// No body has been sent
 		// so assume the client is asking for everything.
+		readResult = 1;
 		memset(properties, 1, sizeof(*properties));
 		goto CLEANUP;
 	} else {
