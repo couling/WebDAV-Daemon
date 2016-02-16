@@ -1296,7 +1296,7 @@ static int getBindAddress(struct sockaddr_in6 * address, int port, const char * 
 	return 1;
 }
 
-#define flaggs MHD_USE_SELECT_INTERNALLY | MHD_USE_DUAL_STACK | MHD_USE_PEDANTIC_CHECKS
+#define flaggs MHD_USE_THREAD_PER_CONNECTION | MHD_USE_DUAL_STACK | MHD_USE_PEDANTIC_CHECKS
 int main(int argCount, char ** args) {
 	if (argCount > 1) {
 		for (int i = 1; i < argCount; i++) {
