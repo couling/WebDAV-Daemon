@@ -393,7 +393,7 @@ int loadSSLCertificate(struct SSLConfig * sslConfig) {
 
 			stdLog("ssl domain %s --> %s", domainName, sslConfig->certificateFile);
 			int index = sslCertificateCount++;
-			sslCertificates = reallocSafe(sslCertificates, sslCertificateCount);
+			sslCertificates = reallocSafe(sslCertificates, sslCertificateCount * (sizeof(*sslCertificates)));
 			sslCertificates[index] = newCertificate;
 			sslCertificates[index].hostname = copyString(domainName);
 			found = 1;
