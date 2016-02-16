@@ -41,6 +41,8 @@
 #
 control:package-with/dpkg.control
 file:package-with/dpkg.conffiles:DEBIAN/conffiles:644
+file:package-with/dpkg.postinst:DEBIAN/postinst:555
+file:package-with/dpkg.prerm:DEBIAN/prerm:555
 
 file:package-with/pam.conf:etc/pam.d/webdav:644
 file:package-with/conf.xml:etc/webdavd:644

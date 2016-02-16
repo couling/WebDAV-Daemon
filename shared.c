@@ -55,13 +55,14 @@ void stdLogError(int errorNumber, const char * str, ...) {
 	ptr += written;
 	remaining -= written;
 	va_end(ap);
-	written = snprintf(ptr, remaining, "\n");
-	ptr += written;
 	remaining -= written;
 	if (errorNumber) {
-		written = snprintf(ptr, remaining, "%s [%d] Error: %s\n", t, getpid(), strerror(errorNumber));
+		written = snprintf(ptr, remaining, " - %s\n", strerror(errorNumber));
 		ptr += written;
 		//remaining -= written;
+	} else {
+		written = snprintf(ptr, remaining, "\n");
+		ptr += written;
 	}
 	size_t ignored = write(STDERR_FILENO, buffer, ptr - buffer);
 }
@@ -90,6 +91,7 @@ void * reallocSafe(void * mem, size_t newSize) {
 }
 
 ssize_t sendMessage(int sock, struct Message * message) {
+	// TODO timeout
 	//stdLog("sendm %d", sock);
 	ssize_t size;
 	struct msghdr msg;
@@ -137,6 +139,7 @@ ssize_t sendMessage(int sock, struct Message * message) {
 }
 
 ssize_t recvMessage(int sock, struct Message * message, char * incomingBuffer, size_t incomingBufferSize) {
+	// TODO timeout
 	//stdLog("recvm %d", sock);
 
 	struct msghdr msg;

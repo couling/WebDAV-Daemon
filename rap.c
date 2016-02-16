@@ -477,6 +477,9 @@ static size_t propfind(struct Message * requestMessage) {
 	}
 
 	int ret = respond(RAP_CONTINUE, -1);
+	if (ret < 0) {
+		return ret;
+	}
 
 	const char * depthString = iovecToString(&requestMessage->buffers[RAP_DEPTH_INDEX]);
 
@@ -495,7 +498,54 @@ static size_t propfind(struct Message * requestMessage) {
 //////////////////
 
 static size_t writeFile(struct Message * requestMessage) {
-	return respond(RAP_BAD_RAP_REQUEST, -1);
+	if (requestMessage->fd == -1) {
+		stdLogError(0, "write file request sent without incoming data!");
+		return respond(RAP_BAD_RAP_REQUEST, -1);
+	}
+	if (!authenticated || requestMessage->bufferCount != 2) {
+		if (!authenticated) {
+			stdLogError(0, "Not authenticated RAP");
+		} else {
+			stdLogError(0, "Get request did not provide correct buffers: %d buffer(s)", requestMessage->bufferCount);
+		}
+		return respond(RAP_BAD_RAP_REQUEST, -1);
+	}
+	char * host = iovecToString(&requestMessage->buffers[RAP_HOST_INDEX]);
+	char * file = iovecToString(&requestMessage->buffers[RAP_FILE_INDEX]);
+	int fd = open(file, O_WRONLY);
+	if (fd == -1) {
+		int e = errno;
+		switch (e) {
+		case EACCES:
+			stdLogError(e, "PUT access denied %s %s %s", authenticatedUser, host, file);
+			return respond(RAP_ACCESS_DENIED, -1);
+		case ENOENT:
+		default:
+			stdLogError(e, "PUT not found %s %s %s", authenticatedUser, host, file);
+			return respond(RAP_CONFLICT, -1);
+		}
+	}
+	int ret = respond(RAP_CONTINUE, -1);
+	if (ret < 0) {
+		return ret;
+	}
+
+	char buffer[40960];
+	ssize_t bytesRead;
+
+	while ((bytesRead = read(requestMessage->fd, buffer, sizeof(buffer))) > 0) {
+		ssize_t bytesWritten = write(fd, buffer, bytesRead);
+		if (bytesWritten < bytesRead) {
+			stdLogError(errno, "Could wite data to file %s", file);
+			close(fd);
+			close(requestMessage->fd);
+			return respond(RAP_INSUFFICIENT_STORAGE, -1);
+		}
+	}
+
+	close(fd);
+	close(requestMessage->fd);
+	return respond(RAP_SUCCESS, - 1);
 }
 
 static size_t readFile(struct Message * requestMessage) {
@@ -686,9 +736,6 @@ static size_t authenticate(struct Message * message) {
 	}
 }
 
-typedef size_t (*handlerMethod)(struct Message * message);
-static handlerMethod handlerMethods[] = { authenticate, readFile, writeFile, propfind };
-
 int main(int argCount, char * args[]) {
 	size_t ioResult;
 	struct Message message;
@@ -721,7 +768,20 @@ int main(int argCount, char * args[]) {
 			ioResult = respond(RAP_BAD_RAP_REQUEST, -1);
 			continue;
 		}
-		ioResult = handlerMethods[message.mID - RAP_MIN_REQUEST](&message);
+		switch (message.mID) {
+		case RAP_AUTHENTICATE:
+			ioResult = authenticate(&message);
+			break;
+		case RAP_READ_FILE:
+			ioResult = readFile(&message);
+			break;
+		case RAP_WRITE_FILE:
+			ioResult = writeFile(&message);
+			break;
+		case RAP_PROPFIND:
+			ioResult = propfind(&message);
+			break;
+		}
 		if (ioResult < 0) {
 			ioResult = 0;
 		}

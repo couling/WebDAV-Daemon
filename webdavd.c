@@ -2,6 +2,7 @@
 // TODO correct failure codes on collections
 // TODO single root parent with multiple configured server processes
 // TODO protect RAP sessions from DOS attack using a lock per user
+// TODO check into what happens when a connection is closed early.
 
 #include "shared.h"
 #include "configuration.h"
@@ -79,6 +80,8 @@ const char * NOT_FOUND_PAGE;
 const char * BAD_REQUEST_PAGE;
 const char * INSUFFICIENT_STORAGE_PAGE;
 const char * OPTIONS_PAGE;
+const char * CONFLICT_PAGE;
+const char * OK_PAGE;
 
 // Used as a place holder for failed auth requests which failed due to invalid credentials
 static const struct RestrictedAccessProcessor AUTH_FAILED_RAP = { .pid = 0, .socketFd = -1, .user = "<auth failed>",
@@ -286,22 +289,26 @@ int sslSNICallback(gnutls_session_t session, const gnutls_datum_t* req_ca_dn, in
 }
 
 int loadSSLCertificateFile(const char * fileName, gnutls_x509_crt_t * x509Certificate, gnutls_pcert_st * cert) {
+	size_t fileSize;
 	gnutls_datum_t certData;
 
 	memset(cert, 0, sizeof(*cert));
 	memset(x509Certificate, 0, sizeof(*x509Certificate));
 
-	int ret;
-	if ((ret = gnutls_load_file(fileName, &certData)) < 0) {
-		return ret;
+	certData.data = loadFileToBuffer(fileName, &fileSize);
+	if (!certData.data) {
+		return -1;
 	}
+	certData.size = fileSize;
 
+	int ret;
 	if ((ret = gnutls_x509_crt_init(x509Certificate)) < 0) {
+		free(certData.data);
 		return ret;
 	}
 
 	ret = gnutls_x509_crt_import(*x509Certificate, &certData, GNUTLS_X509_FMT_PEM);
-	gnutls_free(certData.data);
+	free(certData.data);
 	if (ret < 0) {
 		gnutls_x509_crt_deinit(*x509Certificate);
 		return ret;
@@ -350,7 +357,7 @@ int loadSSLCertificate(struct SSLConfig * sslConfig) {
 		return 0;
 	}
 	newCertificate.certCount = sslConfig->chainFileCount + 1;
-	newCertificate.certs = mallocSafe(newCertificate.certCount);
+	newCertificate.certs = mallocSafe(newCertificate.certCount * (sizeof(*newCertificate.certs)));
 	for (int i = 0; i < sslConfig->chainFileCount; i++) {
 		ret = loadSSLCertificateFile(sslConfig->chainFiles[i], &x509Certificate, &newCertificate.certs[i + 1]);
 		if (ret < 0) {
@@ -377,9 +384,9 @@ int loadSSLCertificate(struct SSLConfig * sslConfig) {
 	int found = 0;
 	for (int i = 0; ret != GNUTLS_E_REQUESTED_DATA_NOT_AVAILABLE; i++) {
 		char domainName[1024];
-		int critical;
+		int critical = 0;
 		size_t dataSize = sizeof(domainName);
-		int sanType;
+		int sanType = 0;
 		ret = gnutls_x509_crt_get_subject_alt_name2(x509Certificate, i, domainName, &dataSize, &sanType, &critical);
 		if (ret != GNUTLS_E_REQUESTED_DATA_NOT_AVAILABLE && ret != GNUTLS_E_SHORT_MEMORY_BUFFER
 				&& sanType == GNUTLS_SAN_DNSNAME) {
@@ -409,7 +416,6 @@ int loadSSLCertificate(struct SSLConfig * sslConfig) {
 }
 
 void initializeSSL() {
-	sslCertificates = mallocSafe(sslCertificateCount * sizeof(*sslCertificates));
 	for (int i = 0; i < config.sslCertCount; i++) {
 		if (loadSSLCertificate(&config.sslCerts[i])) {
 			exit(1);
@@ -574,6 +580,11 @@ static int createRapResponse(struct MHD_Connection *request, struct Message * me
 	switch (message->mID) {
 	case RAP_MULTISTATUS:
 	case RAP_SUCCESS: {
+		if (message->fd == -1) {
+			*response = createFileResponse(request, OK_PAGE, "text/html");
+			return MHD_HTTP_OK;
+		}
+
 		// Get Mime type and date
 		const char * mimeType = iovecToString(&message->buffers[RAP_FILE_INDEX]);
 		time_t date = *((time_t *) message->buffers[RAP_DATE_INDEX].iov_base);
@@ -628,6 +639,14 @@ static int createRapResponse(struct MHD_Connection *request, struct Message * me
 		*response = createFileResponse(request, BAD_REQUEST_PAGE, "text/html");
 		return MHD_HTTP_BAD_REQUEST;
 
+	case RAP_INSUFFICIENT_STORAGE:
+		*response = createFileResponse(request, INSUFFICIENT_STORAGE_PAGE, "text/html");
+		return MHD_HTTP_INSUFFICIENT_STORAGE;
+
+	case RAP_CONFLICT:
+		*response = createFileResponse(request, CONFLICT_PAGE, "text/html");
+		return MHD_HTTP_CONFLICT;
+
 	default:
 		stdLogError(0, "invalid response from RAP %d", (int) message->mID);
 		/* no break */
@@ -646,6 +665,9 @@ static int createRapResponse(struct MHD_Connection *request, struct Message * me
 ////////////////////
 // RAP Processing //
 ////////////////////
+
+// TODO change database to thread based.
+// that will remove the need for locking as well as binding a RAP to a connection
 
 static int forkRapProcess(const char * path, int * newSockFd) {
 	// Create unix domain socket for
@@ -931,29 +953,28 @@ static int completeUpload(struct MHD_Connection *request, struct RestrictedAcces
 		struct MHD_Response ** response) {
 
 	if (processor->writeDataFd == -1) {
-		*response = createFileResponse(request, INSUFFICIENT_STORAGE_PAGE, "text/html");
-		return MHD_HTTP_INSUFFICIENT_STORAGE;
-	} else {
-		// Closing this pipe signals to the rap that there is no more data
-		// This MUST happen before the recvMessage a few lines below or the RAP
-		// will NOT send a message and recvMessage will hang.
 		close(processor->writeDataFd);
 		processor->writeDataFd = -1;
-		struct Message message;
-		char incomingBuffer[INCOMING_BUFFER_SIZE];
-		int readResult = recvMessage(processor->socketFd, &message, incomingBuffer, INCOMING_BUFFER_SIZE);
-		if (readResult <= 0) {
-			if (readResult == 0) {
-				stdLogError(0, "RAP closed socket unexpectedly while waiting for response");
-			}
-			return MHD_HTTP_INTERNAL_SERVER_ERROR;
+	}
+	// Closing this pipe signals to the rap that there is no more data
+	// This MUST happen before the recvMessage a few lines below or the RAP
+	// will NOT send a message and recvMessage will hang.
+	close(processor->writeDataFd);
+	processor->writeDataFd = -1;
+	struct Message message;
+	char incomingBuffer[INCOMING_BUFFER_SIZE];
+	int readResult = recvMessage(processor->socketFd, &message, incomingBuffer, INCOMING_BUFFER_SIZE);
+	if (readResult <= 0) {
+		if (readResult == 0) {
+			stdLogError(0, "RAP closed socket unexpectedly while waiting for response");
 		}
+		return MHD_HTTP_INTERNAL_SERVER_ERROR;
+	}
 
-		if (readResult > 0) {
-			return createRapResponse(request, &message, response);
-		} else {
-			return MHD_HTTP_INTERNAL_SERVER_ERROR;
-		}
+	if (readResult > 0) {
+		return createRapResponse(request, &message, response);
+	} else {
+		return MHD_HTTP_INTERNAL_SERVER_ERROR;
 	}
 }
 
@@ -1265,6 +1286,8 @@ static void initializeStaticResponses() {
 	BAD_REQUEST_PAGE = createStaticFile("HTTP_BAD_REQUEST.html");
 	INSUFFICIENT_STORAGE_PAGE = createStaticFile("HTTP_INSUFFICIENT_STORAGE.html");
 	OPTIONS_PAGE = createStaticFile("OPTIONS.html");
+	CONFLICT_PAGE = createStaticFile("HTTP_CONFLICT.html");
+	OK_PAGE = createStaticFile("HTTP_OK.html");
 }
 
 ////////////////////////
