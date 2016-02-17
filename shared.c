@@ -90,15 +90,14 @@ void * reallocSafe(void * mem, size_t newSize) {
 	}
 }
 
-ssize_t sendMessage(int sock, struct Message * message) {
-	// TODO timeout
+ssize_t sendMessage(int sock, Message * message) {
 	//stdLog("sendm %d", sock);
 	ssize_t size;
 	struct msghdr msg;
 	char ctrl_buf[CMSG_SPACE(sizeof(int))];
-	struct iovec liovec[MAX_BUFFER_PARTS + 1];
+	struct iovec messageParts[MAX_MESSAGE_PARAMS + 1];
 
-	if (message->bufferCount > MAX_BUFFER_PARTS || message->bufferCount < 0) {
+	if (message->bufferCount > MAX_MESSAGE_PARAMS || message->bufferCount < 0) {
 		stdLogError(0, "Can not send message with %d parts", message->bufferCount);
 		if (message->fd != -1) {
 			close(message->fd);
@@ -108,11 +107,11 @@ ssize_t sendMessage(int sock, struct Message * message) {
 
 	msg.msg_name = NULL;
 	msg.msg_namelen = 0;
-	msg.msg_iov = liovec;
+	msg.msg_iov = messageParts;
 	msg.msg_iovlen = message->bufferCount + 1;
-	liovec[0].iov_base = message;
-	liovec[0].iov_len = sizeof(*message);
-	memcpy(&(liovec[1]), message->buffers, sizeof(struct iovec) * message->bufferCount);
+	messageParts[0].iov_base = message;
+	messageParts[0].iov_len = sizeof(*message);
+	memcpy(&(messageParts[1]), message->params, sizeof(*message->params) * message->bufferCount);
 
 	if (message->fd != -1) {
 		memset(&ctrl_buf, 0, sizeof(ctrl_buf));
@@ -138,28 +137,26 @@ ssize_t sendMessage(int sock, struct Message * message) {
 	return size;
 }
 
-ssize_t recvMessage(int sock, struct Message * message, char * incomingBuffer, size_t incomingBufferSize) {
-	// TODO timeout
+ssize_t recvMessage(int sock,  Message * message, char * incomingBuffer, size_t incomingBufferSize) {
 	//stdLog("recvm %d", sock);
 
 	struct msghdr msg;
 	char ctrl_buf[CMSG_SPACE(sizeof(int))];
-	struct iovec iovec[2];
+	struct iovec messageParts[2];
 
 	msg.msg_name = NULL;
 	msg.msg_namelen = 0;
-	msg.msg_iov = iovec;
+	msg.msg_iov = messageParts;
 	msg.msg_iovlen = 2;
 	msg.msg_control = ctrl_buf;
 	msg.msg_controllen = sizeof(ctrl_buf);
-	iovec[0].iov_base = message;
-	iovec[0].iov_len = sizeof(*message);
-	iovec[1].iov_base = incomingBuffer;
-	iovec[1].iov_len = incomingBufferSize;
+	messageParts[0].iov_base = message;
+	messageParts[0].iov_len = sizeof(*message);
+	messageParts[1].iov_base = incomingBuffer;
+	messageParts[1].iov_len = incomingBufferSize;
 
 	memset(incomingBuffer, 0, incomingBufferSize);
 
-	// TODO implement timeout ... possibly using "select"
 	ssize_t size = recvmsg(sock, &msg, MSG_CMSG_CLOEXEC);
 	// this is there to stop random EINTR failures. never yet found out what cause them
 	// but this seems to fix them.
@@ -186,7 +183,7 @@ ssize_t recvMessage(int sock, struct Message * message, char * incomingBuffer, s
 		message->fd = -1;
 	}
 
-	if (size < sizeof(*message) || message->bufferCount < 0 || message->bufferCount > MAX_BUFFER_PARTS) {
+	if (size < sizeof(*message) || message->bufferCount < 0 || message->bufferCount > MAX_MESSAGE_PARAMS) {
 		stdLogError(0, "Invalid message received %zd %d", size, message->bufferCount);
 		if (message->fd != -1) {
 			close(message->fd);
@@ -196,8 +193,8 @@ ssize_t recvMessage(int sock, struct Message * message, char * incomingBuffer, s
 
 	char * partPtr = incomingBuffer;
 	for (int i = 0; i < message->bufferCount; i++) {
-		message->buffers[i].iov_base = partPtr;
-		partPtr += message->buffers[i].iov_len;
+		message->params[i].iov_base = partPtr;
+		partPtr += message->params[i].iov_len;
 		if (partPtr > incomingBuffer + size - sizeof(*message)) {
 			stdLogError(0, "Invalid message received: parts too long\n");
 			if (message->fd != -1) {
@@ -206,15 +203,15 @@ ssize_t recvMessage(int sock, struct Message * message, char * incomingBuffer, s
 			return -1;
 		}
 	}
-	for (int i = message->bufferCount; i < MAX_BUFFER_PARTS; i++) {
-		message->buffers[i].iov_base = NULL;
-		message->buffers[i].iov_len = 0;
+	for (int i = message->bufferCount; i < MAX_MESSAGE_PARAMS; i++) {
+		message->params[i].iov_base = NULL;
+		message->params[i].iov_len = 0;
 	}
 
 	return size;
 }
 
-char * iovecToString(struct iovec * iovec) {
+char * messageParamToString(MessageParam * iovec) {
 	char * buffer = iovec->iov_base;
 	buffer[iovec->iov_len - 1] = '\0';
 	return buffer;
@@ -242,7 +239,7 @@ static void xmlTextNOOPErrorFunction(void * arg, const char * msg, xmlParserSeve
 		xmlTextReaderLocatorPtr locator) {
 }
 
-void suppressReaderErrors(xmlTextReaderPtr reader) {
+void xmlReaderSuppressErrors(xmlTextReaderPtr reader) {
 	xmlTextReaderSetErrorHandler(reader, &xmlTextNOOPErrorFunction, NULL);
 }
 

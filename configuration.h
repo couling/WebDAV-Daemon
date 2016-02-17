@@ -8,29 +8,29 @@
 // Webdavd Configuration Structures //
 //////////////////////////////////////
 
-struct DaemonConfig {
+typedef struct DaemonConfig {
 	int port;
 	const char * host;
 	int sslEnabled;
 	int forwardToIsEncrypted;
 	int forwardToPort;
 	const char * forwardToHost;
-};
+} DaemonConfig;
 
-struct SSLConfig {
+typedef struct SSLConfig {
 	int chainFileCount;
 	const char * keyFile;
 	const char * certificateFile;
 	const char ** chainFiles;
 
-};
+} SSLConfig;
 
-struct WebdavdConfiguration {
+typedef struct WebdavdConfiguration {
 	const char * restrictedUser;
 
 	// Daemons
 	int daemonCount;
-	struct DaemonConfig * daemons;
+	DaemonConfig * daemons;
 	int maxConnectionsPerIp;
 
 	// RAP
@@ -45,23 +45,22 @@ struct WebdavdConfiguration {
 	const char * errorLog;
 	const char * staticResponseDir;
 
-	// Add static files
-
 	// SSL
 	int sslCertCount;
-	struct SSLConfig * sslCerts;
-}extern config;
+	SSLConfig * sslCerts;
+} WebdavdConfiguration;
 
-struct ConfigurationFunction {
+typedef struct ConfigurationFunction {
 	const char * nodeName;
-	int (*func)(struct WebdavdConfiguration * config, xmlTextReaderPtr reader, const char * configFile);
-};
+	int (*func)(WebdavdConfiguration * config, xmlTextReaderPtr reader, const char * configFile);
+} ConfigurationFunction;
 
 //////////////////////////////////////////
 // End Webdavd Configuration Structures //
 //////////////////////////////////////////
 
-void configure(const char * configFile);
+void configure(WebdavdConfiguration ** config, int * configCount, const char * configFile);
+void freeConfigurationData(WebdavdConfiguration * configData);
 
 #define CONFIG_NAMESPACE "http://couling.me/webdavd"
 

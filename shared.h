@@ -12,22 +12,16 @@ enum RapConstant {
 	RAP_WRITE_FILE,
 	RAP_PROPFIND,
 
-	RAP_SUCCESS,
-	RAP_MULTISTATUS,
-	RAP_CONTINUE,
-	RAP_NOT_FOUND,
-	RAP_ACCESS_DENIED,
-	RAP_AUTH_FAILLED,
-	RAP_INSUFFICIENT_STORAGE,
-	RAP_CONFLICT,
-	RAP_BAD_CLIENT_REQUEST,
-	RAP_INTERNAL_ERROR,
-	RAP_BAD_RAP_REQUEST,
-
-	RAP_MIN_REQUEST = RAP_AUTHENTICATE,
-	RAP_MAX_REQUEST = RAP_PROPFIND,
-	RAP_MIN_RESPONSE = RAP_SUCCESS,
-	RAP_MAX_RESPONSE = RAP_BAD_RAP_REQUEST
+	RAP_SUCCESS = 200,
+	RAP_MULTISTATUS = 207,
+	RAP_CONTINUE = 100,
+	RAP_NOT_FOUND = 404,
+	RAP_ACCESS_DENIED = 403,
+	RAP_AUTH_FAILLED = 401,
+	RAP_INSUFFICIENT_STORAGE = 507,
+	RAP_CONFLICT = 409,
+	RAP_BAD_CLIENT_REQUEST = 400,
+	RAP_INTERNAL_ERROR = 500
 };
 
 #define RAP_USER_INDEX 0
@@ -57,24 +51,26 @@ size_t getWebDate(time_t rawtime, char * buf, size_t bufSize);
 void stdLog(const char * str, ...);
 void stdLogError(int errorNumber, const char * str, ...);
 
-#define MAX_BUFFER_PARTS 3
+#define MAX_MESSAGE_PARAMS 3
 #define INCOMING_BUFFER_SIZE 4096
 
-struct Message {
+typedef struct iovec MessageParam;
+
+typedef struct Message {
 	enum RapConstant mID;
 	int fd;
 	int bufferCount;
-	struct iovec buffers[MAX_BUFFER_PARTS];
-};
+	MessageParam params[MAX_MESSAGE_PARAMS];
+} Message;
 
-ssize_t sendMessage(int sock, struct Message * message);
-ssize_t recvMessage(int sock, struct Message * message, char * incomingBuffer, size_t incomingBufferSize);
-char * iovecToString(struct iovec * iovec);
+ssize_t sendMessage(int sock, Message * message);
+ssize_t recvMessage(int sock, Message * message, char * incomingBuffer, size_t incomingBufferSize);
+char * messageParamToString(MessageParam * iovec);
 
 int lockToUser(const char * user);
 
 // XML
-void suppressReaderErrors(xmlTextReaderPtr reader);
+void xmlReaderSuppressErrors(xmlTextReaderPtr reader);
 int stepInto(xmlTextReaderPtr reader);
 int stepOver(xmlTextReaderPtr reader);
 int stepOut(xmlTextReaderPtr reader);

@@ -8,7 +8,7 @@
 // Handler Functions //
 ///////////////////////
 
-static int configListen(struct WebdavdConfiguration * config, xmlTextReaderPtr reader, const char * configFile) {
+static int configListen(WebdavdConfiguration * config, xmlTextReaderPtr reader, const char * configFile) {
 	//<listen><port>80</port><host>localhost</host><encryption>disabled</encryption></listen>
 	int index = config->daemonCount++;
 	config->daemons = reallocSafe(config->daemons, sizeof(*config->daemons) * config->daemonCount);
@@ -123,7 +123,7 @@ static int configListen(struct WebdavdConfiguration * config, xmlTextReaderPtr r
 	return result;
 }
 
-static int configSessionTimeout(struct WebdavdConfiguration * config, xmlTextReaderPtr reader, const char * configFile) {
+static int configSessionTimeout(WebdavdConfiguration * config, xmlTextReaderPtr reader, const char * configFile) {
 	//<session-timeout>5:00</session-timeout>
 	const char * sessionTimeoutString;
 	int result = stepOverText(reader, &sessionTimeoutString);
@@ -162,7 +162,7 @@ static int configSessionTimeout(struct WebdavdConfiguration * config, xmlTextRea
 	return result;
 }
 
-static int configMaxUserSessions(struct WebdavdConfiguration * config, xmlTextReaderPtr reader, const char * configFile) {
+static int configMaxUserSessions(WebdavdConfiguration * config, xmlTextReaderPtr reader, const char * configFile) {
 	// <max-user-sessions>10</max-user-sessions>
 	const char * sessionCountString;
 	int result = stepOverText(reader, &sessionCountString);
@@ -179,8 +179,7 @@ static int configMaxUserSessions(struct WebdavdConfiguration * config, xmlTextRe
 	return result;
 }
 
-static int configMaxIpConnections(struct WebdavdConfiguration * config, xmlTextReaderPtr reader,
-		const char * configFile) {
+static int configMaxIpConnections(WebdavdConfiguration * config, xmlTextReaderPtr reader, const char * configFile) {
 	// <max-ip-connections>20</max-ip-connections>
 	const char * sessionCountString;
 	int result = stepOverText(reader, &sessionCountString);
@@ -197,7 +196,7 @@ static int configMaxIpConnections(struct WebdavdConfiguration * config, xmlTextR
 	return result;
 }
 
-static int configRestricted(struct WebdavdConfiguration * config, xmlTextReaderPtr reader, const char * configFile) {
+static int configRestricted(WebdavdConfiguration * config, xmlTextReaderPtr reader, const char * configFile) {
 	//<restricted>nobody</restricted>
 	if (config->restrictedUser) {
 		stdLogError(0, "restricted-user specified more than once in %s", configFile);
@@ -206,7 +205,7 @@ static int configRestricted(struct WebdavdConfiguration * config, xmlTextReaderP
 	return stepOverText(reader, &config->restrictedUser);;
 }
 
-static int configMimeFile(struct WebdavdConfiguration * config, xmlTextReaderPtr reader, const char * configFile) {
+static int configMimeFile(WebdavdConfiguration * config, xmlTextReaderPtr reader, const char * configFile) {
 	//<mime-file>/etc/mime.types</mime-file>
 	if (config->mimeTypesFile) {
 		stdLogError(0, "restricted-user specified more than once in %s", configFile);
@@ -215,7 +214,7 @@ static int configMimeFile(struct WebdavdConfiguration * config, xmlTextReaderPtr
 	return stepOverText(reader, &config->mimeTypesFile);
 }
 
-static int configRapBinary(struct WebdavdConfiguration * config, xmlTextReaderPtr reader, const char * configFile) {
+static int configRapBinary(WebdavdConfiguration * config, xmlTextReaderPtr reader, const char * configFile) {
 	//<rap-binary>/usr/sbin/rap</rap-binary>
 	if (config->rapBinary) {
 		stdLogError(0, "restricted-user specified more than once in %s", configFile);
@@ -224,7 +223,7 @@ static int configRapBinary(struct WebdavdConfiguration * config, xmlTextReaderPt
 	return stepOverText(reader, &config->rapBinary);
 }
 
-static int configPamService(struct WebdavdConfiguration * config, xmlTextReaderPtr reader, const char * configFile) {
+static int configPamService(WebdavdConfiguration * config, xmlTextReaderPtr reader, const char * configFile) {
 	//<pam-service>webdavd</pam-service>
 	if (config->pamServiceName) {
 		stdLogError(0, "restricted-user specified more than once in %s", configFile);
@@ -233,7 +232,7 @@ static int configPamService(struct WebdavdConfiguration * config, xmlTextReaderP
 	return stepOverText(reader, &config->pamServiceName);
 }
 
-static int configAccessLog(struct WebdavdConfiguration * config, xmlTextReaderPtr reader, const char * configFile) {
+static int configAccessLog(WebdavdConfiguration * config, xmlTextReaderPtr reader, const char * configFile) {
 	if (config->accessLog) {
 		stdLogError(0, "restricted-user specified more than once in %s", configFile);
 		exit(1);
@@ -241,7 +240,7 @@ static int configAccessLog(struct WebdavdConfiguration * config, xmlTextReaderPt
 	return stepOverText(reader, &config->accessLog);
 }
 
-static int configErrorLog(struct WebdavdConfiguration * config, xmlTextReaderPtr reader, const char * configFile) {
+static int configErrorLog(WebdavdConfiguration * config, xmlTextReaderPtr reader, const char * configFile) {
 	if (config->errorLog) {
 		stdLogError(0, "restricted-user specified more than once in %s", configFile);
 		exit(1);
@@ -250,7 +249,7 @@ static int configErrorLog(struct WebdavdConfiguration * config, xmlTextReaderPtr
 }
 
 //<ssl-cert>...</ssl-cert>
-static int configConfigSSLCert(struct WebdavdConfiguration * config, xmlTextReaderPtr reader, const char * configFile) {
+static int configConfigSSLCert(WebdavdConfiguration * config, xmlTextReaderPtr reader, const char * configFile) {
 	int index = config->sslCertCount++;
 	config->sslCerts = reallocSafe(config->sslCerts, sizeof(*config->sslCerts) * config->sslCertCount);
 	config->sslCerts[index].certificateFile = NULL;
@@ -299,7 +298,7 @@ static int configConfigSSLCert(struct WebdavdConfiguration * config, xmlTextRead
 	return result;
 }
 
-static int configResponseDir(struct WebdavdConfiguration * config, xmlTextReaderPtr reader, const char * configFile) {
+static int configResponseDir(WebdavdConfiguration * config, xmlTextReaderPtr reader, const char * configFile) {
 	if (config->errorLog) {
 		stdLogError(0, "restricted-user specified more than once in %s", configFile);
 		exit(1);
@@ -323,12 +322,11 @@ static int configResponseDir(struct WebdavdConfiguration * config, xmlTextReader
 ///////////////////
 
 static int compareConfigFunction(const void * a, const void * b) {
-	return strcmp(((const struct ConfigurationFunction *) a)->nodeName,
-			((const struct ConfigurationFunction *) b)->nodeName);
+	return strcmp(((const ConfigurationFunction *) a)->nodeName, ((const ConfigurationFunction *) b)->nodeName);
 }
 
 // This MUST be sorted in aplabetical order (for nodeName).  The array is binary-searched.
-static const struct ConfigurationFunction configFunctions[] = { { .nodeName = "access-log", .func = &configAccessLog }, //<access-log />
+static const ConfigurationFunction configFunctions[] = { { .nodeName = "access-log", .func = &configAccessLog }, //<access-log />
 		{ .nodeName = "error-log", .func = &configErrorLog },                  // <error-log />
 		{ .nodeName = "listen", .func = &configListen },                       // <listen />
 		{ .nodeName = "max-ip-connections", .func = &configMaxIpConnections }, //<max-ip-connections />
@@ -342,9 +340,9 @@ static const struct ConfigurationFunction configFunctions[] = { { .nodeName = "a
 		{ .nodeName = "static-response-dir", .func = &configResponseDir }      // <static-response-dir />
 };
 
-static int configFunctionCount = sizeof(configFunctions) / sizeof(struct ConfigurationFunction);
+static int configFunctionCount = sizeof(configFunctions) / sizeof(*configFunctions);
 
-static int configureServer(struct WebdavdConfiguration * config, xmlTextReaderPtr reader, const char * configFile) {
+static int configureServer(WebdavdConfiguration * config, xmlTextReaderPtr reader, const char * configFile) {
 	memset(config, 0, sizeof(*config));
 
 	int depth = xmlTextReaderDepth(reader) + 1;
@@ -354,8 +352,8 @@ static int configureServer(struct WebdavdConfiguration * config, xmlTextReaderPt
 		if (xmlTextReaderNodeType(reader) == XML_READER_TYPE_ELEMENT && !strcmp(xmlTextReaderConstNamespaceUri(reader),
 		CONFIG_NAMESPACE)) {
 
-			struct ConfigurationFunction node = { .nodeName = xmlTextReaderConstLocalName(reader) };
-			struct ConfigurationFunction * function = bsearch(&node, configFunctions, configFunctionCount,
+			ConfigurationFunction node = { .nodeName = xmlTextReaderConstLocalName(reader) };
+			ConfigurationFunction * function = bsearch(&node, configFunctions, configFunctionCount,
 					sizeof(*configFunctions), &compareConfigFunction);
 
 			if (function) {
@@ -395,9 +393,9 @@ static int configureServer(struct WebdavdConfiguration * config, xmlTextReaderPt
 	return result;
 }
 
-void configure(const char * configFile) {
+void configure(WebdavdConfiguration ** config, int * configCount, const char * configFile) {
 	xmlTextReaderPtr reader = xmlReaderForFile(configFile, NULL, XML_PARSE_NOENT);
-	suppressReaderErrors(reader);
+	xmlReaderSuppressErrors(reader);
 	if (!reader || !stepInto(reader)) {
 		stdLogError(0, "could not create xml reader for %s", configFile);
 		exit(1);
@@ -412,8 +410,10 @@ void configure(const char * configFile) {
 
 	while (result && xmlTextReaderDepth(reader) == 1) {
 		if (elementMatches(reader, CONFIG_NAMESPACE, "server")) {
-			result = configureServer(&config, reader, configFile);
-			break;
+			int index = (*configCount)++;
+			WebdavdConfiguration * newConfig = reallocSafe(*config, *configCount * sizeof(**config));
+			*config = newConfig;
+			result = configureServer(&newConfig[index], reader, configFile);
 		} else {
 			stdLog("Warning: skipping %s:%s in %s", xmlTextReaderConstNamespaceUri(reader),
 					xmlTextReaderConstLocalName(reader), configFile);
@@ -422,6 +422,42 @@ void configure(const char * configFile) {
 	}
 
 	xmlFreeTextReader(reader);
+}
+
+static void xmlFreeIfNotNull(const char * value) {
+	if (value) {
+		xmlFree((char *) value);
+	}
+}
+
+static void freeIfNotNull(void * value) {
+	if (value) {
+		free(value);
+	}
+}
+
+void freeConfigurationData(WebdavdConfiguration * configData) {
+	xmlFreeIfNotNull(configData->accessLog);
+	xmlFreeIfNotNull(configData->errorLog);
+	for (int i = 0; i < configData->daemonCount; i++) {
+		xmlFreeIfNotNull(configData->daemons[i].host);
+		xmlFreeIfNotNull(configData->daemons[i].forwardToHost);
+	}
+	freeIfNotNull(configData->daemons);
+	xmlFreeIfNotNull(configData->mimeTypesFile);
+	xmlFreeIfNotNull(configData->pamServiceName);
+	xmlFreeIfNotNull(configData->rapBinary);
+	xmlFreeIfNotNull(configData->restrictedUser);
+	xmlFreeIfNotNull(configData->staticResponseDir);
+	for (int i = 0; i < configData->sslCertCount; i++) {
+		xmlFreeIfNotNull(configData->sslCerts[i].certificateFile);
+		xmlFreeIfNotNull(configData->sslCerts[i].keyFile);
+		for (int j = 0; i < configData->sslCerts[i].chainFileCount; j++) {
+			xmlFreeIfNotNull(configData->sslCerts[i].chainFiles[j]);
+		}
+		freeIfNotNull(configData->sslCerts[i].chainFiles);
+	}
+	freeIfNotNull(configData->sslCerts);
 }
 
 ///////////////////////

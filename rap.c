@@ -12,63 +12,77 @@
 #include <security/pam_appl.h>
 #include <libxml/xmlwriter.h>
 
-#define BUFFER_SIZE 4096
+#define BUFFER_SIZE 40960
 
+typedef struct MimeType {
+	const char * fileExtension;
+	const char * type;
+	size_t typeStringSize;
+} MimeType;
+
+// Authentication
 static int authenticated = 0;
 static const char * authenticatedUser;
 static const char * pamService;
+static pam_handle_t *pamh;
+
+// Mime Database.
+static size_t mimeFileBufferSize;
+static char * mimeFileBuffer;
+static MimeType * mimeTypes = NULL;
+static int mimeTypeCount = 0;
+
+static MimeType UNKNOWN_MIME_TYPE = { .fileExtension = "", .type = "application/octet-stream", .typeStringSize =
+		sizeof("application/octet-stream") };
+static MimeType XML_MIME_TYPE = { .fileExtension = "", .type = "application/xml; charset=utf-8", .typeStringSize =
+		sizeof("application/xml; charset=utf-8") };
 
 static size_t respond(enum RapConstant result, int fd) {
-	struct Message message = { .mID = result, .fd = fd, .bufferCount = 0 };
+	Message message = { .mID = result, .fd = fd, .bufferCount = 0 };
 	return sendMessage(STDOUT_FILENO, &message);
+}
+
+static char * normalizeDirName(const char * file, size_t * filePathSize, int isDir) {
+	char * filePath = mallocSafe(*filePathSize + 2);
+	memcpy(filePath, file, *filePathSize + 1);
+	if (isDir && file[*filePathSize - 1] != '/') {
+		filePath[*filePathSize] = '/';
+		filePath[*filePathSize + 1] = '\0';
+		(*filePathSize)++;
+	}
+	return filePath;
 }
 
 //////////
 // Mime //
 //////////
 
-struct MimeType {
-	const char * ext;
-	const char * type;
-	size_t typeStringSize;
-};
-
-// Mime Database.
-static size_t mimeFileBufferSize;
-static char * mimeFileBuffer;
-static struct MimeType * mimeTypes = NULL;
-static int mimeTypeCount = 0;
-static struct MimeType UNKNOWN_MIME_TYPE = { .ext = "", .type = "application/octet-stream", .typeStringSize =
-		sizeof("application/octet-stream") };
-static struct MimeType XML_MIME_TYPE = { .ext = "", .type = "application/xml; charset=utf-8", .typeStringSize =
-		sizeof("application/xml; charset=utf-8") };
-
 static int compareExt(const void * a, const void * b) {
-	return strcmp(((struct MimeType *) a)->ext, ((struct MimeType *) b)->ext);
+	return strcmp(((MimeType *) a)->fileExtension, ((MimeType *) b)->fileExtension);
 }
 
-static struct MimeType * findMimeType(const char * file) {
+static MimeType * findMimeType(const char * file) {
 
 	if (!file) {
 		return &UNKNOWN_MIME_TYPE;
 	}
-	struct MimeType type;
-	type.ext = file + strlen(file) - 1;
+	MimeType type;
+	type.fileExtension = file + strlen(file) - 1;
 	while (1) {
-		if (*type.ext == '/') {
+		if (*type.fileExtension == '/') {
 			return &UNKNOWN_MIME_TYPE;
-		} else if (*type.ext == '.') {
-			type.ext++;
+		} else if (*type.fileExtension == '.') {
+			type.fileExtension++;
 			break;
 		} else {
-			type.ext--;
-			if (type.ext < file) {
+			type.fileExtension--;
+			if (type.fileExtension < file) {
 				return &UNKNOWN_MIME_TYPE;
 			}
 		}
 	}
 
-	struct MimeType * result = bsearch(&type, mimeTypes, mimeTypeCount, sizeof(struct MimeType), &compareExt);
+	MimeType * result = bsearch(&type, mimeTypes, mimeTypeCount, sizeof(*mimeTypes), &compareExt);
 	return result ? result : &UNKNOWN_MIME_TYPE;
 }
 
@@ -123,9 +137,9 @@ static void initializeMimeTypes(const char * mimeTypesFile) {
 				if (type == NULL) {
 					type = partStartPtr;
 				} else {
-					mimeTypes = reallocSafe(mimeTypes, sizeof(struct MimeType) * (mimeTypeCount + 1));
+					mimeTypes = reallocSafe(mimeTypes, sizeof(*mimeTypes) * (mimeTypeCount + 1));
 					mimeTypes[mimeTypeCount].type = type;
-					mimeTypes[mimeTypeCount].ext = partStartPtr;
+					mimeTypes[mimeTypeCount].fileExtension = partStartPtr;
 					mimeTypes[mimeTypeCount].typeStringSize = partEndPtr - partStartPtr + 1;
 					mimeTypeCount++;
 				}
@@ -143,7 +157,7 @@ static void initializeMimeTypes(const char * mimeTypesFile) {
 		partStartPtr = partEndPtr + 1;
 	} while (partStartPtr < mimeFileBuffer + mimeFileBufferSize);
 
-	qsort(mimeTypes, mimeTypeCount, sizeof(struct MimeType), &compareExt);
+	qsort(mimeTypes, mimeTypeCount, sizeof(*mimeTypes), &compareExt);
 }
 
 //////////////
@@ -153,6 +167,7 @@ static void initializeMimeTypes(const char * mimeTypesFile) {
 /////////////////////
 // XML Text Writer //
 /////////////////////
+
 static int xmlFdOutputCloseCallback(void * context) {
 	close(*((int *) context));
 	free(context);
@@ -173,11 +188,20 @@ static xmlTextWriterPtr xmlNewFdTextWriter(int out) {
 	return xmlNewTextWriter(outStruct);
 }
 
-static int xmlTextWriterWriteElementString(xmlTextWriterPtr writer, const char * elementName, const char * string) {
+static int xmlTextWriterWriteElementString(xmlTextWriterPtr writer, const char * prefix, const char * elementName,
+		const char * string) {
 	int ret;
-	(ret = xmlTextWriterStartElementNS(writer, "d", elementName, NULL)) < 0
-			|| (ret = xmlTextWriterWriteString(writer, string)) < 0 || (ret = xmlTextWriterEndElement(writer));
-
+	if (prefix) {
+		if ((ret = xmlTextWriterStartElementNS(writer, prefix, elementName, NULL)) < 0)
+			return ret;
+	} else {
+		if ((ret = xmlTextWriterStartElement(writer, elementName)) < 0)
+			return ret;
+	}
+	if ((ret = xmlTextWriterWriteString(writer, string)) < 0)
+		return ret;
+	if ((ret = xmlTextWriterEndElement(writer)) < 0)
+		return ret;
 	return ret;
 }
 
@@ -199,7 +223,7 @@ static int xmlTextWriterWriteElementString(xmlTextWriterPtr writer, const char *
 #define PROPFIND_AVAILABLE_BYTES "quota-available-bytes"
 #define PROPFIND_ETAG "getetag"
 
-struct PropertySet {
+typedef struct PropertySet {
 	char creationDate;
 	char displayName;
 	char contentLength;
@@ -209,11 +233,11 @@ struct PropertySet {
 	char resourceType;
 	char usedBytes;
 	char availableBytes;
-};
+} PropertySet;
 
-static int parsePropFind(int fd, struct PropertySet * properties) {
+static int parsePropFind(int fd, PropertySet * properties) {
 	xmlTextReaderPtr reader = xmlReaderForFd(fd, NULL, NULL, XML_PARSE_NOENT);
-	suppressReaderErrors(reader);
+	xmlReaderSuppressErrors(reader);
 
 	int readResult;
 	if (!reader || !stepInto(reader)) {
@@ -229,17 +253,17 @@ static int parsePropFind(int fd, struct PropertySet * properties) {
 		memset(properties, 1, sizeof(*properties));
 		goto CLEANUP;
 	} else {
-		memset(properties, 0, sizeof(struct PropertySet));
+		memset(properties, 0, sizeof(PropertySet));
 	}
 
-	if (!elementMatches(reader, "DAV:", "propfind")) {
+	if (!elementMatches(reader, WEBDAV_NAMESPACE, "propfind")) {
 		stdLogError(0, "Request body was not a propfind document");
 		readResult = 0;
 		goto CLEANUP;
 	}
 
 	readResult = stepInto(reader);
-	while (readResult && xmlTextReaderDepth(reader) > 0 && !elementMatches(reader, "DAV:", "prop")) {
+	while (readResult && xmlTextReaderDepth(reader) > 0 && !elementMatches(reader, WEBDAV_NAMESPACE, "prop")) {
 		stepOver(reader);
 	}
 
@@ -249,7 +273,7 @@ static int parsePropFind(int fd, struct PropertySet * properties) {
 
 	readResult = stepInto(reader);
 	while (readResult && xmlTextReaderDepth(reader) > 1) {
-		if (!strcmp(xmlTextReaderConstNamespaceUri(reader), "DAV:")) {
+		if (!strcmp(xmlTextReaderConstNamespaceUri(reader), WEBDAV_NAMESPACE)) {
 			const char * nodeName = xmlTextReaderConstLocalName(reader);
 			if (!strcmp(nodeName, PROPFIND_RESOURCE_TYPE)) {
 				properties->resourceType = 1;
@@ -290,28 +314,28 @@ static int parsePropFind(int fd, struct PropertySet * properties) {
 	return readResult;
 }
 
-static void writePropFindResponsePart(const char * fileName, const char * displayName, struct PropertySet * properties,
+static void writePropFindResponsePart(const char * fileName, const char * displayName, PropertySet * properties,
 		struct stat * fileStat, xmlTextWriterPtr writer) {
 
 	xmlTextWriterStartElementNS(writer, "d", "response", NULL);
-	xmlTextWriterWriteElementString(writer, "href", fileName);
+	xmlTextWriterWriteElementString(writer, "d", "href", fileName);
 	xmlTextWriterStartElementNS(writer, "d", "propstat", NULL);
 	xmlTextWriterStartElementNS(writer, "d", "prop", NULL);
 
 	if (properties->etag) {
 		char buffer[200];
 		snprintf(buffer, sizeof(buffer), "\"%zd-%lld\"", fileStat->st_size, (long long) fileStat->st_mtime);
-		xmlTextWriterWriteElementString(writer, PROPFIND_ETAG, buffer);
+		xmlTextWriterWriteElementString(writer, "d", PROPFIND_ETAG, buffer);
 	}
 	if (properties->creationDate) {
 		char buffer[100];
 		getWebDate(fileStat->st_ctime, buffer, 100);
-		xmlTextWriterWriteElementString(writer, PROPFIND_CREATION_DATE, buffer);
+		xmlTextWriterWriteElementString(writer, "d", PROPFIND_CREATION_DATE, buffer);
 	}
 	if (properties->lastModified) {
 		char buffer[100];
 		getWebDate(fileStat->st_ctime, buffer, 100);
-		xmlTextWriterWriteElementString(writer, PROPFIND_LAST_MODIFIED, buffer);
+		xmlTextWriterWriteElementString(writer, "d", PROPFIND_LAST_MODIFIED, buffer);
 	}
 	if (properties->resourceType) {
 		xmlTextWriterStartElementNS(writer, "d", PROPFIND_RESOURCE_TYPE, NULL);
@@ -331,11 +355,11 @@ static void writePropFindResponsePart(const char * fileName, const char * displa
 				char buffer[100];
 				unsigned long long size = fsStat.f_bavail * fsStat.f_bsize;
 				snprintf(buffer, sizeof(buffer), "%llu", size);
-				xmlTextWriterWriteElementString(writer, PROPFIND_AVAILABLE_BYTES, buffer);
+				xmlTextWriterWriteElementString(writer, "d", PROPFIND_AVAILABLE_BYTES, buffer);
 				if (properties->usedBytes) {
 					size = (fsStat.f_blocks - fsStat.f_bfree) * fsStat.f_bsize;
 					snprintf(buffer, sizeof(buffer), "%llu", size);
-					xmlTextWriterWriteElementString(writer, PROPFIND_USED_BYTES, buffer);
+					xmlTextWriterWriteElementString(writer, "d", PROPFIND_USED_BYTES, buffer);
 				}
 			}
 		} else if (properties->usedBytes) {
@@ -344,27 +368,27 @@ static void writePropFindResponsePart(const char * fileName, const char * displa
 				char buffer[100];
 				unsigned long long size = (fsStat.f_blocks - fsStat.f_bfree) * fsStat.f_bsize;
 				snprintf(buffer, sizeof(buffer), "%llu", size);
-				xmlTextWriterWriteElementString(writer, PROPFIND_USED_BYTES, buffer);
+				xmlTextWriterWriteElementString(writer, "d", PROPFIND_USED_BYTES, buffer);
 			}
 		}
 	} else {
 		if (properties->contentLength) {
 			char buffer[100];
 			snprintf(buffer, sizeof(buffer), "%zd", fileStat->st_size);
-			xmlTextWriterWriteElementString(writer, PROPFIND_CONTENT_LENGTH, buffer);
+			xmlTextWriterWriteElementString(writer, "d", PROPFIND_CONTENT_LENGTH, buffer);
 		}
 		if (properties->contentType) {
-			xmlTextWriterWriteElementString(writer, PROPFIND_CONTENT_TYPE, findMimeType(fileName)->type);
+			xmlTextWriterWriteElementString(writer, "d", PROPFIND_CONTENT_TYPE, findMimeType(fileName)->type);
 		}
 	}
 	xmlTextWriterEndElement(writer);
-	xmlTextWriterWriteElementString(writer, "status", "HTTP/1.1 200 OK");
+	xmlTextWriterWriteElementString(writer, "d", "status", "HTTP/1.1 200 OK");
 	xmlTextWriterEndElement(writer);
 	xmlTextWriterEndElement(writer);
 
 }
 
-static int respondToPropFind(const char * file, const char * host, struct PropertySet * properties, int depth) {
+static int respondToPropFind(const char * file, const char * host, PropertySet * properties, int depth) {
 	struct stat fileStat;
 	if (stat(file, &fileStat)) {
 		int e = errno;
@@ -385,18 +409,9 @@ static int respondToPropFind(const char * file, const char * host, struct Proper
 		return respond(RAP_INTERNAL_ERROR, -1);
 	}
 
-	char * filePath;
-	size_t filePathSize = strlen(file);
-	size_t fileNameSize = filePathSize;
-	if ((fileStat.st_mode & S_IFMT) == S_IFDIR && file[filePathSize - 1] != '/') {
-		filePath = mallocSafe(filePathSize + 2);
-		memcpy(filePath, file, filePathSize);
-		filePath[filePathSize] = '/';
-		filePath[filePathSize + 1] = '\0';
-		filePathSize++;
-	} else {
-		filePath = (char *) file;
-	}
+	size_t fileNameSize = strlen(file);
+	size_t filePathSize = fileNameSize;
+	char * filePath = normalizeDirName(file, &filePathSize, (fileStat.st_mode & S_IFMT) == S_IFDIR);
 
 	const char * displayName = &file[fileNameSize - 2];
 	while (displayName >= file && *displayName != '/') {
@@ -406,18 +421,16 @@ static int respondToPropFind(const char * file, const char * host, struct Proper
 
 	time_t fileTime;
 	time(&fileTime);
-	struct Message message = { .mID = RAP_MULTISTATUS, .fd = pipeEnds[PIPE_READ], .bufferCount = 2 };
-	message.buffers[RAP_DATE_INDEX].iov_base = &fileTime;
-	message.buffers[RAP_DATE_INDEX].iov_len = sizeof(fileTime);
-	message.buffers[RAP_MIME_INDEX].iov_base = (void *) XML_MIME_TYPE.type;
-	message.buffers[RAP_MIME_INDEX].iov_len = XML_MIME_TYPE.typeStringSize;
-	message.buffers[RAP_LOCATION_INDEX].iov_base = filePath;
-	message.buffers[RAP_LOCATION_INDEX].iov_len = filePathSize + 1;
+	Message message = { .mID = RAP_MULTISTATUS, .fd = pipeEnds[PIPE_READ], .bufferCount = 2 };
+	message.params[RAP_DATE_INDEX].iov_base = &fileTime;
+	message.params[RAP_DATE_INDEX].iov_len = sizeof(fileTime);
+	message.params[RAP_MIME_INDEX].iov_base = (void *) XML_MIME_TYPE.type;
+	message.params[RAP_MIME_INDEX].iov_len = XML_MIME_TYPE.typeStringSize;
+	message.params[RAP_LOCATION_INDEX].iov_base = filePath;
+	message.params[RAP_LOCATION_INDEX].iov_len = filePathSize + 1;
 	size_t messageResult = sendMessage(STDOUT_FILENO, &message);
 	if (messageResult <= 0) {
-		if (filePath != file) {
-			free(filePath);
-		}
+		free(filePath);
 		close(pipeEnds[PIPE_WRITE]);
 		return messageResult;
 	}
@@ -426,7 +439,7 @@ static int respondToPropFind(const char * file, const char * host, struct Proper
 	xmlTextWriterPtr writer = xmlNewFdTextWriter(pipeEnds[PIPE_WRITE]);
 	DIR * dir;
 	xmlTextWriterStartDocument(writer, "1.0", "utf-8", NULL);
-	xmlTextWriterStartElementNS(writer, "d", "multistatus", "DAV:");
+	xmlTextWriterStartElementNS(writer, "d", "multistatus", WEBDAV_NAMESPACE);
 	writePropFindResponsePart(filePath, displayName, properties, &fileStat, writer);
 	if (depth > 1 && (fileStat.st_mode & S_IFMT) == S_IFDIR && (dir = opendir(filePath))) {
 		struct dirent * dp;
@@ -454,19 +467,12 @@ static int respondToPropFind(const char * file, const char * host, struct Proper
 	}
 	xmlTextWriterEndElement(writer);
 	xmlFreeTextWriter(writer);
-	if (filePath != file) {
-		free(filePath);
-	}
+	free(filePath);
 	return messageResult;
 
 }
 
-static size_t propfind(struct Message * requestMessage) {
-	if (requestMessage->fd == -1) {
-		stdLogError(0, "No body sent in propfind request");
-		return respond(RAP_BAD_CLIENT_REQUEST, -1);
-	}
-
+static size_t propfind(Message * requestMessage) {
 	if (!authenticated || requestMessage->bufferCount != 3) {
 		if (!authenticated) {
 			stdLogError(0, "Not authenticated RAP");
@@ -474,23 +480,26 @@ static size_t propfind(struct Message * requestMessage) {
 			stdLogError(0, "Get request did not provide correct buffers: %d buffer(s)", requestMessage->bufferCount);
 		}
 		close(requestMessage->fd);
-		return respond(RAP_BAD_RAP_REQUEST, -1);
+		return respond(RAP_INTERNAL_ERROR, -1);
 	}
 
-	int ret = respond(RAP_CONTINUE, -1);
-	if (ret < 0) {
-		return ret;
+	char * depthString = messageParamToString(&requestMessage->params[RAP_DEPTH_INDEX]);
+	char * file = messageParamToString(&requestMessage->params[RAP_FILE_INDEX]);
+
+	PropertySet properties;
+	if (requestMessage->fd == -1) {
+		memset(&properties, 1, sizeof(properties));
+	} else {
+		int ret = respond(RAP_CONTINUE, -1);
+		if (ret < 0) {
+			return ret;
+		}
+		if (!parsePropFind(requestMessage->fd, &properties)) {
+			return respond(RAP_BAD_CLIENT_REQUEST, -1);
+		}
 	}
 
-	const char * depthString = iovecToString(&requestMessage->buffers[RAP_DEPTH_INDEX]);
-
-	struct PropertySet properties;
-	if (!parsePropFind(requestMessage->fd, &properties)) {
-		return respond(RAP_BAD_CLIENT_REQUEST, -1);
-	}
-
-	char * file = iovecToString(&requestMessage->buffers[RAP_FILE_INDEX]);
-	return respondToPropFind(file, iovecToString(&requestMessage->buffers[RAP_HOST_INDEX]), &properties,
+	return respondToPropFind(file, messageParamToString(&requestMessage->params[RAP_HOST_INDEX]), &properties,
 			(strcmp("0", depthString) ? 2 : 1));
 }
 
@@ -498,21 +507,26 @@ static size_t propfind(struct Message * requestMessage) {
 // End PROPFIND //
 //////////////////
 
-static size_t writeFile(struct Message * requestMessage) {
+/////////
+// PUT //
+/////////
+
+static size_t writeFile(Message * requestMessage) {
 	if (requestMessage->fd == -1) {
 		stdLogError(0, "write file request sent without incoming data!");
-		return respond(RAP_BAD_RAP_REQUEST, -1);
+		return respond(RAP_INTERNAL_ERROR, -1);
 	}
-	if (!authenticated || requestMessage->bufferCount != 2) {
-		if (!authenticated) {
-			stdLogError(0, "Not authenticated RAP");
-		} else {
-			stdLogError(0, "Get request did not provide correct buffers: %d buffer(s)", requestMessage->bufferCount);
-		}
-		return respond(RAP_BAD_RAP_REQUEST, -1);
+	if (!authenticated) {
+		stdLogError(0, "Not authenticated RAP");
+		return respond(RAP_INTERNAL_ERROR, -1);
 	}
-	char * host = iovecToString(&requestMessage->buffers[RAP_HOST_INDEX]);
-	char * file = iovecToString(&requestMessage->buffers[RAP_FILE_INDEX]);
+	if (requestMessage->bufferCount != 2) {
+		stdLogError(0, "Get request did not provide correct buffers: %d buffer(s)", requestMessage->bufferCount);
+		return respond(RAP_INTERNAL_ERROR, -1);
+	}
+
+	char * host = messageParamToString(&requestMessage->params[RAP_HOST_INDEX]);
+	char * file = messageParamToString(&requestMessage->params[RAP_FILE_INDEX]);
 	int fd = open(file, O_WRONLY);
 	if (fd == -1) {
 		int e = errno;
@@ -531,7 +545,7 @@ static size_t writeFile(struct Message * requestMessage) {
 		return ret;
 	}
 
-	char buffer[40960];
+	char buffer[BUFFER_SIZE];
 	ssize_t bytesRead;
 
 	while ((bytesRead = read(requestMessage->fd, buffer, sizeof(buffer))) > 0) {
@@ -546,25 +560,75 @@ static size_t writeFile(struct Message * requestMessage) {
 
 	close(fd);
 	close(requestMessage->fd);
-	return respond(RAP_SUCCESS, - 1);
+	return respond(RAP_SUCCESS, -1);
 }
 
-static size_t readFile(struct Message * requestMessage) {
+/////////////
+// End PUT //
+/////////////
+
+/////////
+// GET //
+/////////
+
+static void listDir(const char * file, int dirFd, int writeFd) {
+	DIR * dir = fdopendir(dirFd);
+	xmlTextWriterPtr writer = xmlNewFdTextWriter(writeFd);
+
+	size_t fileSize = strlen(file);
+	char * filePath = normalizeDirName(file, &fileSize, 1);
+
+	xmlTextWriterStartElement(writer, "html");
+	xmlTextWriterStartElement(writer, "head");
+	xmlTextWriterWriteElementString(writer, NULL, "title", filePath);
+	xmlTextWriterEndElement(writer);
+	xmlTextWriterStartElement(writer, "body");
+	xmlTextWriterWriteElementString(writer, NULL, "h1", filePath);
+	xmlTextWriterStartElement(writer, "ul");
+	struct dirent * dp;
+	while ((dp = readdir(dir)) != NULL) {
+		if (dp->d_name[0] != '.') {
+			xmlTextWriterStartElement(writer, "li");
+			xmlTextWriterStartElement(writer, "a");
+			xmlTextWriterStartAttribute(writer, "href");
+			xmlTextWriterWriteString(writer, filePath);
+			xmlTextWriterWriteString(writer, dp->d_name);
+			if (dp->d_type == DT_DIR)
+				xmlTextWriterWriteString(writer, "/");
+			xmlTextWriterEndAttribute(writer);
+			xmlTextWriterWriteString(writer, filePath);
+			xmlTextWriterWriteString(writer, dp->d_name);
+			if (dp->d_type == DT_DIR)
+				xmlTextWriterWriteString(writer, "/");
+			xmlTextWriterEndElement(writer);
+			xmlTextWriterEndElement(writer);
+		}
+	}
+	xmlTextWriterEndElement(writer);
+	xmlTextWriterEndElement(writer);
+	xmlTextWriterEndElement(writer);
+
+	free(filePath);
+	xmlFreeTextWriter(writer);
+	closedir(dir);
+}
+
+static size_t readFile(Message * requestMessage) {
 	if (requestMessage->fd != -1) {
 		stdLogError(0, "read file request sent incoming data!");
 		close(requestMessage->fd);
 	}
-	if (!authenticated || requestMessage->bufferCount != 2) {
-		if (!authenticated) {
-			stdLogError(0, "Not authenticated RAP");
-		} else {
-			stdLogError(0, "Get request did not provide correct buffers: %d buffer(s)", requestMessage->bufferCount);
-		}
-		return respond(RAP_BAD_RAP_REQUEST, -1);
+	if (!authenticated) {
+		stdLogError(0, "Not authenticated RAP");
+		return respond(RAP_INTERNAL_ERROR, -1);
+	}
+	if (requestMessage->bufferCount != 2) {
+		stdLogError(0, "Get request did not provide correct buffers: %d buffer(s)", requestMessage->bufferCount);
+		return respond(RAP_INTERNAL_ERROR, -1);
 	}
 
-	char * host = iovecToString(&requestMessage->buffers[RAP_HOST_INDEX]);
-	char * file = iovecToString(&requestMessage->buffers[RAP_FILE_INDEX]);
+	char * host = messageParamToString(&requestMessage->params[RAP_HOST_INDEX]);
+	char * file = messageParamToString(&requestMessage->params[RAP_FILE_INDEX]);
 	int fd = open(file, O_RDONLY);
 	if (fd == -1) {
 		int e = errno;
@@ -592,12 +656,12 @@ static size_t readFile(struct Message * requestMessage) {
 			time_t fileTime;
 			time(&fileTime);
 
-			struct Message message = { .mID = RAP_SUCCESS, .fd = pipeEnds[PIPE_READ], 3 };
-			message.buffers[RAP_DATE_INDEX].iov_base = &fileTime;
-			message.buffers[RAP_DATE_INDEX].iov_len = sizeof(fileTime);
-			message.buffers[RAP_MIME_INDEX].iov_base = "text/html";
-			message.buffers[RAP_MIME_INDEX].iov_len = sizeof("text/html");
-			message.buffers[RAP_LOCATION_INDEX] = requestMessage->buffers[RAP_FILE_INDEX];
+			Message message = { .mID = RAP_SUCCESS, .fd = pipeEnds[PIPE_READ], 3 };
+			message.params[RAP_DATE_INDEX].iov_base = &fileTime;
+			message.params[RAP_DATE_INDEX].iov_len = sizeof(fileTime);
+			message.params[RAP_MIME_INDEX].iov_base = "text/html";
+			message.params[RAP_MIME_INDEX].iov_len = sizeof("text/html");
+			message.params[RAP_LOCATION_INDEX] = requestMessage->params[RAP_FILE_INDEX];
 			size_t messageResult = sendMessage(STDOUT_FILENO, &message);
 			if (messageResult <= 0) {
 				close(fd);
@@ -605,37 +669,28 @@ static size_t readFile(struct Message * requestMessage) {
 				return messageResult;
 			}
 
-			// We've set up the pipe and sent read end across so now write the result
-			DIR * dir = fdopendir(fd);
-			FILE * outPipe = fdopen(pipeEnds[PIPE_WRITE], "w");
-			char * sep = (file[strlen(file) - 1] == '/' ? "" : "/");
-			fprintf(outPipe, "<html><head><title>%s%s</title></head><body><h1>%s%s</h1><ul>", file, sep, file, sep);
-			struct dirent * dp;
-			while ((dp = readdir(dir)) != NULL) {
-				if (dp->d_name[0] != '.') {
-					if (dp->d_type == DT_DIR) {
-						fprintf(outPipe, "<li><a href=\"%s%s%s/\">%s/</a></li>", file, sep, dp->d_name, dp->d_name);
-					} else {
-						fprintf(outPipe, "<li><a href=\"%s%s%s\">%s</a></li>", file, sep, dp->d_name, dp->d_name);
-					}
-				}
-			}
-			fprintf(outPipe, "</ul></body></html>");
-			closedir(dir);
-			fclose(outPipe);
+			listDir(file, fd, pipeEnds[PIPE_WRITE]);
 			return messageResult;
 		} else {
-			struct Message message = { .mID = RAP_SUCCESS, .fd = fd, .bufferCount = 3 };
-			message.buffers[RAP_DATE_INDEX].iov_base = &statinfo.st_mtime;
-			message.buffers[RAP_DATE_INDEX].iov_len = sizeof(statinfo.st_mtime);
-			struct MimeType * mimeType = findMimeType(file);
-			message.buffers[RAP_MIME_INDEX].iov_base = (char *) mimeType->type;
-			message.buffers[RAP_MIME_INDEX].iov_len = mimeType->typeStringSize;
-			message.buffers[RAP_LOCATION_INDEX] = requestMessage->buffers[RAP_FILE_INDEX];
+			Message message = { .mID = RAP_SUCCESS, .fd = fd, .bufferCount = 3 };
+			message.params[RAP_DATE_INDEX].iov_base = &statinfo.st_mtime;
+			message.params[RAP_DATE_INDEX].iov_len = sizeof(statinfo.st_mtime);
+			MimeType * mimeType = findMimeType(file);
+			message.params[RAP_MIME_INDEX].iov_base = (char *) mimeType->type;
+			message.params[RAP_MIME_INDEX].iov_len = mimeType->typeStringSize;
+			message.params[RAP_LOCATION_INDEX] = requestMessage->params[RAP_FILE_INDEX];
 			return sendMessage(STDOUT_FILENO, &message);
 		}
 	}
 }
+
+/////////////
+// End GET //
+/////////////
+
+//////////////////
+// Authenticate //
+//////////////////
 
 static int pamConverse(int n, const struct pam_message **msg, struct pam_response **resp, char * password) {
 	struct pam_response * response = mallocSafe(sizeof(struct pam_response));
@@ -646,8 +701,6 @@ static int pamConverse(int n, const struct pam_message **msg, struct pam_respons
 	*resp = response;
 	return PAM_SUCCESS;
 }
-
-static pam_handle_t *pamh;
 
 static void pamCleanup() {
 	int pamResult = pam_close_session(pamh, 0);
@@ -665,7 +718,7 @@ static int pamAuthenticate(const char * user, const char * password, const char 
 		return 0;
 	}
 
-// Authenticate and start session
+	// Authenticate and start session
 	int pamResult;
 	if ((pamResult = pam_set_item(pamh, PAM_RHOST, hostname)) != PAM_SUCCESS
 			|| (pamResult = pam_set_item(pamh, PAM_RUSER, user)) != PAM_SUCCESS
@@ -677,7 +730,7 @@ static int pamAuthenticate(const char * user, const char * password, const char 
 		return 0;
 	}
 
-// Get user details
+	// Get user details
 	if ((pamResult = pam_get_item(pamh, PAM_USER, (const void **) &user)) != PAM_SUCCESS
 			|| (envList = pam_getenvlist(pamh)) == NULL) {
 
@@ -687,7 +740,7 @@ static int pamAuthenticate(const char * user, const char * password, const char 
 		return 0;
 	}
 
-// Set up environment and switch user
+	// Set up environment and switch user
 	clearenv();
 	for (char ** pam_env = envList; *pam_env != NULL; ++pam_env) {
 		putenv(*pam_env);
@@ -711,23 +764,23 @@ static int pamAuthenticate(const char * user, const char * password, const char 
 	return 1;
 }
 
-static size_t authenticate(struct Message * message) {
+static size_t authenticate(Message * message) {
 	if (message->fd != -1) {
 		stdLogError(0, "authenticate request send incoming data!");
 		close(message->fd);
 	}
-	if (authenticated || message->bufferCount != 3) {
-		if (authenticated) {
-			stdLogError(0, "Login for already logged in RAP");
-		} else {
-			stdLogError(0, "Login provided %d buffer(s) instead of 3", message->bufferCount);
-		}
-		return respond(RAP_BAD_RAP_REQUEST, -1);
+	if (authenticated) {
+		stdLogError(0, "Login for already logged in RAP");
+		return respond(RAP_INTERNAL_ERROR, -1);
+	}
+	if (authenticated) {
+		stdLogError(0, "Login provided %d buffer(s) instead of 3", message->bufferCount);
+		return respond(RAP_INTERNAL_ERROR, -1);
 	}
 
-	char * user = iovecToString(&message->buffers[RAP_USER_INDEX]);
-	char * password = iovecToString(&message->buffers[RAP_PASSWORD_INDEX]);
-	char * rhost = iovecToString(&message->buffers[RAP_RHOST_INDEX]);
+	char * user = messageParamToString(&message->params[RAP_USER_INDEX]);
+	char * password = messageParamToString(&message->params[RAP_PASSWORD_INDEX]);
+	char * rhost = messageParamToString(&message->params[RAP_RHOST_INDEX]);
 
 	if (pamAuthenticate(user, password, rhost)) {
 		//stdLog("Login accepted for %s", user);
@@ -737,9 +790,13 @@ static size_t authenticate(struct Message * message) {
 	}
 }
 
+//////////////////////
+// End Authenticate //
+//////////////////////
+
 int main(int argCount, char * args[]) {
 	size_t ioResult;
-	struct Message message;
+	Message message;
 	char incomingBuffer[INCOMING_BUFFER_SIZE];
 	if (argCount > 1) {
 		pamService = args[1];
@@ -757,18 +814,9 @@ int main(int argCount, char * args[]) {
 		// Read a message
 		ioResult = recvMessage(STDIN_FILENO, &message, incomingBuffer, INCOMING_BUFFER_SIZE);
 		if (ioResult <= 0) {
-			if (ioResult < 0) {
-				exit(1);
-			} else {
-				continue;
-			}
-		}
-
-		// Handle the message
-		if (message.mID > RAP_MAX_REQUEST || message.mID < RAP_MIN_REQUEST) {
-			ioResult = respond(RAP_BAD_RAP_REQUEST, -1);
 			continue;
 		}
+
 		switch (message.mID) {
 		case RAP_AUTHENTICATE:
 			ioResult = authenticate(&message);
@@ -782,13 +830,15 @@ int main(int argCount, char * args[]) {
 		case RAP_PROPFIND:
 			ioResult = propfind(&message);
 			break;
+		default:
+			stdLogError(0, "Invalid rap request id %d", message.mID);
+			ioResult = respond(RAP_INTERNAL_ERROR, -1);
 		}
 		if (ioResult < 0) {
 			ioResult = 0;
 		}
 
 	} while (ioResult);
-	close(STDIN_FILENO);
-	close(STDOUT_FILENO);
-	return 0;
+
+	return ioResult < 0 ? -1 : 0;
 }
