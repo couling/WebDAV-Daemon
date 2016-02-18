@@ -1,5 +1,5 @@
 CFLAGS=-O3 -s
-GCC_COMPILE_PART=gcc ${CFLAGS} -std=gnu99 -pthread -o $@ -MMD $(filter %.c,$^) $(filter %.o,$^)
+GCC_COMPILE_PART=gcc ${CFLAGS} -Wall -Wno-pointer-sign -std=gnu99 -pthread -o $@ -MMD $(filter %.c,$^) $(filter %.o,$^)
 
 all: build/webdavd build/rap
 

@@ -148,12 +148,11 @@ static void getRequestIP(char * buffer, size_t bufferSize, Request * request) {
 	const struct sockaddr * addressInfo =
 			MHD_get_connection_info(request, MHD_CONNECTION_INFO_CLIENT_ADDRESS)->client_addr;
 	static unsigned char IPV4_PREFIX[] = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF };
-	unsigned char * address;
 	switch (addressInfo->sa_family) {
 	case AF_INET: {
 		struct sockaddr_in * v4Address = (struct sockaddr_in *) addressInfo;
 		unsigned char * address = (unsigned char *) (&v4Address->sin_addr);
-		PRINT_IPV4: snprintf(buffer, bufferSize, "%d.%d.%d.%d", address[0], address[1], address[2], address[3]);
+		snprintf(buffer, bufferSize, "%d.%d.%d.%d", address[0], address[1], address[2], address[3]);
 		break;
 	}
 
@@ -1395,7 +1394,7 @@ static void runServer() {
 }
 
 int main(int argCount, char ** args) {
-	int configCount;
+	int configCount = 0;
 	WebdavdConfiguration * loadedConfig = NULL;
 	if (argCount > 1) {
 		for (int i = 1; i < argCount; i++) {

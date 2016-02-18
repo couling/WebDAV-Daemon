@@ -38,7 +38,7 @@ void stdLog(const char * str, ...) {
 	written = snprintf(ptr, remaining, "\n");
 	ptr += written;
 	//remaining -= written;
-	size_t ignored = write(STDERR_FILENO, buffer, ptr - buffer);
+	size_t ignored __attribute__ ((unused)) = write(STDERR_FILENO, buffer, ptr - buffer);
 }
 
 void stdLogError(int errorNumber, const char * str, ...) {
@@ -64,7 +64,7 @@ void stdLogError(int errorNumber, const char * str, ...) {
 		written = snprintf(ptr, remaining, "\n");
 		ptr += written;
 	}
-	size_t ignored = write(STDERR_FILENO, buffer, ptr - buffer);
+	size_t ignored __attribute__ ((unused)) = write(STDERR_FILENO, buffer, ptr - buffer);
 }
 
 void * mallocSafe(size_t size) {
@@ -137,7 +137,7 @@ ssize_t sendMessage(int sock, Message * message) {
 	return size;
 }
 
-ssize_t recvMessage(int sock,  Message * message, char * incomingBuffer, size_t incomingBufferSize) {
+ssize_t recvMessage(int sock, Message * message, char * incomingBuffer, size_t incomingBufferSize) {
 	//stdLog("recvm %d", sock);
 
 	struct msghdr msg;
