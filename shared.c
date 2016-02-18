@@ -121,7 +121,8 @@ ssize_t sendMessage(int sock, Message * message) {
 		cmsg->cmsg_len = CMSG_LEN(sizeof(int));
 		cmsg->cmsg_level = SOL_SOCKET;
 		cmsg->cmsg_type = SCM_RIGHTS;
-		*((int *) CMSG_DATA(cmsg)) = message->fd;
+		int * fd = (int *) CMSG_DATA(cmsg);
+		*fd = message->fd;
 	} else {
 		msg.msg_control = NULL;
 		msg.msg_controllen = 0;
@@ -178,7 +179,8 @@ ssize_t recvMessage(int sock, Message * message, char * incomingBuffer, size_t i
 	struct cmsghdr * cmsg = CMSG_FIRSTHDR(&msg);
 	if (cmsg && cmsg->cmsg_len == CMSG_LEN(sizeof(int)) && cmsg->cmsg_level == SOL_SOCKET
 			&& cmsg->cmsg_type == SCM_RIGHTS) {
-		message->fd = *((int *) CMSG_DATA(cmsg));
+		int * fd = (int *) CMSG_DATA(cmsg);
+		message->fd = *fd;
 	} else {
 		message->fd = -1;
 	}
