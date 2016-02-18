@@ -76,7 +76,7 @@
 			YOU ARE DOING! This is primarily here for testing but on non-standard systems 
 			where binaries are not stored in /usr/sbin this will need to be changed to 
 			the location of "webdav-rap" -->
-		<rap-binary>/usr/sbin/rap</rap-binary>
+		<rap-binary>/usr/sbin/webdav-rap</rap-binary>
 
 		<!-- The service name for PAM. This corresponds to a file of the same name 
 			in /etc/pam.d/ on linux systems. default webdavd -->
