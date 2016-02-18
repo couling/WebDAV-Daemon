@@ -39,7 +39,7 @@ static MimeType XML_MIME_TYPE = { .fileExtension = "", .type = "application/xml;
 
 static size_t respond(enum RapConstant result, int fd) {
 	Message message = { .mID = result, .fd = fd, .bufferCount = 0 };
-	return sendMessage(STDOUT_FILENO, &message);
+	return sendMessage(RAP_CONTROL_SOCKET, &message);
 }
 
 static char * normalizeDirName(const char * file, size_t * filePathSize, int isDir) {
@@ -428,7 +428,7 @@ static int respondToPropFind(const char * file, const char * host, PropertySet *
 	message.params[RAP_MIME_INDEX].iov_len = XML_MIME_TYPE.typeStringSize;
 	message.params[RAP_LOCATION_INDEX].iov_base = filePath;
 	message.params[RAP_LOCATION_INDEX].iov_len = filePathSize + 1;
-	size_t messageResult = sendMessage(STDOUT_FILENO, &message);
+	size_t messageResult = sendMessage(RAP_CONTROL_SOCKET, &message);
 	if (messageResult <= 0) {
 		free(filePath);
 		close(pipeEnds[PIPE_WRITE]);
@@ -527,7 +527,8 @@ static size_t writeFile(Message * requestMessage) {
 
 	char * host = messageParamToString(&requestMessage->params[RAP_HOST_INDEX]);
 	char * file = messageParamToString(&requestMessage->params[RAP_FILE_INDEX]);
-	int fd = open(file, O_WRONLY);
+	// TODO change file mode
+	int fd = open(file, O_WRONLY | O_CREAT, 0660);
 	if (fd == -1) {
 		int e = errno;
 		switch (e) {
@@ -584,11 +585,13 @@ static void listDir(const char * file, int dirFd, int writeFd) {
 	xmlTextWriterEndElement(writer);
 	xmlTextWriterStartElement(writer, "body");
 	xmlTextWriterWriteElementString(writer, NULL, "h1", filePath);
-	xmlTextWriterStartElement(writer, "ul");
+	xmlTextWriterStartElement(writer, "table");
 	struct dirent * dp;
 	while ((dp = readdir(dir)) != NULL) {
 		if (dp->d_name[0] != '.') {
-			xmlTextWriterStartElement(writer, "li");
+			xmlTextWriterStartElement(writer, "tr");
+			xmlTextWriterWriteElementString(writer, NULL, "td", dp->d_type == DT_DIR ? "dir" : "file");
+			xmlTextWriterStartElement(writer, "td");
 			xmlTextWriterStartElement(writer, "a");
 			xmlTextWriterStartAttribute(writer, "href");
 			xmlTextWriterWriteString(writer, filePath);
@@ -600,6 +603,9 @@ static void listDir(const char * file, int dirFd, int writeFd) {
 			xmlTextWriterWriteString(writer, dp->d_name);
 			if (dp->d_type == DT_DIR)
 				xmlTextWriterWriteString(writer, "/");
+			xmlTextWriterEndElement(writer);
+			xmlTextWriterWriteElementString(writer, NULL, "td",
+					dp->d_type == DT_DIR ? "-" : findMimeType(dp->d_name)->type);
 			xmlTextWriterEndElement(writer);
 			xmlTextWriterEndElement(writer);
 		}
@@ -662,7 +668,7 @@ static size_t readFile(Message * requestMessage) {
 			message.params[RAP_MIME_INDEX].iov_base = "text/html";
 			message.params[RAP_MIME_INDEX].iov_len = sizeof("text/html");
 			message.params[RAP_LOCATION_INDEX] = requestMessage->params[RAP_FILE_INDEX];
-			size_t messageResult = sendMessage(STDOUT_FILENO, &message);
+			size_t messageResult = sendMessage(RAP_CONTROL_SOCKET, &message);
 			if (messageResult <= 0) {
 				close(fd);
 				close(pipeEnds[PIPE_WRITE]);
@@ -679,7 +685,7 @@ static size_t readFile(Message * requestMessage) {
 			message.params[RAP_MIME_INDEX].iov_base = (char *) mimeType->type;
 			message.params[RAP_MIME_INDEX].iov_len = mimeType->typeStringSize;
 			message.params[RAP_LOCATION_INDEX] = requestMessage->params[RAP_FILE_INDEX];
-			return sendMessage(STDOUT_FILENO, &message);
+			return sendMessage(RAP_CONTROL_SOCKET, &message);
 		}
 	}
 }
@@ -812,7 +818,7 @@ int main(int argCount, char * args[]) {
 
 	do {
 		// Read a message
-		ioResult = recvMessage(STDIN_FILENO, &message, incomingBuffer, INCOMING_BUFFER_SIZE);
+		ioResult = recvMessage(RAP_CONTROL_SOCKET, &message, incomingBuffer, INCOMING_BUFFER_SIZE);
 		if (ioResult <= 0) {
 			continue;
 		}

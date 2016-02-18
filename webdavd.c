@@ -687,14 +687,14 @@ static int forkRapProcess(const char * path, int * newSockFd) {
 
 	if (result) {
 		// parent
-		close(sockFd[1]);
+		close(sockFd[CHILD_SOCKET]);
 		if (result != -1) {
-			*newSockFd = sockFd[0];
+			*newSockFd = sockFd[PARENT_SOCKET];
 			//stdLog("New RAP %d on %d", result, sockFd[0]);
 			return result;
 		} else {
 			// fork failed so close parent pipes and return non-zero
-			close(sockFd[0]);
+			close(sockFd[PARENT_SOCKET]);
 			stdLogError(errno, "Could not fork");
 			return 0;
 		}
@@ -702,10 +702,27 @@ static int forkRapProcess(const char * path, int * newSockFd) {
 		// child
 		// Sort out socket
 		//stdLog("Starting rap: %s", path);
-		if (dup2(sockFd[1], STDIN_FILENO) == -1 || dup2(sockFd[1], STDOUT_FILENO) == -1) {
-			stdLogError(errno, "Could not assign new socket (%d) to stdin/stdout", newSockFd[1]);
-			exit(255);
+		// close this for good meausre
+		close(sockFd[PARENT_SOCKET]);
+		if (sockFd[CHILD_SOCKET] == RAP_CONTROL_SOCKET) {
+			// If by some chance this socket has opened as pre-defined RAP_CONTROL_SOCKET we
+			// wont dup2 but we do need to remove the close-on-exec flag
+			int flags = fcntl(sockFd[CHILD_SOCKET], F_GETFD);
+			if (fcntl(sockFd[CHILD_SOCKET], F_SETFD, flags & ~FD_CLOEXEC) == -1) {
+				stdLogError(errno, "Could not clear close-on-exec for control socket", sockFd[CHILD_SOCKET],
+						(int) RAP_CONTROL_SOCKET);
+				exit(255);
+			}
+		} else {
+			// Assign the control socket to the correct FD so the RAP can use it
+			// This previously abused STD_IN and STD_OUT for this but instead we now
+			// reserve a different FD (3) AKA RAP_CONTROL_SOCKET
+			if (dup2(sockFd[CHILD_SOCKET], RAP_CONTROL_SOCKET) == -1) {
+				stdLogError(errno, "Could not assign new socket (%d) to %d", newSockFd[1], (int) RAP_CONTROL_SOCKET);
+				exit(255);
+			}
 		}
+
 		char * argv[] =
 				{ (char *) config.rapBinary, (char *) config.pamServiceName, (char *) config.mimeTypesFile, NULL };
 		execv(path, argv);

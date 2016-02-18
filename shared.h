@@ -6,6 +6,8 @@
 #include <stdarg.h>
 #include <libxml/xmlreader.h>
 
+#define RAP_CONTROL_SOCKET 3
+
 enum RapConstant {
 	RAP_AUTHENTICATE = 1,
 	RAP_READ_FILE,
@@ -38,6 +40,9 @@ enum RapConstant {
 
 #define PIPE_READ      0
 #define PIPE_WRITE     1
+
+#define PARENT_SOCKET 0
+#define CHILD_SOCKET  1
 
 #define WEBDAV_NAMESPACE "DAV:"
 
