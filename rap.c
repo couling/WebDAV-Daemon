@@ -480,6 +480,7 @@ static int respondToPropFind(const char * file, const char * host, PropertySet *
 				}
 			}
 		}
+		closedir(dir);
 		free(childFileName);
 	}
 	xmlTextWriterEndElement(writer);
