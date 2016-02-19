@@ -1018,7 +1018,6 @@ static int processNewRequest(Request * request, const char * url, const char * h
 	message.params[RAP_HOST_INDEX].iov_base = (void *) host;
 	message.params[RAP_FILE_INDEX].iov_len = strlen(url) + 1;
 	message.params[RAP_FILE_INDEX].iov_base = (void *) url;
-	// TODO PROPPATCH
 	// TODO MKCOL
 	// TODO HEAD
 	// TODO DELETE
@@ -1035,6 +1034,17 @@ static int processNewRequest(Request * request, const char * url, const char * h
 		message.bufferCount = 2;
 	} else if (!strcmp("PROPFIND", method)) {
 		message.mID = RAP_PROPFIND;
+		const char * depth = getHeader(request, "Depth");
+		if (depth) {
+			message.params[RAP_DEPTH_INDEX].iov_base = (void *) depth;
+			message.params[RAP_DEPTH_INDEX].iov_len = strlen(depth) + 1;
+		} else {
+			message.params[RAP_DEPTH_INDEX].iov_base = "infinity";
+			message.params[RAP_DEPTH_INDEX].iov_len = sizeof("infinity");
+		}
+		message.bufferCount = 3;
+	} else if (!strcmp("PROPPATCH", method)) {
+		message.mID = RAP_PROPPATCH;
 		const char * depth = getHeader(request, "Depth");
 		if (depth) {
 			message.params[RAP_DEPTH_INDEX].iov_base = (void *) depth;
@@ -1171,11 +1181,11 @@ static int answerToRequest(void *cls, Request *request, const char *url, const c
 				}
 				(*rapSession)->readDataFd = pipeEnds[PIPE_READ];
 				(*rapSession)->writeDataFd = pipeEnds[PIPE_WRITE];
-				Response * response;
 
+				Response * response;
 				int statusCode = processNewRequest(request, url, host, method, *rapSession, &response);
 
-				if (statusCode == MHD_HTTP_CONTINUE) {
+				if (statusCode == RAP_CONTINUE) {
 					// do not queue a response for contiune
 					(*rapSession)->responseAlreadyGiven = 0;
 					//logAccess(statusCode, method, (*rapSession)->user, url);
@@ -1191,7 +1201,7 @@ static int answerToRequest(void *cls, Request *request, const char *url, const c
 
 				int statusCode = processNewRequest(request, url, host, method, *rapSession, &response);
 
-				if (statusCode == MHD_HTTP_CONTINUE) {
+				if (statusCode == RAP_CONTINUE) {
 					stdLogError(0, "RAP returned CONTINUE when there is no data");
 					int ret = sendResponse(request, MHD_HTTP_INTERNAL_SERVER_ERROR, NULL, *rapSession, method, url);
 					releaseRap(*rapSession);

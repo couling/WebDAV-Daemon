@@ -13,6 +13,7 @@ enum RapConstant {
 	RAP_READ_FILE,
 	RAP_WRITE_FILE,
 	RAP_PROPFIND,
+	RAP_PROPPATCH,
 
 	RAP_SUCCESS = 200,
 	RAP_MULTISTATUS = 207,
@@ -45,6 +46,7 @@ enum RapConstant {
 #define CHILD_SOCKET  1
 
 #define WEBDAV_NAMESPACE "DAV:"
+#define MICROSOFT_NAMESPACE "urn:schemas-microsoft-com:"
 
 void * mallocSafe(size_t size);
 void * reallocSafe(void * mem, size_t newSize);

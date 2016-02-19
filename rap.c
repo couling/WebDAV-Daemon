@@ -37,7 +37,7 @@ static MimeType UNKNOWN_MIME_TYPE = { .fileExtension = "", .type = "application/
 static MimeType XML_MIME_TYPE = { .fileExtension = "", .type = "application/xml; charset=utf-8", .typeStringSize =
 		sizeof("application/xml; charset=utf-8") };
 
-static size_t respond(enum RapConstant result, int fd) {
+static ssize_t respond(enum RapConstant result, int fd) {
 	Message message = { .mID = result, .fd = fd, .bufferCount = 0 };
 	return sendMessage(RAP_CONTROL_SOCKET, &message);
 }
@@ -222,6 +222,7 @@ static int xmlTextWriterWriteElementString(xmlTextWriterPtr writer, const char *
 #define PROPFIND_USED_BYTES "quota-used-bytes"
 #define PROPFIND_AVAILABLE_BYTES "quota-available-bytes"
 #define PROPFIND_ETAG "getetag"
+#define PROPFIND_WINDOWS_ATTRIBUTES "Win32FileAttributes"
 
 typedef struct PropertySet {
 	char creationDate;
@@ -233,6 +234,7 @@ typedef struct PropertySet {
 	char resourceType;
 	char usedBytes;
 	char availableBytes;
+	char windowsHidden;
 } PropertySet;
 
 static int parsePropFind(int fd, PropertySet * properties) {
@@ -295,6 +297,12 @@ static int parsePropFind(int fd, PropertySet * properties) {
 				properties->etag = 1;
 			}
 		}
+		else if (!strcmp(xmlTextReaderConstNamespaceUri(reader), MICROSOFT_NAMESPACE)) {
+			const char * nodeName = xmlTextReaderConstLocalName(reader);
+			if (!strcmp(nodeName, PROPFIND_WINDOWS_ATTRIBUTES)) {
+				properties->windowsHidden = 1;
+			}
+		}
 		stepOver(reader);
 	}
 
@@ -324,7 +332,7 @@ static void writePropFindResponsePart(const char * fileName, const char * displa
 
 	if (properties->etag) {
 		char buffer[200];
-		snprintf(buffer, sizeof(buffer), "\"%zd-%lld\"", fileStat->st_size, (long long) fileStat->st_mtime);
+		snprintf(buffer, sizeof(buffer), "\"%lld-%lld\"", (long long) fileStat->st_size, (long long) fileStat->st_mtime);
 		xmlTextWriterWriteElementString(writer, "d", PROPFIND_ETAG, buffer);
 	}
 	if (properties->creationDate) {
@@ -362,7 +370,8 @@ static void writePropFindResponsePart(const char * fileName, const char * displa
 					xmlTextWriterWriteElementString(writer, "d", PROPFIND_USED_BYTES, buffer);
 				}
 			}
-		} else if (properties->usedBytes) {
+		} 
+		if (properties->usedBytes) {
 			struct statvfs fsStat;
 			if (!statvfs(fileName, &fsStat)) {
 				char buffer[100];
@@ -371,15 +380,22 @@ static void writePropFindResponsePart(const char * fileName, const char * displa
 				xmlTextWriterWriteElementString(writer, "d", PROPFIND_USED_BYTES, buffer);
 			}
 		}
+		if (properties->windowsHidden) {
+			xmlTextWriterWriteElementString(writer, "z", PROPFIND_WINDOWS_ATTRIBUTES, displayName[0] == '.' ? "00000012" : "00000010");
+		}
 	} else {
 		if (properties->contentLength) {
 			char buffer[100];
-			snprintf(buffer, sizeof(buffer), "%zd", fileStat->st_size);
+			snprintf(buffer, sizeof(buffer), "%lld", (long long) fileStat->st_size);
 			xmlTextWriterWriteElementString(writer, "d", PROPFIND_CONTENT_LENGTH, buffer);
 		}
 		if (properties->contentType) {
 			xmlTextWriterWriteElementString(writer, "d", PROPFIND_CONTENT_TYPE, findMimeType(fileName)->type);
 		}
+		if (properties->windowsHidden) {
+			xmlTextWriterWriteElementString(writer, "z", PROPFIND_WINDOWS_ATTRIBUTES, displayName[0] == '.' ? "00000022" : "00000020");
+		}
+
 	}
 	xmlTextWriterEndElement(writer);
 	xmlTextWriterWriteElementString(writer, "d", "status", "HTTP/1.1 200 OK");
@@ -428,7 +444,7 @@ static int respondToPropFind(const char * file, const char * host, PropertySet *
 	message.params[RAP_MIME_INDEX].iov_len = XML_MIME_TYPE.typeStringSize;
 	message.params[RAP_LOCATION_INDEX].iov_base = filePath;
 	message.params[RAP_LOCATION_INDEX].iov_len = filePathSize + 1;
-	size_t messageResult = sendMessage(RAP_CONTROL_SOCKET, &message);
+	ssize_t messageResult = sendMessage(RAP_CONTROL_SOCKET, &message);
 	if (messageResult <= 0) {
 		free(filePath);
 		close(pipeEnds[PIPE_WRITE]);
@@ -440,6 +456,7 @@ static int respondToPropFind(const char * file, const char * host, PropertySet *
 	DIR * dir;
 	xmlTextWriterStartDocument(writer, "1.0", "utf-8", NULL);
 	xmlTextWriterStartElementNS(writer, "d", "multistatus", WEBDAV_NAMESPACE);
+    xmlTextWriterWriteAttribute(writer,	"xmlns:z", MICROSOFT_NAMESPACE);
 	writePropFindResponsePart(filePath, displayName, properties, &fileStat, writer);
 	if (depth > 1 && (fileStat.st_mode & S_IFMT) == S_IFDIR && (dir = opendir(filePath))) {
 		struct dirent * dp;
@@ -472,7 +489,7 @@ static int respondToPropFind(const char * file, const char * host, PropertySet *
 
 }
 
-static size_t propfind(Message * requestMessage) {
+static ssize_t propfind(Message * requestMessage) {
 	if (!authenticated || requestMessage->bufferCount != 3) {
 		if (!authenticated) {
 			stdLogError(0, "Not authenticated RAP");
@@ -507,11 +524,35 @@ static size_t propfind(Message * requestMessage) {
 // End PROPFIND //
 //////////////////
 
+///////////////
+// PROPPATCH //
+///////////////
+
+static ssize_t proppatch(Message * requestMessage) {
+	if (requestMessage->fd != -1) {
+		respond(RAP_CONTINUE, -1);
+		char buffer[BUFFER_SIZE];
+		ssize_t bytesRead;
+		while ((bytesRead = read(requestMessage->fd, buffer, sizeof(buffer))) > 0) {
+			ssize_t __attribute__ ((unused)) ignored = write(STDERR_FILENO, buffer, bytesRead);
+		}
+		char c = '\n';
+		ssize_t __attribute__ ((unused)) ignored = write(STDOUT_FILENO, &c, 1);
+		close(requestMessage->fd);
+
+	}
+	return respond(RAP_SUCCESS, -1);
+}
+
+///////////////////
+// End PROPPATCH //
+///////////////////
+
 /////////
 // PUT //
 /////////
 
-static size_t writeFile(Message * requestMessage) {
+static ssize_t writeFile(Message * requestMessage) {
 	if (requestMessage->fd == -1) {
 		stdLogError(0, "write file request sent without incoming data!");
 		return respond(RAP_INTERNAL_ERROR, -1);
@@ -619,7 +660,7 @@ static void listDir(const char * file, int dirFd, int writeFd) {
 	closedir(dir);
 }
 
-static size_t readFile(Message * requestMessage) {
+static ssize_t readFile(Message * requestMessage) {
 	if (requestMessage->fd != -1) {
 		stdLogError(0, "read file request sent incoming data!");
 		close(requestMessage->fd);
@@ -668,7 +709,7 @@ static size_t readFile(Message * requestMessage) {
 			message.params[RAP_MIME_INDEX].iov_base = "text/html";
 			message.params[RAP_MIME_INDEX].iov_len = sizeof("text/html");
 			message.params[RAP_LOCATION_INDEX] = requestMessage->params[RAP_FILE_INDEX];
-			size_t messageResult = sendMessage(RAP_CONTROL_SOCKET, &message);
+			ssize_t messageResult = sendMessage(RAP_CONTROL_SOCKET, &message);
 			if (messageResult <= 0) {
 				close(fd);
 				close(pipeEnds[PIPE_WRITE]);
@@ -770,7 +811,7 @@ static int pamAuthenticate(const char * user, const char * password, const char 
 	return 1;
 }
 
-static size_t authenticate(Message * message) {
+static ssize_t authenticate(Message * message) {
 	if (message->fd != -1) {
 		stdLogError(0, "authenticate request send incoming data!");
 		close(message->fd);
@@ -801,7 +842,7 @@ static size_t authenticate(Message * message) {
 //////////////////////
 
 int main(int argCount, char * args[]) {
-	size_t ioResult;
+	ssize_t ioResult;
 	Message message;
 	char incomingBuffer[INCOMING_BUFFER_SIZE];
 	if (argCount > 1) {
@@ -835,6 +876,9 @@ int main(int argCount, char * args[]) {
 			break;
 		case RAP_PROPFIND:
 			ioResult = propfind(&message);
+			break;
+		case RAP_PROPPATCH:
+			ioResult = proppatch(&message);
 			break;
 		default:
 			stdLogError(0, "Invalid rap request id %d", message.mID);

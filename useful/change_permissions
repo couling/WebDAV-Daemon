@@ -1,5 +1,0 @@
-#!/bin/bash
-# build/webdavd
-chown root:root build/rap build/webdavd
-chmod o+rx build/rap
-chmod ug+s build/rap

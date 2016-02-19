@@ -4,7 +4,6 @@
 		<listen>
 			<port>80</port>
 			<encryption>none</encryption>
-			<forward-to><port>443</port></forward-to>
 		</listen>
 		<listen>
 			<port>443</port>
