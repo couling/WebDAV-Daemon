@@ -162,9 +162,9 @@ ssize_t recvMessage(int sock, Message * message, char * incomingBuffer, size_t i
 	// this is there to stop random EINTR failures. never yet found out what cause them
 	// but this seems to fix them.
 	if (size < 0 && errno == EINTR) {
-		stdLogError(0, "Could not receive socket message intr %d %zd ... retry", sock, size);
 		int retryCount = 20;
 		do {
+			stdLogError(EINTR, "Could not receive socket message intr %d %zd ... retry", sock, size);
 			retryCount--;
 			size = recvmsg(sock, &msg, MSG_CMSG_CLOEXEC);
 		} while (size < 0 && errno == EINTR && retryCount > 0);
@@ -350,7 +350,7 @@ const char * nodeTypeToName(int nodeType) {
 }
 
 char * loadFileToBuffer(const char * file, size_t * size) {
-	int fd = open(file, O_RDONLY);
+	int fd = open(file, O_RDONLY | O_CLOEXEC);
 	struct stat stat;
 	if (fd == -1 || fstat(fd, &stat)) {
 		stdLogError(errno, "Could not open file %s", file);

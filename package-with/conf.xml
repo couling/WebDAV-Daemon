@@ -7,7 +7,7 @@
 
 		<!-- Each listen port opens an individual listening daemon. There is no 
 			default port. Default host "any ip". Default encryption is "none". The following 
-			will listening on localhost only and be unencrypted -->
+			will listening on all ips and be unencrypted -->
 
 		<listen>
 
@@ -60,11 +60,6 @@
 			Supports format: [[[hours:]minutes:]seconds] -->
 		<session-timeout>5:00</session-timeout>
 
-		<!-- Max rap sessions per user keep this low (eg 10). Multiple connections 
-			can share a sessoion. More than one session will only be required if more 
-			than one concurrent request is sent -->
-		<max-user-sessions>10</max-user-sessions>
-
 		<!-- Not yet supported until multiple servers is implemeted (see <server> 
 			above). Planned to setup a lockdown on the main session -->
 		<restricted>nobody</restricted>
@@ -77,6 +72,10 @@
 			where binaries are not stored in /usr/sbin this will need to be changed to 
 			the location of "webdav-rap" -->
 		<rap-binary>/usr/sbin/webdav-rap</rap-binary>
+
+		<!-- If a RAP hangs the thread waiting on it will wait this long before 
+			giving up -->
+		<rap-timeout>120</rap-timeout>
 
 		<!-- The service name for PAM. This corresponds to a file of the same name 
 			in /etc/pam.d/ on linux systems. default webdavd -->
@@ -113,10 +112,8 @@
 			<!-- The key for <certificate> -->
 			<key>/etc/ssl/private/server.key</key>
 		</ssl-cert>
-		
+
 		<!-- As required.... -->
-		<!-- <ssl-cert>
-			...
-		</ssl-cert> -->
+		<!-- <ssl-cert> ... </ssl-cert> -->
 	</server>
 </server-config>

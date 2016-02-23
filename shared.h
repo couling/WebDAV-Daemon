@@ -39,8 +39,8 @@ enum RapConstant {
 #define RAP_MIME_INDEX     1
 #define RAP_LOCATION_INDEX 2
 
-#define PIPE_READ      0
-#define PIPE_WRITE     1
+#define PIPE_READ     0
+#define PIPE_WRITE    1
 
 #define PARENT_SOCKET 0
 #define CHILD_SOCKET  1

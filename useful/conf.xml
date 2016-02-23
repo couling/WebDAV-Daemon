@@ -9,10 +9,8 @@
 			<port>443</port>
 			<encryption>ssl</encryption>
 		</listen>
-		<session-timeout>1:00</session-timeout>
 		<rap-binary>build/rap</rap-binary>
 		<static-response-dir>package-with/share</static-response-dir>
-		<max-user-sessions/>
 		<ssl-cert>
 			<certificate>/etc/ssl/certs/local/server.crt</certificate>
 			<key>/etc/ssl/private/server.key</key>

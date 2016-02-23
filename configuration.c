@@ -8,6 +8,31 @@
 // Handler Functions //
 ///////////////////////
 
+static int readConfigInt(xmlTextReaderPtr reader, int * value, const char * configFile) {
+	const char * nodeName = xmlTextReaderConstLocalName(reader);
+	const char * valueString;
+	int result = stepOverText(reader, &valueString);
+	if (valueString) {
+		char * endPtr;
+		long int tmp = strtol(valueString, &endPtr, 10);
+		if (*endPtr || tmp < 0 || tmp > 0xFFFFFFF) {
+			stdLogError(0, "Invalid %s value %s - should be numeric in %s", nodeName, tmp, configFile);
+			exit(1);
+		}
+		*value = tmp;
+		xmlFree((char *) valueString);
+	}
+	return result;
+}
+
+static int readConfigString(xmlTextReaderPtr reader, const char ** value) {
+	if (*value) {
+		xmlFree((char *) *value);
+		*value = NULL;
+	}
+	return stepOverText(reader, value);
+}
+
 static int configListen(WebdavdConfiguration * config, xmlTextReaderPtr reader, const char * configFile) {
 	//<listen><port>80</port><host>localhost</host><encryption>disabled</encryption></listen>
 	int index = config->daemonCount++;
@@ -19,29 +44,9 @@ static int configListen(WebdavdConfiguration * config, xmlTextReaderPtr reader, 
 		if (xmlTextReaderNodeType(reader) == XML_READER_TYPE_ELEMENT && !strcmp(xmlTextReaderConstNamespaceUri(reader),
 		CONFIG_NAMESPACE)) {
 			if (!strcmp(xmlTextReaderConstLocalName(reader), "port")) {
-				if (config->daemons[index].port) {
-					stdLogError(0, "port specified for listen more than once int %s", configFile);
-					exit(1);
-				}
-				const char * portString;
-				result = stepOverText(reader, &portString);
-				if (portString != NULL) {
-					char * endP;
-					long int parsedPort = strtol(portString, &endP, 10);
-					if (!*endP && parsedPort > 0 && parsedPort <= 0xFFFF) {
-						config->daemons[index].port = parsedPort;
-					} else {
-						stdLogError(0, "%s is not a valid port in %s", portString, configFile);
-						exit(1);
-					}
-					xmlFree((char *) portString);
-				}
+				result = readConfigInt(reader, &config->daemons[index].port, configFile);
 			} else if (!strcmp(xmlTextReaderConstLocalName(reader), "host")) {
-				if (config->daemons[index].host != NULL) {
-					stdLogError(0, "host specified for listen more than once int %s", configFile);
-					exit(1);
-				}
-				result = stepOverText(reader, &config->daemons[index].host);
+				result = readConfigString(reader, &config->daemons[index].host);
 			} else if (!strcmp(xmlTextReaderConstLocalName(reader), "encryption")) {
 				const char * encryptionString;
 				result = stepOverText(reader, &encryptionString);
@@ -64,26 +69,9 @@ static int configListen(WebdavdConfiguration * config, xmlTextReaderPtr reader, 
 					if (xmlTextReaderNodeType(reader) == XML_READER_TYPE_ELEMENT
 							&& !strcmp(xmlTextReaderConstNamespaceUri(reader), CONFIG_NAMESPACE)) {
 						if (!strcmp(xmlTextReaderConstLocalName(reader), "host")) {
-							if (config->daemons[index].forwardToHost) {
-								stdLogError(0, "forward-to host specified for listen more than once int %s",
-										configFile);
-								exit(1);
-							}
-							result = stepOverText(reader, &config->daemons[index].forwardToHost);
+							result = readConfigString(reader, &config->daemons[index].forwardToHost);
 						} else if (!strcmp(xmlTextReaderConstLocalName(reader), "port")) {
-							const char * portString;
-							result = stepOverText(reader, &portString);
-							if (portString != NULL) {
-								char * endP;
-								long int parsedPort = strtol(portString, &endP, 10);
-								if (!*endP && parsedPort > 0 && parsedPort <= 0xFFFF) {
-									config->daemons[index].forwardToPort = parsedPort;
-								} else {
-									stdLogError(0, "%s is not a valid forward-to in %s", portString, configFile);
-									exit(1);
-								}
-								xmlFree((char *) portString);
-							}
+							result = readConfigInt(reader, &config->daemons[index].forwardToPort, configFile);
 						} else if (!strcmp(xmlTextReaderConstLocalName(reader), "encryption")) {
 							const char * encryptionString;
 							result = stepOverText(reader, &encryptionString);
@@ -162,90 +150,42 @@ static int configSessionTimeout(WebdavdConfiguration * config, xmlTextReaderPtr 
 	return result;
 }
 
-static int configMaxUserSessions(WebdavdConfiguration * config, xmlTextReaderPtr reader, const char * configFile) {
-	// <max-user-sessions>10</max-user-sessions>
-	const char * sessionCountString;
-	int result = stepOverText(reader, &sessionCountString);
-	if (sessionCountString) {
-		char * endPtr;
-		long int maxUserSessions = strtol(sessionCountString, &endPtr, 10);
-		if (*endPtr || maxUserSessions < 0 || maxUserSessions > 0xFFFFFFF) {
-			stdLogError(0, "Invalid max-user-sessions %s in %s", maxUserSessions, configFile);
-			exit(1);
-		}
-		config->rapMaxSessionsPerUser = maxUserSessions;
-		xmlFree((char *) sessionCountString);
-	}
-	return result;
-}
-
 static int configMaxIpConnections(WebdavdConfiguration * config, xmlTextReaderPtr reader, const char * configFile) {
 	// <max-ip-connections>20</max-ip-connections>
-	const char * sessionCountString;
-	int result = stepOverText(reader, &sessionCountString);
-	if (sessionCountString) {
-		char * endPtr;
-		long int maxUserSessions = strtol(sessionCountString, &endPtr, 10);
-		if (*endPtr || maxUserSessions < 0 || maxUserSessions > 0xFFFFFFF) {
-			stdLogError(0, "Invalid max-user-sessions %s in %s", maxUserSessions, configFile);
-			exit(1);
-		}
-		config->rapMaxSessionsPerUser = maxUserSessions;
-		xmlFree((char *) sessionCountString);
-	}
-	return result;
+	return readConfigInt(reader, &config->maxConnectionsPerIp, configFile);
+}
+
+static int configRapTimeout(WebdavdConfiguration * config, xmlTextReaderPtr reader, const char * configFile) {
+	// <rap-timeout>120</rap-timeout>
+	return readConfigInt(reader, &config->rapTimeoutRead, configFile);
 }
 
 static int configRestricted(WebdavdConfiguration * config, xmlTextReaderPtr reader, const char * configFile) {
 	//<restricted>nobody</restricted>
-	if (config->restrictedUser) {
-		stdLogError(0, "restricted-user specified more than once in %s", configFile);
-		exit(1);
-	}
-	return stepOverText(reader, &config->restrictedUser);;
+	return readConfigString(reader, &config->restrictedUser);
 }
 
 static int configMimeFile(WebdavdConfiguration * config, xmlTextReaderPtr reader, const char * configFile) {
 	//<mime-file>/etc/mime.types</mime-file>
-	if (config->mimeTypesFile) {
-		stdLogError(0, "restricted-user specified more than once in %s", configFile);
-		exit(1);
-	}
-	return stepOverText(reader, &config->mimeTypesFile);
+	return readConfigString(reader, &config->mimeTypesFile);
 }
 
 static int configRapBinary(WebdavdConfiguration * config, xmlTextReaderPtr reader, const char * configFile) {
 	//<rap-binary>/usr/sbin/rap</rap-binary>
-	if (config->rapBinary) {
-		stdLogError(0, "restricted-user specified more than once in %s", configFile);
-		exit(1);
-	}
-	return stepOverText(reader, &config->rapBinary);
+	return readConfigString(reader, &config->rapBinary);
 }
 
 static int configPamService(WebdavdConfiguration * config, xmlTextReaderPtr reader, const char * configFile) {
 	//<pam-service>webdavd</pam-service>
-	if (config->pamServiceName) {
-		stdLogError(0, "restricted-user specified more than once in %s", configFile);
-		exit(1);
-	}
-	return stepOverText(reader, &config->pamServiceName);
+	return readConfigString(reader, &config->pamServiceName);
 }
 
 static int configAccessLog(WebdavdConfiguration * config, xmlTextReaderPtr reader, const char * configFile) {
-	if (config->accessLog) {
-		stdLogError(0, "restricted-user specified more than once in %s", configFile);
-		exit(1);
-	}
-	return stepOverText(reader, &config->accessLog);
+	return readConfigString(reader, &config->accessLog);
 }
 
 static int configErrorLog(WebdavdConfiguration * config, xmlTextReaderPtr reader, const char * configFile) {
-	if (config->errorLog) {
-		stdLogError(0, "restricted-user specified more than once in %s", configFile);
-		exit(1);
-	}
-	return stepOverText(reader, &config->errorLog);
+	return readConfigString(reader, &config->errorLog);
 }
 
 //<ssl-cert>...</ssl-cert>
@@ -262,17 +202,9 @@ static int configConfigSSLCert(WebdavdConfiguration * config, xmlTextReaderPtr r
 		if (xmlTextReaderNodeType(reader) == XML_READER_TYPE_ELEMENT && !strcmp(xmlTextReaderConstNamespaceUri(reader),
 		CONFIG_NAMESPACE)) {
 			if (!strcmp(xmlTextReaderConstLocalName(reader), "certificate")) {
-				if (config->sslCerts[index].certificateFile) {
-					stdLogError(0, "more than one certificate specified in ssl-cert %s", configFile);
-					exit(1);
-				}
-				result = stepOverText(reader, &config->sslCerts[index].certificateFile);
+				result = readConfigString(reader, &config->sslCerts[index].certificateFile);
 			} else if (!strcmp(xmlTextReaderConstLocalName(reader), "key")) {
-				if (config->sslCerts[index].keyFile) {
-					stdLogError(0, "more than one key specified in ssl-cert %s", configFile);
-					exit(1);
-				}
-				return stepOverText(reader, &config->sslCerts[index].keyFile);
+				result = readConfigString(reader, &config->sslCerts[index].keyFile);
 			} else if (!strcmp(xmlTextReaderConstLocalName(reader), "chain")) {
 				const char * chainFile;
 				result = stepOverText(reader, &chainFile);
@@ -299,9 +231,8 @@ static int configConfigSSLCert(WebdavdConfiguration * config, xmlTextReaderPtr r
 }
 
 static int configResponseDir(WebdavdConfiguration * config, xmlTextReaderPtr reader, const char * configFile) {
-	if (config->errorLog) {
-		stdLogError(0, "restricted-user specified more than once in %s", configFile);
-		exit(1);
+	if (config->staticResponseDir) {
+		xmlFree((char *) config->staticResponseDir);
 	}
 	int result = stepOverText(reader, &config->staticResponseDir);
 	if (config->staticResponseDir) {
@@ -330,10 +261,10 @@ static const ConfigurationFunction configFunctions[] = { { .nodeName = "access-l
 		{ .nodeName = "error-log", .func = &configErrorLog },                  // <error-log />
 		{ .nodeName = "listen", .func = &configListen },                       // <listen />
 		{ .nodeName = "max-ip-connections", .func = &configMaxIpConnections }, //<max-ip-connections />
-		{ .nodeName = "max-user-sessions", .func = &configMaxUserSessions },   // <max-user-sessions />
 		{ .nodeName = "mime-file", .func = &configMimeFile },                  // <mime-file />
 		{ .nodeName = "pam-service", .func = &configPamService },              // <pam-service />
 		{ .nodeName = "rap-binary", .func = &configRapBinary },                // <rap-binary />
+		{ .nodeName = "rap-timeout", .func = &configRapTimeout },              // <rap-timeout />
 		{ .nodeName = "restricted", .func = &configRestricted },               // <restricted />
 		{ .nodeName = "session-timeout", .func = &configSessionTimeout },      // <session-timeout />
 		{ .nodeName = "ssl-cert", .func = &configConfigSSLCert },              // <ssl-cert />
@@ -374,8 +305,8 @@ static int configureServer(WebdavdConfiguration * config, xmlTextReaderPtr reade
 	if (!config->rapMaxSessionLife) {
 		config->rapMaxSessionLife = 60 * 5;
 	}
-	if (!config->rapMaxSessionsPerUser) {
-		config->rapMaxSessionsPerUser = 10;
+	if (!config->rapTimeoutRead) {
+		config->rapTimeoutRead = 120;
 	}
 	if (!config->rapBinary) {
 		config->rapBinary = "/usr/sbin/webdav-rap";

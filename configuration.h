@@ -26,6 +26,7 @@ typedef struct SSLConfig {
 } SSLConfig;
 
 typedef struct WebdavdConfiguration {
+	// TODO restrict to user
 	const char * restrictedUser;
 
 	// Daemons
@@ -35,7 +36,7 @@ typedef struct WebdavdConfiguration {
 
 	// RAP
 	time_t rapMaxSessionLife;
-	int rapMaxSessionsPerUser;
+	int rapTimeoutRead;
 	const char * pamServiceName;
 
 	// files

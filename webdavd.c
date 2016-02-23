@@ -1,6 +1,4 @@
 // TODO auth modes other than basic?
-// TODO correct failure codes on collections
-// TODO protect RAP sessions from DOS attack using a lock per user
 // TODO check into what happens when a connection is closed early during upload.
 
 #include "shared.h"
@@ -36,21 +34,26 @@
 ////////////////
 
 typedef struct RAP {
-	int rapSessionInUse;
-	time_t rapCreated;
+	// Managed by create / destroy RAP
 	int pid;
 	int socketFd;
 	const char * user;
-	int writeDataFd;
-	int readDataFd;
+	const char * password;
+
+	// Managed by RAP DB
+	time_t rapCreated;
+	struct RAP * next;
+	struct RAP ** prevPtr;
+
+	// Managed by Low level handler function
+	int writeDataFd; // Should be closed by uploadComplete()
+	int readDataFd;  // Should be closed by processNewRequest() when sent to the RAP.
 	int responseAlreadyGiven;
 } RAP;
 
-typedef struct RapGroup {
-	const char * user;
-	const char * password;
-	RAP * rapSession;
-} RapGroup;
+typedef struct RAPDB {
+	RAP * firstRapSession;
+} RAPDB;
 
 typedef struct Header {
 	const char * key;
@@ -93,19 +96,13 @@ static const RAP AUTH_FAILED_RAP = { .pid = 0, .socketFd = -1, .user = "<auth fa
 static const RAP AUTH_ERROR_RAP = { .pid = 0, .socketFd = -1, .user = "<auth error>", .writeDataFd = -1, .readDataFd =
 		-1, .responseAlreadyGiven = 1 };
 
-static const RAP AUTH_ERROR_BACKOFF = { .pid = 0, .socketFd = -1, .user = "<backoff>", .writeDataFd = -1, .readDataFd =
-		-1, .responseAlreadyGiven = 1 };
-
 #define AUTH_FAILED (( RAP *)&AUTH_FAILED_RAP)
 #define AUTH_ERROR (( RAP *)&AUTH_ERROR_RAP)
-#define AUTH_BACKOFF (( RAP *)&AUTH_ERROR_BACKOFF)
 
 static int sslCertificateCount;
 static SSLCertificate * sslCertificates = NULL;
 
-static sem_t rapDBLock;
-static int rapDBSize;
-static RapGroup * rapDB;
+pthread_key_t rapDBThreadKey;
 
 WebdavdConfiguration config;
 
@@ -126,7 +123,7 @@ static void logAccess(int statusCode, const char * method, const char * user, co
 static void initializeLogs() {
 	// Error log first
 	if (config.errorLog) {
-		int errorLog = open(config.errorLog, O_CREAT | O_APPEND | O_WRONLY, 420);
+		int errorLog = open(config.errorLog, O_CREAT | O_APPEND | O_WRONLY | O_CLOEXEC, 420);
 		if (errorLog == -1 || dup2(errorLog, STDERR_FILENO) == -1) {
 			stdLogError(errno, "Could not open error log file %s", config.errorLog);
 			exit(1);
@@ -135,7 +132,7 @@ static void initializeLogs() {
 	}
 
 	if (config.accessLog) {
-		int accessLogFd = open(config.accessLog, O_CREAT | O_APPEND | O_WRONLY, 420);
+		int accessLogFd = open(config.accessLog, O_CREAT | O_APPEND | O_WRONLY | O_CLOEXEC, 420);
 		if (accessLogFd == -1 || dup2(accessLogFd, STDOUT_FILENO) == -1) {
 			stdLogError(errno, "Could not open access log file %s", config.accessLog);
 			exit(1);
@@ -245,13 +242,13 @@ static const char * getHeader(Request *request, const char * headerKey) {
 // SSL //
 /////////
 
-int sslCertificateCompareHost(const void * a, const void * b) {
+static int sslCertificateCompareHost(const void * a, const void * b) {
 	SSLCertificate * lhs = (SSLCertificate *) a;
 	SSLCertificate * rhs = (SSLCertificate *) b;
 	return strcmp(lhs->hostname, rhs->hostname);
 }
 
-SSLCertificate * findCertificateForHost(const char * hostname) {
+static SSLCertificate * findCertificateForHost(const char * hostname) {
 	SSLCertificate toFind = { .hostname = hostname };
 	SSLCertificate * found = bsearch(&toFind, sslCertificates, sslCertificateCount, sizeof(*sslCertificates),
 			&sslCertificateCompareHost);
@@ -272,7 +269,7 @@ SSLCertificate * findCertificateForHost(const char * hostname) {
 	return found;
 }
 
-int sslSNICallback(gnutls_session_t session, const gnutls_datum_t* req_ca_dn, int nreqs,
+static int sslSNICallback(gnutls_session_t session, const gnutls_datum_t* req_ca_dn, int nreqs,
 		const gnutls_pk_algorithm_t* pk_algos, int pk_algos_length, gnutls_pcert_st** pcert, unsigned int *pcert_length,
 		gnutls_privkey_t * pkey) {
 
@@ -296,7 +293,7 @@ int sslSNICallback(gnutls_session_t session, const gnutls_datum_t* req_ca_dn, in
 	return 0;
 }
 
-int loadSSLCertificateFile(const char * fileName, gnutls_x509_crt_t * x509Certificate, gnutls_pcert_st * cert) {
+static int loadSSLCertificateFile(const char * fileName, gnutls_x509_crt_t * x509Certificate, gnutls_pcert_st * cert) {
 	size_t fileSize;
 	gnutls_datum_t certData;
 
@@ -329,7 +326,7 @@ int loadSSLCertificateFile(const char * fileName, gnutls_x509_crt_t * x509Certif
 	return ret;
 }
 
-int loadSSLKeyFile(const char * fileName, gnutls_privkey_t * key) {
+static int loadSSLKeyFile(const char * fileName, gnutls_privkey_t * key) {
 	size_t fileSize;
 	gnutls_datum_t keyData;
 	keyData.data = loadFileToBuffer(fileName, &fileSize);
@@ -354,7 +351,7 @@ int loadSSLKeyFile(const char * fileName, gnutls_privkey_t * key) {
 	return ret;
 }
 
-int loadSSLCertificate(SSLConfig * sslConfig) {
+static int loadSSLCertificate(SSLConfig * sslConfig) {
 	// Now load the files in earnest
 	SSLCertificate newCertificate;
 	gnutls_x509_crt_t x509Certificate;
@@ -423,7 +420,7 @@ int loadSSLCertificate(SSLConfig * sslConfig) {
 	return 0;
 }
 
-void initializeSSL() {
+static void initializeSSL() {
 	for (int i = 0; i < config.sslCertCount; i++) {
 		if (loadSSLCertificate(&config.sslCerts[i])) {
 			exit(1);
@@ -522,7 +519,7 @@ static Response * createFdFileResponse(off_t offset, size_t size, int fd, const 
 }
 
 static Response * createFileResponse(Request *request, const char * fileName, const char * mimeType) {
-	int fd = open(fileName, O_RDONLY);
+	int fd = open(fileName, O_RDONLY | O_CLOEXEC);
 	if (fd == -1) {
 		stdLogError(errno, "Could not open file for response", fileName);
 		return NULL;
@@ -669,11 +666,7 @@ static int createRapResponse(Request *request, struct Message * message, Respons
 // RAP Processing //
 ////////////////////
 
-// TODO change database to thread based.
-// that will remove the need for locking as well as binding a RAP to a connection
-
 static int forkRapProcess(const char * path, int * newSockFd) {
-	// TODO timeout on socketpair
 	// Create unix domain socket for
 	int sockFd[2];
 	int result = socketpair(PF_LOCAL, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, sockFd);
@@ -682,9 +675,20 @@ static int forkRapProcess(const char * path, int * newSockFd) {
 		return 0;
 	}
 
-	result = fork();
+	// We set this timeout so that a hung RAP will eventually clean itself up
+	struct timeval timeout;
+	timeout.tv_sec = config.rapTimeoutRead;
+	timeout.tv_usec = 0;
+	if (setsockopt(sockFd[PARENT_SOCKET], SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) < 0) {
+		stdLogError(errno, "Could not set timeout");
+		close(sockFd[PARENT_SOCKET]);
+		close(sockFd[CHILD_SOCKET]);
+		return 0;
+	}
 
+	result = fork();
 	if (result) {
+
 		// parent
 		close(sockFd[CHILD_SOCKET]);
 		if (result != -1) {
@@ -698,14 +702,12 @@ static int forkRapProcess(const char * path, int * newSockFd) {
 			return 0;
 		}
 	} else {
+
 		// child
-		// Sort out socket
-		//stdLog("Starting rap: %s", path);
-		// close this for good meausre
 		close(sockFd[PARENT_SOCKET]);
 		if (sockFd[CHILD_SOCKET] == RAP_CONTROL_SOCKET) {
 			// If by some chance this socket has opened as pre-defined RAP_CONTROL_SOCKET we
-			// wont dup2 but we do need to remove the close-on-exec flag
+			// won't dup2 but we do need to remove the close-on-exec flag
 			int flags = fcntl(sockFd[CHILD_SOCKET], F_GETFD);
 			if (fcntl(sockFd[CHILD_SOCKET], F_SETFD, flags & ~FD_CLOEXEC) == -1) {
 				stdLogError(errno, "Could not clear close-on-exec for control socket", sockFd[CHILD_SOCKET],
@@ -725,23 +727,37 @@ static int forkRapProcess(const char * path, int * newSockFd) {
 		char * argv[] =
 				{ (char *) config.rapBinary, (char *) config.pamServiceName, (char *) config.mimeTypesFile, NULL };
 		execv(path, argv);
+
 		stdLogError(errno, "Could not start rap: %s", path);
 		exit(255);
 	}
 }
 
-static void destroyRap(RAP * processor) {
-	close(processor->socketFd);
-	processor->socketFd = -1;
+static void destroyRap(RAP * rapSession) {
+	close(rapSession->socketFd);
+	if (rapSession->readDataFd != -1) {
+		stdLogError(0, "readDataFd was not properly closed before destroying rap");
+		close(rapSession->readDataFd);
+	}
+	if (rapSession->writeDataFd != -1) {
+		stdLogError(0, "writeDataFd was not properly closed before destroying rap");
+		close(rapSession->writeDataFd);
+	}
+
+	free((void *) rapSession->user);
+	free((void *) rapSession->password);
+	*(rapSession->prevPtr) = rapSession->next;
+	free(rapSession);
 }
 
-static RAP * createRap(RAP * processor, const char * user, const char * password, const char * rhost) {
-
-	processor->pid = forkRapProcess(config.rapBinary, &(processor->socketFd));
-	if (!processor->pid) {
+static RAP * createRap(RAPDB * db, const char * user, const char * password, const char * rhost) {
+	int socketFd;
+	int pid = forkRapProcess(config.rapBinary, &socketFd);
+	if (!pid) {
 		return AUTH_ERROR;
 	}
 
+	// Send Auth Request
 	Message message;
 	message.mID = RAP_AUTHENTICATE;
 	message.fd = -1;
@@ -752,16 +768,16 @@ static RAP * createRap(RAP * processor, const char * user, const char * password
 	message.params[RAP_PASSWORD_INDEX].iov_base = (void *) password;
 	message.params[RAP_RHOST_INDEX].iov_len = strlen(rhost) + 1;
 	message.params[RAP_RHOST_INDEX].iov_base = (void *) rhost;
-
-	if (sendMessage(processor->socketFd, &message) <= 0) {
-		destroyRap(processor);
+	if (sendMessage(socketFd, &message) <= 0) {
+		close(socketFd);
 		return AUTH_ERROR;
 	}
 
+	// Read Auth Result
 	char incomingBuffer[INCOMING_BUFFER_SIZE];
-	ssize_t readResult = recvMessage(processor->socketFd, &message, incomingBuffer, INCOMING_BUFFER_SIZE);
+	ssize_t readResult = recvMessage(socketFd, &message, incomingBuffer, INCOMING_BUFFER_SIZE);
 	if (readResult <= 0 || message.mID != RAP_SUCCESS) {
-		destroyRap(processor);
+		close(socketFd);
 		if (readResult < 0) {
 			stdLogError(0, "Could not read result from RAP ");
 			return AUTH_ERROR;
@@ -774,106 +790,24 @@ static RAP * createRap(RAP * processor, const char * user, const char * password
 		}
 	}
 
-	processor->user = user;
-	time(&processor->rapCreated);
+	// If successfully authenticated then populate the RAP structure and add it to the DB
+	RAP * newRap = mallocSafe(sizeof(RAP));
+	newRap->pid = pid;
+	newRap->socketFd = socketFd;
+	newRap->user = copyString(user);
+	newRap->password = copyString(password);
+	time(&newRap->rapCreated);
+	newRap->next = db->firstRapSession;
+	newRap->prevPtr = &db->firstRapSession;
+	newRap->writeDataFd = -1;
+	newRap->readDataFd = -1;
+	// newRap->responseAlreadyGiven // this is set elsewhere
+	db->firstRapSession = newRap;
 
-	return processor;
-}
-
-static int compareRapGroup(const void * rapA, const void * rapB) {
-	int result = strcmp(((RapGroup *) rapA)->user, ((RapGroup *) rapB)->user);
-	if (result == 0) {
-		result = strcmp(((RapGroup *) rapA)->password, ((RapGroup *) rapB)->password);
-	}
-	return result;
-}
-
-static RAP * acquireRapFromDb(const char * user, const char * password, int * activeSessions) {
-	RapGroup groupToFind = { .user = user, .password = password };
-	sem_wait(&rapDBLock);
-	RapGroup *groupFound = bsearch(&groupToFind, rapDB, rapDBSize, sizeof(*rapDB), &compareRapGroup);
-	RAP * rapSessionFound = NULL;
-	*activeSessions = 0;
-	if (groupFound) {
-		time_t expireTime;
-		time(&expireTime);
-		expireTime -= config.rapMaxSessionLife;
-		for (int i = 0; i < config.rapMaxSessionsPerUser; i++) {
-			if (groupFound->rapSession[i].socketFd != -1 && !groupFound->rapSession[i].rapSessionInUse
-					&& groupFound->rapSession[i].rapCreated >= expireTime) {
-				rapSessionFound = &groupFound->rapSession[i];
-				groupFound->rapSession[i].rapSessionInUse = 1;
-				(*activeSessions)++;
-				break;
-			} else if (groupFound->rapSession[i].rapSessionInUse) {
-				(*activeSessions)++;
-			}
-		}
-	}
-	sem_post(&rapDBLock);
-	return rapSessionFound;
-}
-
-RAP * addRapToDb(RAP * rapSession, const char * password) {
-	RAP * newRapSession;
-	RapGroup groupToFind;
-	groupToFind.user = rapSession->user;
-	groupToFind.password = password;
-	sem_wait(&rapDBLock);
-	RapGroup *groupFound = bsearch(&groupToFind, rapDB, rapDBSize, sizeof(*rapDB), &compareRapGroup);
-	if (groupFound) {
-		newRapSession = NULL;
-		time_t expireTime;
-		time(&expireTime);
-		expireTime -= config.rapMaxSessionLife;
-		for (int i = 0; i < config.rapMaxSessionsPerUser; i++) {
-			if (groupFound->rapSession[i].socketFd == -1) {
-				newRapSession = &groupFound->rapSession[i];
-				break;
-			} else if (groupFound->rapSession[i].rapCreated < expireTime
-					&& !groupFound->rapSession[i].rapSessionInUse) {
-				destroyRap(&groupFound->rapSession[i]);
-				newRapSession = &groupFound->rapSession[i];
-			}
-		}
-		if (!newRapSession) {
-			destroyRap(rapSession);
-			sem_post(&rapDBLock);
-			return AUTH_BACKOFF;
-		}
-	} else {
-		rapDBSize++;
-		rapDB = reallocSafe(rapDB, rapDBSize * sizeof(*rapDB));
-		groupFound = &rapDB[rapDBSize - 1];
-		size_t userSize = strlen(groupToFind.user) + 1;
-		size_t passwordSize = strlen(groupToFind.password) + 1;
-		size_t bufferSize = userSize + passwordSize;
-		char * buffer = mallocSafe(bufferSize);
-		memcpy(buffer, groupToFind.user, userSize);
-		memcpy(buffer + userSize, groupToFind.password, passwordSize);
-		groupFound->user = buffer;
-		groupFound->password = buffer + userSize;
-		groupFound->rapSession = mallocSafe(sizeof(*groupFound->rapSession) * config.rapMaxSessionsPerUser);
-		memset(groupFound->rapSession, 0, sizeof(*groupFound->rapSession) * config.rapMaxSessionsPerUser);
-		for (int i = 1; i < config.rapMaxSessionsPerUser; i++) {
-			groupFound->rapSession[i].socketFd = -1;
-		}
-		newRapSession = &groupFound->rapSession[0];
-
-		for (int i = 1; i < config.rapMaxSessionsPerUser; i++) {
-
-		}
-		qsort(rapDB, rapDBSize, sizeof(*rapDB), &compareRapGroup);
-	}
-	*newRapSession = *rapSession;
-	newRapSession->user = groupFound->user;
-	newRapSession->rapSessionInUse = 1;
-	sem_post(&rapDBLock);
-	return newRapSession;
+	return newRap;
 }
 
 static void releaseRap(RAP * processor) {
-	processor->rapSessionInUse = 0;
 }
 
 static RAP * acquireRap(Request *request) {
@@ -881,26 +815,29 @@ static RAP * acquireRap(Request *request) {
 	char * password;
 	user = MHD_basic_auth_get_username_password(request, &password);
 	if (user && password) {
-		int sessionCount;
-		RAP * rapSession = acquireRapFromDb(user, password, &sessionCount);
-		if (rapSession) {
-			return rapSession;
+		RAPDB * rapDB = pthread_getspecific(rapDBThreadKey);
+		if (!rapDB) {
+			rapDB = mallocSafe(sizeof(*rapDB));
+			memset(rapDB, 0, sizeof(*rapDB));
+			pthread_setspecific(rapDBThreadKey, rapDB);
 		} else {
-			if (sessionCount < config.rapMaxSessionsPerUser) {
-				char rhost[100];
-				getRequestIP(rhost, sizeof(rhost), request);
-
-				RAP newSession;
-				rapSession = createRap(&newSession, user, password, rhost);
-				if (rapSession != &newSession) {
-					return rapSession;
+			time_t expires;
+			time(&expires);
+			expires -= config.rapMaxSessionLife;
+			RAP * rap = rapDB->firstRapSession;
+			while (rap) {
+				if (rap->rapCreated < expires) {
+					destroyRap(rap);
+				} else if (!strcmp(user, rap->user) && !strcmp(password, rap->password)) {
+					return rap;
 				} else {
-					return addRapToDb(rapSession, password);
+					rap = rap->next;
 				}
-			} else {
-				return AUTH_BACKOFF;
 			}
 		}
+		char rHost[100];
+		getRequestIP(rHost, sizeof(rHost), request);
+		return createRap(rapDB, user, password, rHost);
 	} else {
 		stdLogError(0, "Rejecting request without auth");
 		return AUTH_FAILED;
@@ -916,25 +853,15 @@ static void cleanupAfterRap(int sig, siginfo_t *siginfo, void *context) {
 	//stdLog("Child finished PID: %d staus: %d", siginfo->si_pid, status);
 }
 
-static void * rapTimeoutWorker(void * ignored) {
-	// TODO actually free() something
-	while (1) {
-		sleep(config.rapMaxSessionLife / 2);
-		time_t expireTime;
-		time(&expireTime);
-		expireTime -= config.rapMaxSessionLife;
-		sem_wait(&rapDBLock);
-		for (int group = 0; group < rapDBSize; group++) {
-			for (int rap = 0; rap < config.rapMaxSessionsPerUser; rap++) {
-				if (!rapDB[group].rapSession[rap].rapSessionInUse && rapDB[group].rapSession[rap].socketFd != -1
-						&& rapDB[group].rapSession[rap].rapCreated < expireTime) {
-					destroyRap(&rapDB[group].rapSession[rap]);
-				}
-			}
+static void deInitializeRapDatabase(void * data) {
+	RAPDB * db = data;
+	if (db) {
+		RAPDB * db = data;
+		while (db->firstRapSession) {
+			destroyRap(db->firstRapSession);
 		}
-		sem_post(&rapDBLock);
+		free(db);
 	}
-	return NULL;
 }
 
 static void initializeRapDatabase() {
@@ -947,25 +874,16 @@ static void initializeRapDatabase() {
 		exit(255);
 	}
 
-	sem_init(&rapDBLock, 0, 1);
-
-	rapDBSize = 0;
-	rapDB = NULL;
-
-	pthread_t newThread;
-	if (pthread_create(&newThread, NULL, &rapTimeoutWorker, NULL)) {
-		stdLogError(errno, "Could not create worker thread for rap db");
-		exit(255);
-	}
+	pthread_key_create(&rapDBThreadKey, &deInitializeRapDatabase);
 }
 
 ////////////////////////
 // End RAP Processing //
 ////////////////////////
 
-///////////////////////////////////////
-// Low Level HTTP handling (Signpost //
-///////////////////////////////////////
+//////////////////////////
+// Main Handler Methods //
+//////////////////////////
 
 static int completeUpload(Request *request, RAP * processor, Response ** response) {
 
@@ -1088,15 +1006,6 @@ static int processNewRequest(Request * request, const char * url, const char * h
 	}
 }
 
-static int requestHasData(Request *request) {
-	if (getHeader(request, "Content-Length")) {
-		return 1;
-	} else {
-		const char * te = getHeader(request, "Transfer-Encoding");
-		return te && !strcmp(te, "chunked");
-	}
-}
-
 static int sendResponse(Request *request, int statusCode, Response * response, RAP * rapSession, const char * method,
 		const char * url) {
 
@@ -1128,6 +1037,23 @@ static int sendResponse(Request *request, int statusCode, Response * response, R
 		MHD_destroy_response(response);
 		return queueResult;
 	}
+	}
+}
+
+//////////////////////////////
+// END Main Handler Methods //
+//////////////////////////////
+
+///////////////////////////////////////
+// Low Level HTTP handling (Signpost //
+///////////////////////////////////////
+
+static int requestHasData(Request *request) {
+	if (getHeader(request, "Content-Length")) {
+		return 1;
+	} else {
+		const char * te = getHeader(request, "Transfer-Encoding");
+		return te && !strcmp(te, "chunked");
 	}
 }
 
@@ -1167,20 +1093,23 @@ static int answerToRequest(void *cls, Request *request, const char *url, const c
 
 		// Authenticate all new requests regardless of anything else
 		*rapSession = acquireRap(request);
-		if (*rapSession == AUTH_FAILED || *rapSession == AUTH_BACKOFF) {
+		if (*rapSession == AUTH_FAILED) {
 			return sendResponse(request, MHD_HTTP_UNAUTHORIZED, NULL, *rapSession, method, url);
 		} else if (*rapSession == AUTH_ERROR) {
 			return sendResponse(request, MHD_HTTP_INTERNAL_SERVER_ERROR, NULL, *rapSession, method, url);
 		} else {
 			if (requestHasData(request)) {
 				// If we have data to send then create a pipe to pump it through
+				// To avoid the "non-standard" pipe2() we use unix domain sockets with socketpair
+				// this let us set it as a close on exec
 				int pipeEnds[2];
-				if (pipe(pipeEnds)) {
+				if (socketpair(PF_LOCAL, SOCK_STREAM | SOCK_CLOEXEC, 0, pipeEnds)) {
 					stdLogError(errno, "Could not create write pipe");
 					return sendResponse(request, MHD_HTTP_INTERNAL_SERVER_ERROR, NULL, *rapSession, method, url);
 				}
-				(*rapSession)->readDataFd = pipeEnds[PIPE_READ];
-				(*rapSession)->writeDataFd = pipeEnds[PIPE_WRITE];
+
+				(*rapSession)->readDataFd = pipeEnds[CHILD_SOCKET];
+				(*rapSession)->writeDataFd = pipeEnds[PARENT_SOCKET];
 
 				Response * response;
 				int statusCode = processNewRequest(request, url, host, method, *rapSession, &response);
@@ -1233,9 +1162,9 @@ static int answerForwardToRequest(void *cls, Request *request, const char *url, 
 	const char * host = daemon->forwardToHost ? daemon->forwardToHost : getHeader(request, "Host");
 	if (!host) {
 		host = daemon->host;
-	}
-	if (!host) {
-		return MHD_queue_response(request, MHD_HTTP_INTERNAL_SERVER_ERROR, INTERNAL_SERVER_ERROR_PAGE);
+		if (!host) {
+			return MHD_queue_response(request, MHD_HTTP_INTERNAL_SERVER_ERROR, INTERNAL_SERVER_ERROR_PAGE);
+		}
 	}
 
 	size_t bufferSize = strlen(host) + strlen(url) + 10;
@@ -1383,6 +1312,7 @@ static void runServer() {
 						MHD_OPTION_SOCK_ADDR, &address,                  // Specifies both host and port
 						MHD_OPTION_PER_IP_CONNECTION_LIMIT, 10,          // max connections per ip
 						MHD_OPTION_HTTPS_CERT_CALLBACK, &sslSNICallback, // enable ssl
+						MHD_OPTION_PER_IP_CONNECTION_LIMIT, config.maxConnectionsPerIp, //
 						MHD_OPTION_END);
 			} else {
 				// http
@@ -1392,6 +1322,7 @@ static void runServer() {
 						callback, &config.daemons[i],                    //
 						MHD_OPTION_SOCK_ADDR, &address,                  // Specifies both host and port
 						MHD_OPTION_PER_IP_CONNECTION_LIMIT, 10,          // max connections per ip
+						MHD_OPTION_PER_IP_CONNECTION_LIMIT, config.maxConnectionsPerIp, //
 						MHD_OPTION_END);
 			}
 			if (!daemons[i]) {
