@@ -2,7 +2,6 @@
 #define WEBDAV_CONFIGURATION_H
 
 #include <time.h>
-#include <libxml/xmlreader.h>
 
 //////////////////////////////////////
 // Webdavd Configuration Structures //
@@ -51,10 +50,7 @@ typedef struct WebdavdConfiguration {
 	SSLConfig * sslCerts;
 } WebdavdConfiguration;
 
-typedef struct ConfigurationFunction {
-	const char * nodeName;
-	int (*func)(WebdavdConfiguration * config, xmlTextReaderPtr reader, const char * configFile);
-} ConfigurationFunction;
+extern WebdavdConfiguration config;
 
 //////////////////////////////////////////
 // End Webdavd Configuration Structures //

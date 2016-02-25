@@ -1,10 +1,8 @@
 #ifndef WEBDAV_SHARED_H
 #define WEBDAV_SHARED_H
 
-#include <stdlib.h>
 #include <sys/socket.h>
 #include <stdarg.h>
-#include <libxml/xmlreader.h>
 
 #define RAP_CONTROL_SOCKET 3
 
@@ -75,15 +73,6 @@ ssize_t recvMessage(int sock, Message * message, char * incomingBuffer, size_t i
 char * messageParamToString(MessageParam * iovec);
 
 int lockToUser(const char * user);
-
-// XML
-void xmlReaderSuppressErrors(xmlTextReaderPtr reader);
-int stepInto(xmlTextReaderPtr reader);
-int stepOver(xmlTextReaderPtr reader);
-int stepOut(xmlTextReaderPtr reader);
-int stepOverText(xmlTextReaderPtr reader, const char ** text);
-int elementMatches(xmlTextReaderPtr reader, const char * namespace, const char * nodeName);
-const char * nodeTypeToName(int nodeType);
 
 char * loadFileToBuffer(const char * file, size_t * size);
 #endif

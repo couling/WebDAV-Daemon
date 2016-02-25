@@ -2,7 +2,11 @@
 
 #include "shared.h"
 
+#include "xml.h"
+
 #include <string.h>
+
+WebdavdConfiguration config;
 
 ///////////////////////
 // Handler Functions //
@@ -28,7 +32,6 @@ static int readConfigInt(xmlTextReaderPtr reader, int * value, const char * conf
 static int readConfigString(xmlTextReaderPtr reader, const char ** value) {
 	if (*value) {
 		xmlFree((char *) *value);
-		*value = NULL;
 	}
 	return stepOverText(reader, value);
 }
@@ -251,6 +254,11 @@ static int configResponseDir(WebdavdConfiguration * config, xmlTextReaderPtr rea
 ///////////////////
 // Configuration //
 ///////////////////
+
+typedef struct ConfigurationFunction {
+	const char * nodeName;
+	int (*func)(WebdavdConfiguration * config, xmlTextReaderPtr reader, const char * configFile);
+} ConfigurationFunction;
 
 static int compareConfigFunction(const void * a, const void * b) {
 	return strcmp(((const ConfigurationFunction *) a)->nodeName, ((const ConfigurationFunction *) b)->nodeName);

@@ -1,6 +1,7 @@
 #include "shared.h"
+#include "xml.h"
 
-#include <stdio.h>
+//#include <stdio.h>
 #include <unistd.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -10,7 +11,6 @@
 #include <sys/statvfs.h>
 #include <dirent.h>
 #include <security/pam_appl.h>
-#include <libxml/xmlwriter.h>
 
 #define BUFFER_SIZE 40960
 
@@ -164,51 +164,6 @@ static void initializeMimeTypes(const char * mimeTypesFile) {
 // End Mime //
 //////////////
 
-/////////////////////
-// XML Text Writer //
-/////////////////////
-
-static int xmlFdOutputCloseCallback(void * context) {
-	close(*((int *) context));
-	free(context);
-	return 0;
-}
-
-static int xmlFdOutputWriteCallback(void * context, const char * buffer, int len) {
-	ssize_t ignored = write(*((int *) context), buffer, len);
-	return ignored;
-}
-
-static xmlTextWriterPtr xmlNewFdTextWriter(int out) {
-	xmlOutputBufferPtr outStruct = xmlAllocOutputBuffer(NULL);
-	outStruct->writecallback = &xmlFdOutputWriteCallback;
-	outStruct->closecallback = &xmlFdOutputCloseCallback;
-	outStruct->context = mallocSafe(sizeof(int));
-	*((int *) outStruct->context) = out;
-	return xmlNewTextWriter(outStruct);
-}
-
-static int xmlTextWriterWriteElementString(xmlTextWriterPtr writer, const char * prefix, const char * elementName,
-		const char * string) {
-	int ret;
-	if (prefix) {
-		if ((ret = xmlTextWriterStartElementNS(writer, prefix, elementName, NULL)) < 0)
-			return ret;
-	} else {
-		if ((ret = xmlTextWriterStartElement(writer, elementName)) < 0)
-			return ret;
-	}
-	if ((ret = xmlTextWriterWriteString(writer, string)) < 0)
-		return ret;
-	if ((ret = xmlTextWriterEndElement(writer)) < 0)
-		return ret;
-	return ret;
-}
-
-/////////////////////////
-// End XML Text Writer //
-/////////////////////////
-
 //////////////
 // PROPFIND //
 //////////////
@@ -296,8 +251,7 @@ static int parsePropFind(int fd, PropertySet * properties) {
 			} else if (!strcmp(nodeName, PROPFIND_ETAG)) {
 				properties->etag = 1;
 			}
-		}
-		else if (!strcmp(xmlTextReaderConstNamespaceUri(reader), MICROSOFT_NAMESPACE)) {
+		} else if (!strcmp(xmlTextReaderConstNamespaceUri(reader), MICROSOFT_NAMESPACE)) {
 			const char * nodeName = xmlTextReaderConstLocalName(reader);
 			if (!strcmp(nodeName, PROPFIND_WINDOWS_ATTRIBUTES)) {
 				properties->windowsHidden = 1;
@@ -326,13 +280,16 @@ static void writePropFindResponsePart(const char * fileName, const char * displa
 		struct stat * fileStat, xmlTextWriterPtr writer) {
 
 	xmlTextWriterStartElementNS(writer, "d", "response", NULL);
-	xmlTextWriterWriteElementString(writer, "d", "href", fileName);
+	xmlTextWriterStartElementNS(writer, "d", "href", NULL);
+	xmlTextWriterWriteURL(writer, fileName);
+	xmlTextWriterStartElementNS(writer, "d", "response", NULL);
 	xmlTextWriterStartElementNS(writer, "d", "propstat", NULL);
 	xmlTextWriterStartElementNS(writer, "d", "prop", NULL);
 
 	if (properties->etag) {
 		char buffer[200];
-		snprintf(buffer, sizeof(buffer), "\"%lld-%lld\"", (long long) fileStat->st_size, (long long) fileStat->st_mtime);
+		snprintf(buffer, sizeof(buffer), "\"%lld-%lld\"", (long long) fileStat->st_size,
+				(long long) fileStat->st_mtime);
 		xmlTextWriterWriteElementString(writer, "d", PROPFIND_ETAG, buffer);
 	}
 	if (properties->creationDate) {
@@ -370,7 +327,7 @@ static void writePropFindResponsePart(const char * fileName, const char * displa
 					xmlTextWriterWriteElementString(writer, "d", PROPFIND_USED_BYTES, buffer);
 				}
 			}
-		} 
+		}
 		if (properties->usedBytes) {
 			struct statvfs fsStat;
 			if (!statvfs(fileName, &fsStat)) {
@@ -381,7 +338,8 @@ static void writePropFindResponsePart(const char * fileName, const char * displa
 			}
 		}
 		if (properties->windowsHidden) {
-			xmlTextWriterWriteElementString(writer, "z", PROPFIND_WINDOWS_ATTRIBUTES, displayName[0] == '.' ? "00000012" : "00000010");
+			xmlTextWriterWriteElementString(writer, "z", PROPFIND_WINDOWS_ATTRIBUTES,
+					displayName[0] == '.' ? "00000012" : "00000010");
 		}
 	} else {
 		if (properties->contentLength) {
@@ -393,7 +351,8 @@ static void writePropFindResponsePart(const char * fileName, const char * displa
 			xmlTextWriterWriteElementString(writer, "d", PROPFIND_CONTENT_TYPE, findMimeType(fileName)->type);
 		}
 		if (properties->windowsHidden) {
-			xmlTextWriterWriteElementString(writer, "z", PROPFIND_WINDOWS_ATTRIBUTES, displayName[0] == '.' ? "00000022" : "00000020");
+			xmlTextWriterWriteElementString(writer, "z", PROPFIND_WINDOWS_ATTRIBUTES,
+					displayName[0] == '.' ? "00000022" : "00000020");
 		}
 
 	}
@@ -456,7 +415,7 @@ static int respondToPropFind(const char * file, const char * host, PropertySet *
 	DIR * dir;
 	xmlTextWriterStartDocument(writer, "1.0", "utf-8", NULL);
 	xmlTextWriterStartElementNS(writer, "d", "multistatus", WEBDAV_NAMESPACE);
-    xmlTextWriterWriteAttribute(writer,	"xmlns:z", MICROSOFT_NAMESPACE);
+	xmlTextWriterWriteAttribute(writer, "xmlns:z", MICROSOFT_NAMESPACE);
 	writePropFindResponsePart(filePath, displayName, properties, &fileStat, writer);
 	if (depth > 1 && (fileStat.st_mode & S_IFMT) == S_IFDIR && (dir = opendir(filePath))) {
 		struct dirent * dp;
@@ -628,6 +587,9 @@ static void listDir(const char * file, int dirFd, int writeFd) {
 	xmlTextWriterStartElement(writer, "body");
 	xmlTextWriterWriteElementString(writer, NULL, "h1", filePath);
 	xmlTextWriterStartElement(writer, "table");
+	xmlTextWriterWriteAttribute(writer, "cellpadding", "5");
+	xmlTextWriterWriteAttribute(writer, "cellspacing", "5");
+	xmlTextWriterWriteAttribute(writer, "border", "1");
 	struct dirent * dp;
 	while ((dp = readdir(dir)) != NULL) {
 		if (dp->d_name[0] != '.') {
@@ -636,12 +598,11 @@ static void listDir(const char * file, int dirFd, int writeFd) {
 			xmlTextWriterStartElement(writer, "td");
 			xmlTextWriterStartElement(writer, "a");
 			xmlTextWriterStartAttribute(writer, "href");
-			xmlTextWriterWriteString(writer, filePath);
-			xmlTextWriterWriteString(writer, dp->d_name);
+			xmlTextWriterWriteURL(writer, filePath);
+			xmlTextWriterWriteURL(writer, dp->d_name);
 			if (dp->d_type == DT_DIR)
 				xmlTextWriterWriteString(writer, "/");
 			xmlTextWriterEndAttribute(writer);
-			xmlTextWriterWriteString(writer, filePath);
 			xmlTextWriterWriteString(writer, dp->d_name);
 			if (dp->d_type == DT_DIR)
 				xmlTextWriterWriteString(writer, "/");

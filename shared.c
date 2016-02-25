@@ -164,7 +164,7 @@ ssize_t recvMessage(int sock, Message * message, char * incomingBuffer, size_t i
 	if (size < 0 && errno == EINTR) {
 		int retryCount = 20;
 		do {
-			stdLogError(EINTR, "Could not receive socket message intr %d %zd ... retry", sock, size);
+			//stdLogError(EINTR, "Could not receive socket message intr %d %zd ... retry", sock, size);
 			retryCount--;
 			size = recvmsg(sock, &msg, MSG_CMSG_CLOEXEC);
 		} while (size < 0 && errno == EINTR && retryCount > 0);
@@ -237,116 +237,14 @@ int lockToUser(const char * user) {
 	return 1;
 }
 
-static void xmlTextNOOPErrorFunction(void * arg, const char * msg, xmlParserSeverities severity,
-		xmlTextReaderLocatorPtr locator) {
-}
-
-void xmlReaderSuppressErrors(xmlTextReaderPtr reader) {
-	xmlTextReaderSetErrorHandler(reader, &xmlTextNOOPErrorFunction, NULL);
-}
-
-int stepInto(xmlTextReaderPtr reader) {
-	// Skip all significant white space
-	int result;
-	do {
-		result = xmlTextReaderRead(reader);
-	} while (result
-			&& (xmlTextReaderNodeType(reader) == XML_READER_TYPE_SIGNIFICANT_WHITESPACE
-					|| xmlTextReaderNodeType(reader) == XML_READER_TYPE_COMMENT
-					|| xmlTextReaderNodeType(reader) == XML_READER_TYPE_END_ELEMENT));
-	return result;
-}
-
-int stepOver(xmlTextReaderPtr reader) {
-	int depth = xmlTextReaderDepth(reader);
-	int result;
-	do {
-		result = xmlTextReaderRead(reader);
-	} while (result && xmlTextReaderDepth(reader) > depth);
-	while (result
-			&& (xmlTextReaderNodeType(reader) == XML_READER_TYPE_SIGNIFICANT_WHITESPACE
-					|| xmlTextReaderNodeType(reader) == XML_READER_TYPE_COMMENT
-					|| xmlTextReaderNodeType(reader) == XML_READER_TYPE_END_ELEMENT)) {
-		result = xmlTextReaderRead(reader);
-	}
-	return result;
-}
-
-int stepOut(xmlTextReaderPtr reader) {
-	int depth = xmlTextReaderDepth(reader) - 1;
-	int result;
-	do {
-		result = xmlTextReaderRead(reader);
-	} while (result && xmlTextReaderDepth(reader) > depth);
-	while (result
-			&& (xmlTextReaderNodeType(reader) == XML_READER_TYPE_SIGNIFICANT_WHITESPACE
-					|| xmlTextReaderNodeType(reader) == XML_READER_TYPE_COMMENT
-					|| xmlTextReaderNodeType(reader) == XML_READER_TYPE_END_ELEMENT)) {
-		result = xmlTextReaderRead(reader);
-	}
-	return result;
-}
-
-int stepOverText(xmlTextReaderPtr reader, const char ** text) {
-	int depth = xmlTextReaderDepth(reader);
-	int result = stepInto(reader);
-	*text = NULL;
-	if (result && xmlTextReaderDepth(reader) > depth) {
-		if (xmlTextReaderNodeType(reader) == XML_READER_TYPE_TEXT) {
-			*text = xmlTextReaderValue(reader);
-		}
-		result = stepOut(reader);
-	}
-	return result;
-}
-
-int elementMatches(xmlTextReaderPtr reader, const char * namespace, const char * nodeName) {
-	return xmlTextReaderNodeType(reader) == XML_READER_TYPE_ELEMENT
-			&& !strcmp(xmlTextReaderConstNamespaceUri(reader), namespace)
-			&& !strcmp(xmlTextReaderConstLocalName(reader), nodeName);
-}
-
-const char * nodeTypeToName(int nodeType) {
-	switch (nodeType) {
-	case XML_READER_TYPE_NONE:
-		return "XML_READER_TYPE_NONE";
-	case XML_READER_TYPE_ELEMENT:
-		return "XML_READER_TYPE_ELEMENT";
-	case XML_READER_TYPE_ATTRIBUTE:
-		return "XML_READER_TYPE_ATTRIBUTE";
-	case XML_READER_TYPE_TEXT:
-		return "XML_READER_TYPE_TEXT";
-	case XML_READER_TYPE_CDATA:
-		return "XML_READER_TYPE_CDATA";
-	case XML_READER_TYPE_ENTITY_REFERENCE:
-		return "XML_READER_TYPE_ENTITY_REFERENCE";
-	case XML_READER_TYPE_ENTITY:
-		return "XML_READER_TYPE_ENTITY";
-	case XML_READER_TYPE_PROCESSING_INSTRUCTION:
-		return "XML_READER_TYPE_PROCESSING_INSTRUCTION";
-	case XML_READER_TYPE_COMMENT:
-		return "XML_READER_TYPE_COMMENT";
-	case XML_READER_TYPE_DOCUMENT:
-		return "XML_READER_TYPE_DOCUMENT";
-	case XML_READER_TYPE_DOCUMENT_TYPE:
-		return "XML_READER_TYPE_DOCUMENT_TYPE";
-	case XML_READER_TYPE_DOCUMENT_FRAGMENT:
-		return "XML_READER_TYPE_DOCUMENT_FRAGMENT";
-	case XML_READER_TYPE_NOTATION:
-		return "XML_READER_TYPE_NOTATION";
-	case XML_READER_TYPE_WHITESPACE:
-		return "XML_READER_TYPE_WHITESPACE";
-	case XML_READER_TYPE_SIGNIFICANT_WHITESPACE:
-		return "XML_READER_TYPE_SIGNIFICANT_WHITESPACE";
-	case XML_READER_TYPE_END_ELEMENT:
-		return "XML_READER_TYPE_END_ELEMENT";
-	case XML_READER_TYPE_END_ENTITY:
-		return "XML_READER_TYPE_END_ENTITY";
-	case XML_READER_TYPE_XML_DECLARATION:
-		return "XML_READER_TYPE_XML_DECLARATION";
-	default:
+char * copyString(const char * string) {
+	if (!string) {
 		return NULL;
 	}
+	size_t stringSize = strlen(string) + 1;
+	char * newString = mallocSafe(stringSize);
+	memcpy(newString, string, stringSize);
+	return newString;
 }
 
 char * loadFileToBuffer(const char * file, size_t * size) {
@@ -375,15 +273,5 @@ char * loadFileToBuffer(const char * file, size_t * size) {
 	*size = stat.st_size;
 	close(fd);
 	return buffer;
-}
-
-char * copyString(const char * string) {
-	if (!string) {
-		return NULL;
-	}
-	size_t stringSize = strlen(string) + 1;
-	char * newString = mallocSafe(stringSize);
-	memcpy(newString, string, stringSize);
-	return newString;
 }
 
