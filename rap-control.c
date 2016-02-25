@@ -98,7 +98,10 @@ static int forkRapProcess(const char * path, int * newSockFd) {
 	}
 }
 
-static void destroyRap(RAP * rapSession) {
+void destroyRap(RAP * rapSession) {
+	if (!AUTH_SUCCESS(rapSession)) {
+		return;
+	}
 	close(rapSession->socketFd);
 	if (rapSession->readDataFd != -1) {
 		stdLogError(0, "readDataFd was not properly closed before destroying rap");

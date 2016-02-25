@@ -27,11 +27,14 @@ extern const RAP AUTH_FAILED_RAP;
 // Used as a place holder for failed auth requests which failed due to errors
 extern const RAP AUTH_ERROR_RAP;
 
-#define AUTH_FAILED (( RAP *)&AUTH_FAILED_RAP)
-#define AUTH_ERROR (( RAP *)&AUTH_ERROR_RAP)
+#define AUTH_FAILED ( ( RAP *) &AUTH_FAILED_RAP )
+#define AUTH_ERROR ( ( RAP *) &AUTH_ERROR_RAP )
+
+#define AUTH_SUCCESS(rap) (rap != AUTH_FAILED && rap != AUTH_ERROR)
 
 void initializeRapDatabase();
 RAP * acquireRap(const char * user, const char * password, const char * clientIp);
 void releaseRap(RAP * processor);
+void destroyRap(RAP * rapSession);
 
 #endif

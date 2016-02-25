@@ -795,27 +795,32 @@ static int requestHasData(Request *request) {
 static int answerToRequest(void *cls, Request *request, const char *url, const char *method, const char *version,
 		const char *upload_data, size_t *upload_data_size, void ** s) {
 
-	RAP ** rapSession = (RAP **) s;
+	RAP * rapSession = *((RAP **) s);
 
-	if (*rapSession) {
+	if (rapSession) {
 		if (*upload_data_size) {
 			// Finished uploading data
-			if (!(*rapSession)->responseAlreadyGiven) {
-				processUploadData(request, upload_data, *upload_data_size, *rapSession);
+			if (!rapSession->responseAlreadyGiven) {
+				processUploadData(request, upload_data, *upload_data_size, rapSession);
 			}
 			*upload_data_size = 0;
 			return MHD_YES;
 		} else {
 			// Uploading more data
-			if ((*rapSession)->responseAlreadyGiven) {
-				releaseRap(*rapSession);
+			if (rapSession->responseAlreadyGiven) {
+				if (rapSession->responseAlreadyGiven == RAP_INTERNAL_ERROR) {
+					destroyRap(rapSession);
+				}
+				releaseRap(rapSession);
 				return MHD_YES;
 			} else {
 				Response * response;
-				int statusCode = completeUpload(request, *rapSession, &response);
-				int result = sendResponse(request, statusCode, response, *rapSession, method, url);
-				if (*rapSession != AUTH_ERROR && *rapSession != AUTH_FAILED) {
-					releaseRap(*rapSession);
+				int statusCode = completeUpload(request, rapSession, &response);
+				int result = sendResponse(request, statusCode, response, rapSession, method, url);
+				if (statusCode == RAP_INTERNAL_ERROR) {
+					destroyRap(rapSession);
+				} else if (AUTH_SUCCESS(rapSession)) {
+					releaseRap(rapSession);
 				}
 				return result;
 			}
@@ -831,12 +836,9 @@ static int answerToRequest(void *cls, Request *request, const char *url, const c
 		char * user = MHD_basic_auth_get_username_password(request, &password);
 		char clientIp[100];
 		getRequestIP(clientIp, sizeof(clientIp), request);
-		*rapSession = acquireRap(user, password, clientIp);
-		if (*rapSession == AUTH_FAILED) {
-			return sendResponse(request, MHD_HTTP_UNAUTHORIZED, NULL, *rapSession, method, url);
-		} else if (*rapSession == AUTH_ERROR) {
-			return sendResponse(request, MHD_HTTP_INTERNAL_SERVER_ERROR, NULL, *rapSession, method, url);
-		} else {
+		rapSession = acquireRap(user, password, clientIp);
+		*s = rapSession;
+		if (AUTH_SUCCESS(rapSession)) {
 			//urlDecode((char *) url);
 			if (requestHasData(request)) {
 				// If we have data to send then create a pipe to pump it through
@@ -845,42 +847,50 @@ static int answerToRequest(void *cls, Request *request, const char *url, const c
 				int pipeEnds[2];
 				if (socketpair(PF_LOCAL, SOCK_STREAM | SOCK_CLOEXEC, 0, pipeEnds)) {
 					stdLogError(errno, "Could not create write pipe");
-					return sendResponse(request, MHD_HTTP_INTERNAL_SERVER_ERROR, NULL, *rapSession, method, url);
+					return sendResponse(request, MHD_HTTP_INTERNAL_SERVER_ERROR, NULL, rapSession, method, url);
 				}
 
-				(*rapSession)->readDataFd = pipeEnds[CHILD_SOCKET];
-				(*rapSession)->writeDataFd = pipeEnds[PARENT_SOCKET];
+				rapSession->readDataFd = pipeEnds[CHILD_SOCKET];
+				rapSession->writeDataFd = pipeEnds[PARENT_SOCKET];
 
 				Response * response;
-				int statusCode = processNewRequest(request, url, host, method, *rapSession, &response);
+				int statusCode = processNewRequest(request, url, host, method, rapSession, &response);
 
 				if (statusCode == RAP_CONTINUE) {
 					// do not queue a response for contiune
-					(*rapSession)->responseAlreadyGiven = 0;
+					rapSession->responseAlreadyGiven = 0;
 					//logAccess(statusCode, method, (*rapSession)->user, url);
 					return MHD_YES;
 				} else {
-					(*rapSession)->responseAlreadyGiven = 1;
-					return sendResponse(request, statusCode, response, *rapSession, method, url);
+					rapSession->responseAlreadyGiven = statusCode;
+					return sendResponse(request, statusCode, response, rapSession, method, url);
 				}
 			} else {
-				(*rapSession)->readDataFd = -1;
-				(*rapSession)->writeDataFd = -1;
+				rapSession->readDataFd = -1;
+				rapSession->writeDataFd = -1;
 				Response * response;
 
-				int statusCode = processNewRequest(request, url, host, method, *rapSession, &response);
+				int statusCode = processNewRequest(request, url, host, method, rapSession, &response);
 
 				if (statusCode == RAP_CONTINUE) {
 					stdLogError(0, "RAP returned CONTINUE when there is no data");
-					int ret = sendResponse(request, MHD_HTTP_INTERNAL_SERVER_ERROR, NULL, *rapSession, method, url);
-					releaseRap(*rapSession);
+					int ret = sendResponse(request, MHD_HTTP_INTERNAL_SERVER_ERROR, NULL, rapSession, method, url);
+					releaseRap(rapSession);
 					return ret;
 				} else {
-					int ret = sendResponse(request, statusCode, response, *rapSession, method, url);
-					releaseRap(*rapSession);
+					int ret = sendResponse(request, statusCode, response, rapSession, method, url);
+					if (statusCode == RAP_INTERNAL_ERROR) {
+						destroyRap(rapSession);
+					} else {
+						releaseRap(rapSession);
+					}
 					return ret;
 				}
 			}
+		} else if (rapSession == AUTH_FAILED) {
+			return sendResponse(request, MHD_HTTP_UNAUTHORIZED, NULL, rapSession, method, url);
+		} else /*if (*rapSession == AUTH_ERROR)*/{
+			return sendResponse(request, MHD_HTTP_INTERNAL_SERVER_ERROR, NULL, rapSession, method, url);
 		}
 	}
 }
