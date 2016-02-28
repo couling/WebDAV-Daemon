@@ -10,6 +10,7 @@
 #include <sys/stat.h>
 #include <sys/statvfs.h>
 #include <dirent.h>
+#include <locale.h>
 #include <security/pam_appl.h>
 
 #define BUFFER_SIZE 40960
@@ -51,6 +52,34 @@ static char * normalizeDirName(const char * file, size_t * filePathSize, int isD
 		(*filePathSize)++;
 	}
 	return filePath;
+}
+
+static size_t formatFileSize(char * buffer, size_t bufferSize, off_t size) {
+	static char * suffix[] = { "B", "KiB", "MiB", "GiB", "TiB", "PiB" "EiB", "ZiB", "YiB" };
+	int magnitude = 0;
+	off_t tmpSize = size;
+	while (magnitude < 8 && (tmpSize & 1023) != tmpSize) {
+		magnitude++;
+		tmpSize >>= 10;
+	}
+	double divisor;
+	char * format;
+	if (magnitude > 0) {
+		divisor = ((off_t)1) << (magnitude * 10);
+		if (tmpSize >= 100) {
+			format = "%.0f %s";
+		} else if (tmpSize >= 10) {
+			format = "%.1f %s";
+		} else {
+			format = "%.2f %s";
+		}
+	} else {
+		divisor = 1;
+		format = "%.0f %s";
+	}
+	double dsize = size;
+	dsize /= divisor;
+	return snprintf(buffer, bufferSize, format, dsize, suffix[magnitude]);
 }
 
 //////////
@@ -573,12 +602,36 @@ static ssize_t writeFile(Message * requestMessage) {
 // GET //
 /////////
 
+static int compareDirent(const void * a, const void * b) {
+	const struct dirent * lhs = *((const struct dirent **) a);
+	const struct dirent * rhs = *((const struct dirent **) b);
+	int result = strcoll(lhs->d_name, rhs->d_name);
+	if (result != 0) {
+		return result;
+	}
+	return strcmp(lhs->d_name, rhs->d_name);
+}
+
 static void listDir(const char * file, int dirFd, int writeFd) {
 	DIR * dir = fdopendir(dirFd);
 	xmlTextWriterPtr writer = xmlNewFdTextWriter(writeFd);
 
 	size_t fileSize = strlen(file);
 	char * filePath = normalizeDirName(file, &fileSize, 1);
+
+	size_t entryCount = 0, allocatedEntries = 0;
+	struct dirent ** directoryEntries = NULL;
+	struct dirent * dp;
+	while ((dp = readdir(dir)) != NULL) {
+		int index = entryCount++;
+		if (entryCount > allocatedEntries) {
+			allocatedEntries += 200;
+			directoryEntries = reallocSafe(directoryEntries, sizeof(struct dirent **) * allocatedEntries);
+		}
+		directoryEntries[index] = dp;
+	}
+
+	qsort(directoryEntries, entryCount, sizeof(*directoryEntries), &compareDirent);
 
 	xmlTextWriterStartElement(writer, "html");
 	xmlTextWriterStartElement(writer, "head");
@@ -590,8 +643,9 @@ static void listDir(const char * file, int dirFd, int writeFd) {
 	xmlTextWriterWriteAttribute(writer, "cellpadding", "5");
 	xmlTextWriterWriteAttribute(writer, "cellspacing", "5");
 	xmlTextWriterWriteAttribute(writer, "border", "1");
-	struct dirent * dp;
-	while ((dp = readdir(dir)) != NULL) {
+
+	for (size_t i = 0; i < entryCount; i++) {
+		dp = directoryEntries[i];
 		if (dp->d_name[0] != '.') {
 			xmlTextWriterStartElement(writer, "tr");
 			xmlTextWriterWriteElementString(writer, NULL, "td", dp->d_type == DT_DIR ? "dir" : "file");
@@ -607,6 +661,15 @@ static void listDir(const char * file, int dirFd, int writeFd) {
 			if (dp->d_type == DT_DIR)
 				xmlTextWriterWriteString(writer, "/");
 			xmlTextWriterEndElement(writer);
+			if (dp->d_type == DT_REG) {
+				struct stat stat;
+				fstatat(dirFd, dp->d_name, &stat, 0);
+				char buffer[30];
+				formatFileSize(buffer, sizeof(buffer), stat.st_size);
+				xmlTextWriterWriteElementString(writer, NULL, "td", buffer);
+			} else {
+				xmlTextWriterWriteElementString(writer, NULL, "td", "-");
+			}
 			xmlTextWriterWriteElementString(writer, NULL, "td",
 					dp->d_type == DT_DIR ? "-" : findMimeType(dp->d_name)->type);
 			xmlTextWriterEndElement(writer);
@@ -620,6 +683,7 @@ static void listDir(const char * file, int dirFd, int writeFd) {
 	free(filePath);
 	xmlFreeTextWriter(writer);
 	closedir(dir);
+	free(directoryEntries);
 }
 
 static ssize_t readFile(Message * requestMessage) {
@@ -804,6 +868,7 @@ static ssize_t authenticate(Message * message) {
 //////////////////////
 
 int main(int argCount, char * args[]) {
+	setlocale(LC_ALL, "");
 	ssize_t ioResult;
 	Message message;
 	char incomingBuffer[INCOMING_BUFFER_SIZE];

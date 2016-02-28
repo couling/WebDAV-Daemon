@@ -1,11 +1,10 @@
 // TODO auth modes other than basic?
 // TODO check into what happens when a connection is closed early during upload.
+// TODO prevent PUT clobbering files.
 
 #include "shared.h"
 #include "configuration.h"
 #include "rap-control.h"
-
-#define MHD_NO_DEPRECATION
 
 #include <errno.h>
 #include <fcntl.h>
@@ -15,6 +14,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <sys/stat.h>
+#include <sys/types.h>
 #include <sys/wait.h>
 #include <netdb.h>
 #include <stdlib.h>
@@ -38,6 +38,13 @@ typedef struct SSLCertificate {
 
 typedef struct MHD_Connection Request;
 typedef struct MHD_Response Response;
+
+typedef struct FDResponse {
+	int fd;
+	off_t pos;
+	off_t offset;
+	off_t size;
+} FDResponse;
 
 ////////////////////
 // End Structures //
@@ -412,54 +419,57 @@ static void addStaticHeaders(Response * response) {
 }
 
 static ssize_t fdContentReader(void *cls, uint64_t pos, char *buf, size_t max) {
-	int * fd = cls;
-	size_t bytesRead = read(*fd, buf, max);
-	if (bytesRead < 0) {
-		stdLogError(errno, "Could not read content from fd");
-		return MHD_CONTENT_READER_END_WITH_ERROR;
+	FDResponse * fdResponsedata = cls;
+	if (pos != fdResponsedata->pos) {
+		off_t seekTo = pos + fdResponsedata->offset;
+		off_t result = lseek(fdResponsedata->fd, pos + fdResponsedata->offset, SEEK_SET);
+		if (result != seekTo) {
+			stdLogError(errno, "Could not file seek for response");
+			return MHD_CONTENT_READER_END_WITH_ERROR;
+		} else {
+			fdResponsedata->pos = seekTo;
+		}
 	}
-	if (bytesRead == 0) {
-		return MHD_CONTENT_READER_END_OF_STREAM;
+	if (fdResponsedata->size > 0 && fdResponsedata->size - pos < max) {
+		max = fdResponsedata->size - pos;
+	}
+
+	size_t bytesRead = read(fdResponsedata->fd, buf, max);
+	if (bytesRead <= 0) {
+		if (bytesRead == 0) {
+			return MHD_CONTENT_READER_END_OF_STREAM;
+		} else {
+			stdLogError(errno, "Could not read content from fd");
+			return MHD_CONTENT_READER_END_WITH_ERROR;
+		}
 	}
 	while (bytesRead < max) {
-		size_t newBytesRead = read(*fd, buf + bytesRead, max - bytesRead);
+		size_t newBytesRead = read(fdResponsedata->fd, buf + bytesRead, max - bytesRead);
 		if (newBytesRead <= 0) {
 			break;
 		}
 		bytesRead += newBytesRead;
 	}
+	fdResponsedata->pos += bytesRead;
 	return bytesRead;
 }
 
 static void fdContentReaderCleanup(void *cls) {
-	int * fd = cls;
-	close(*fd);
-	free(fd);
+	FDResponse * fdResponseData = cls;
+	close(fdResponseData->fd);
+	free(fdResponseData);
 }
 
-static Response * createFdStreamResponse(int fd, const char * mimeType, time_t date) {
-	int * fdAllocated = mallocSafe(sizeof(int));
-	*fdAllocated = fd;
-	Response * response = MHD_create_response_from_callback(-1, 4096, &fdContentReader, fdAllocated,
+static Response * createFdResponse(int fd, uint64_t offset, uint64_t size, const char * mimeType, time_t date) {
+	FDResponse * fdResponseData = mallocSafe(sizeof(FDResponse));
+	fdResponseData->fd = fd;
+	fdResponseData->pos = 0;
+	fdResponseData->offset = offset;
+	fdResponseData->size = size;
+	Response * response = MHD_create_response_from_callback(size, 40960, &fdContentReader, fdResponseData,
 			&fdContentReaderCleanup);
 	if (!response) {
-		free(fdAllocated);
-		return NULL;
-	}
-	char dateBuf[100];
-	getWebDate(date, dateBuf, 100);
-	addHeader(response, "Date", dateBuf);
-	if (mimeType != NULL) {
-		addHeader(response, "Content-Type", mimeType);
-	}
-	addStaticHeaders(response);
-	return response;
-}
-
-static Response * createFdFileResponse(off_t offset, size_t size, int fd, const char * mimeType, time_t date) {
-	Response * response = MHD_create_response_from_fd_at_offset(size, fd, offset);
-	if (!response) {
-		close(fd);
+		fdContentReaderCleanup(fdResponseData);
 		return NULL;
 	}
 	char dateBuf[100];
@@ -481,7 +491,7 @@ static Response * createFileResponse(Request *request, const char * fileName, co
 
 	struct stat statBuffer;
 	fstat(fd, &statBuffer);
-	return createFdFileResponse(0, statBuffer.st_size, fd, mimeType, statBuffer.st_mtime);
+	return createFdResponse(fd, 0, statBuffer.st_size, mimeType, statBuffer.st_mtime);
 }
 
 static int processRangeHeader(off_t * offset, size_t * fileSize, const char *range) {
@@ -542,7 +552,7 @@ static int createRapResponse(Request *request, struct Message * message, Respons
 			return MHD_HTTP_INTERNAL_SERVER_ERROR;
 		}
 
-		*response = createFdStreamResponse(message->fd, mimeType, date);
+		*response = createFdResponse(message->fd, 0, -1, mimeType, date);
 		return RAP_MULTISTATUS;
 	}
 
@@ -566,7 +576,7 @@ static int createRapResponse(Request *request, struct Message * message, Respons
 			if (rangeHeader && processRangeHeader(&offset, &fileSize, rangeHeader)) {
 				statusCode = MHD_HTTP_PARTIAL_CONTENT;
 			}
-			*response = createFdFileResponse(offset, fileSize, message->fd, mimeType, date);
+			*response = createFdResponse(message->fd, offset, fileSize, mimeType, date);
 
 			char contentRangeHeader[200];
 			snprintf(contentRangeHeader, sizeof(contentRangeHeader), "bytes %lld-%lld/%lld", (long long) offset,
@@ -574,7 +584,7 @@ static int createRapResponse(Request *request, struct Message * message, Respons
 
 			addHeader(*response, "Content-Range", contentRangeHeader);
 		} else {
-			*response = createFdStreamResponse(message->fd, mimeType, date);
+			*response = createFdResponse(message->fd, 0, -1, mimeType, date);
 		}
 
 		if (message->bufferCount > RAP_LOCATION_INDEX) {
@@ -678,6 +688,7 @@ static int processNewRequest(Request * request, const char * url, const char * h
 	// TODO MOVE
 	// TODO LOCK
 	// TODO UNLOCK
+	// TODO PROPPATCH // properly
 	//stdLog("%s %s data", method, writeHandle ? "with" : "without");
 	if (!strcmp("GET", method)) {
 		message.mID = RAP_READ_FILE;
@@ -735,6 +746,9 @@ static int processNewRequest(Request * request, const char * url, const char * h
 	}
 
 	if (message.mID == RAP_CONTINUE) {
+		if (message.fd != -1) {
+			close(message.fd);
+		}
 		return MHD_HTTP_CONTINUE;
 	} else {
 		return createRapResponse(request, &message, response);

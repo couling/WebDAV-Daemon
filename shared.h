@@ -1,6 +1,8 @@
 #ifndef WEBDAV_SHARED_H
 #define WEBDAV_SHARED_H
 
+#define _FILE_OFFSET_BITS 64
+
 #include <sys/socket.h>
 #include <stdarg.h>
 

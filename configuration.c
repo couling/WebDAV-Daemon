@@ -5,7 +5,7 @@
 #include "xml.h"
 
 #include <string.h>
-
+#include <errno.h>
 WebdavdConfiguration config;
 
 ///////////////////////
@@ -334,8 +334,12 @@ static int configureServer(WebdavdConfiguration * config, xmlTextReaderPtr reade
 
 void configure(WebdavdConfiguration ** config, int * configCount, const char * configFile) {
 	xmlTextReaderPtr reader = xmlReaderForFile(configFile, NULL, XML_PARSE_NOENT);
+	if (!reader) {
+		stdLogError(errno, "Could not load config file %s", configFile);
+		exit(1);
+	}
 	xmlReaderSuppressErrors(reader);
-	if (!reader || !stepInto(reader)) {
+	if (!stepInto(reader)) {
 		stdLogError(0, "could not create xml reader for %s", configFile);
 		exit(1);
 	}
