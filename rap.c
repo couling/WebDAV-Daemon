@@ -311,7 +311,7 @@ static void writePropFindResponsePart(const char * fileName, const char * displa
 	xmlTextWriterStartElementNS(writer, "d", "response", NULL);
 	xmlTextWriterStartElementNS(writer, "d", "href", NULL);
 	xmlTextWriterWriteURL(writer, fileName);
-	xmlTextWriterStartElementNS(writer, "d", "response", NULL);
+	xmlTextWriterEndElement(writer);
 	xmlTextWriterStartElementNS(writer, "d", "propstat", NULL);
 	xmlTextWriterStartElementNS(writer, "d", "prop", NULL);
 
