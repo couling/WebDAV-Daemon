@@ -27,14 +27,17 @@ enum RapConstant {
 	RAP_INTERNAL_ERROR = 500
 };
 
+// Auth Request
 #define RAP_USER_INDEX 0
 #define RAP_PASSWORD_INDEX 1
 #define RAP_RHOST_INDEX 2
 
-#define RAP_HOST_INDEX  0
+// Generic Requet
+#define RAP_LOCK_INDEX  0
 #define RAP_FILE_INDEX  1
 #define RAP_DEPTH_INDEX 2
 
+// Generic Response
 #define RAP_DATE_INDEX     0
 #define RAP_MIME_INDEX     1
 #define RAP_LOCATION_INDEX 2
@@ -77,7 +80,9 @@ typedef struct Message {
 
 ssize_t sendMessage(int sock, Message * message);
 ssize_t recvMessage(int sock, Message * message, char * incomingBuffer, size_t incomingBufferSize);
+
 char * messageParamToString(MessageParam * iovec);
+MessageParam stringToMessageParam(const char * string);
 
 int lockToUser(const char * user);
 

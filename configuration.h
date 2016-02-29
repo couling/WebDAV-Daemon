@@ -35,8 +35,11 @@ typedef struct WebdavdConfiguration {
 
 	// RAP
 	time_t rapMaxSessionLife;
-	int rapTimeoutRead;
+	time_t rapTimeoutRead;
 	const char * pamServiceName;
+
+	// Max lock time
+	time_t maxLockTime;
 
 	// files
 	const char * mimeTypesFile;

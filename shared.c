@@ -221,6 +221,16 @@ char * messageParamToString(MessageParam * iovec) {
 	return buffer;
 }
 
+MessageParam stringToMessageParam(const char * string) {
+	if (string != NULL) {
+		MessageParam param = { .iov_base = (void *) string, .iov_len = strlen(string) + 1 };
+		return param;
+	} else {
+		MessageParam param = { .iov_base = NULL, .iov_len = 0 };
+		return param;
+	}
+}
+
 size_t getWebDate(time_t rawtime, char * buf, size_t bufSize) {
 	struct tm * timeinfo = gmtime(&rawtime);
 	return strftime(buf, bufSize, "%a, %d %b %Y %H:%M:%S %Z", timeinfo);

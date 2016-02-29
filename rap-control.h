@@ -9,6 +9,7 @@ typedef struct RAP {
 	int socketFd;
 	const char * user;
 	const char * password;
+	const char * clientIp;
 
 	// Managed by RAP DB
 	time_t rapCreated;
@@ -19,6 +20,7 @@ typedef struct RAP {
 	int writeDataFd; // Should be closed by uploadComplete()
 	int readDataFd;  // Should be closed by processNewRequest() when sent to the RAP.
 	int responseAlreadyGiven;
+	const char * lockToken;
 } RAP;
 
 // Used as a place holder for failed auth requests which failed due to invalid credentials
@@ -34,7 +36,9 @@ extern const RAP AUTH_ERROR_RAP;
 
 void initializeRapDatabase();
 RAP * acquireRap(const char * user, const char * password, const char * clientIp);
-void releaseRap(RAP * processor);
+//void releaseRap(RAP * processor);
+#define releaseRap(processor)
 void destroyRap(RAP * rapSession);
+void runCleanRapPool();
 
 #endif

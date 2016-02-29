@@ -13,10 +13,11 @@
 #include <fcntl.h>
 #include <pthread.h>
 #include <stdlib.h>
+#include <semaphore.h>
 
-typedef struct RAPDB {
+typedef struct RapList {
 	RAP * firstRapSession;
-} RAPDB;
+} RapList;
 
 // Used as a place holder for failed auth requests which failed due to invalid credentials
 const RAP AUTH_FAILED_RAP = { .pid = 0, .socketFd = -1, .user = "<auth failed>", .writeDataFd = -1, .readDataFd = -1,
@@ -27,10 +28,19 @@ const RAP AUTH_ERROR_RAP = { .pid = 0, .socketFd = -1, .user = "<auth error>", .
 		.responseAlreadyGiven = 500, .next = NULL, .prevPtr = NULL };
 
 static pthread_key_t rapDBThreadKey;
+static sem_t rapPoolLock;
+static RapList rapPool;
 
 ////////////////////
 // RAP Processing //
 ////////////////////
+
+static time_t getExpiryTime() {
+	time_t expires;
+	time(&expires);
+	expires -= config.rapMaxSessionLife;
+	return expires;
+}
 
 static int forkRapProcess(const char * path, int * newSockFd) {
 	// Create unix domain socket for
@@ -99,6 +109,22 @@ static int forkRapProcess(const char * path, int * newSockFd) {
 	}
 }
 
+static void removeRapFromList(RAP * rapSession) {
+	*(rapSession->prevPtr) = rapSession->next;
+	if (rapSession->next != NULL) {
+		rapSession->next->prevPtr = rapSession->prevPtr;
+	}
+}
+
+static void addRapToList(RapList * list, RAP * rapSession) {
+	rapSession->next = list->firstRapSession;
+	list->firstRapSession = rapSession;
+	rapSession->prevPtr = &list->firstRapSession;
+	if (rapSession->next) {
+		rapSession->next->prevPtr = &rapSession->next;
+	}
+}
+
 void destroyRap(RAP * rapSession) {
 	if (!AUTH_SUCCESS(rapSession)) {
 		return;
@@ -115,11 +141,12 @@ void destroyRap(RAP * rapSession) {
 
 	freeSafe((void * ) rapSession->user);
 	freeSafe((void * ) rapSession->password);
-	*(rapSession->prevPtr) = rapSession->next;
+	freeSafe((void * ) rapSession->clientIp);
+	removeRapFromList(rapSession);
 	freeSafe(rapSession);
 }
 
-static RAP * createRap(RAPDB * db, const char * user, const char * password, const char * rhost) {
+static RAP * createRap(RapList * db, const char * user, const char * password, const char * rhost) {
 	int socketFd;
 	int pid = forkRapProcess(config.rapBinary, &socketFd);
 	if (!pid) {
@@ -131,12 +158,9 @@ static RAP * createRap(RAPDB * db, const char * user, const char * password, con
 	message.mID = RAP_AUTHENTICATE;
 	message.fd = -1;
 	message.bufferCount = 3;
-	message.params[RAP_USER_INDEX].iov_len = strlen(user) + 1;
-	message.params[RAP_USER_INDEX].iov_base = (void *) user;
-	message.params[RAP_PASSWORD_INDEX].iov_len = strlen(password) + 1;
-	message.params[RAP_PASSWORD_INDEX].iov_base = (void *) password;
-	message.params[RAP_RHOST_INDEX].iov_len = strlen(rhost) + 1;
-	message.params[RAP_RHOST_INDEX].iov_base = (void *) rhost;
+	message.params[RAP_USER_INDEX] = stringToMessageParam(user);
+	message.params[RAP_PASSWORD_INDEX] = stringToMessageParam(password);
+	message.params[RAP_RHOST_INDEX] = stringToMessageParam(rhost);
 	if (sendMessage(socketFd, &message) <= 0) {
 		close(socketFd);
 		return AUTH_ERROR;
@@ -165,45 +189,68 @@ static RAP * createRap(RAPDB * db, const char * user, const char * password, con
 	newRap->socketFd = socketFd;
 	newRap->user = copyString(user);
 	newRap->password = copyString(password);
+	newRap->clientIp = copyString(rhost);
 	time(&newRap->rapCreated);
-	newRap->next = db->firstRapSession;
-	newRap->prevPtr = &db->firstRapSession;
 	newRap->writeDataFd = -1;
 	newRap->readDataFd = -1;
+	addRapToList(db, newRap);
 	// newRap->responseAlreadyGiven // this is set elsewhere
-	db->firstRapSession = newRap;
-	stdLog("%p create rap (prev %p, next %p)", &newRap->next, newRap->prevPtr, &newRap->next->next);
 	return newRap;
 }
 
-void releaseRap(RAP * processor) {
-}
+// void releaseRap(RAP * processor) {}
 
 RAP * acquireRap(const char * user, const char * password, const char * clientIp) {
 	if (user && password) {
-		RAPDB * rapDB = pthread_getspecific(rapDBThreadKey);
-		if (!rapDB) {
-			rapDB = mallocSafe(sizeof(*rapDB));
-			memset(rapDB, 0, sizeof(*rapDB));
-			pthread_setspecific(rapDBThreadKey, rapDB);
+		RAP * rap;
+		time_t expires = getExpiryTime();
+		RapList * threadRapList = pthread_getspecific(rapDBThreadKey);
+		if (!threadRapList) {
+			threadRapList = mallocSafe(sizeof(*threadRapList));
+			memset(threadRapList, 0, sizeof(*threadRapList));
+			pthread_setspecific(rapDBThreadKey, threadRapList);
 		} else {
-			time_t expires;
-			time(&expires);
-			expires -= config.rapMaxSessionLife;
-			RAP * rap = rapDB->firstRapSession;
+			// Get a rap from this thread's own list
+			rap = threadRapList->firstRapSession;
 			while (rap) {
 				if (rap->rapCreated < expires) {
 					RAP * raptmp = rap->next;
 					destroyRap(rap);
 					rap = raptmp;
-				} else if (!strcmp(user, rap->user) && !strcmp(password, rap->password)) {
+				} else if (!strcmp(user, rap->user)
+						&& !strcmp(password, rap->password) /*&& !strcmp(clientIp, rap->clientIp)*/) {
+					// all requests here will come from the same ip so we don't check it in the above.
 					return rap;
 				} else {
 					rap = rap->next;
 				}
 			}
 		}
-		return createRap(rapDB, user, password, clientIp);
+		// Get a rap from the central pool.
+		if (sem_wait(&rapPoolLock) == -1) {
+			stdLogError(errno, "Could not wait for rap pool lock while acquiring rap");
+			return AUTH_ERROR;
+		} else {
+			rap = rapPool.firstRapSession;
+			while (rap) {
+				if (rap->rapCreated < expires) {
+					RAP * raptmp = rap->next;
+					destroyRap(rap);
+					rap = raptmp;
+				} else if (!strcmp(user, rap->user) && !strcmp(password, rap->password)
+						&& !strcmp(clientIp, rap->clientIp)) {
+					// We will only re-use sessions in the pool if they are from the same ip
+					removeRapFromList(rap);
+					addRapToList(threadRapList, rap);
+					sem_post(&rapPoolLock);
+					return rap;
+				} else {
+					rap = rap->next;
+				}
+			}
+			sem_post(&rapPoolLock);
+		}
+		return createRap(threadRapList, user, password, clientIp);
 	} else {
 		stdLogError(0, "Rejecting request without auth");
 		return AUTH_FAILED;
@@ -220,28 +267,58 @@ static void cleanupAfterRap(int sig, siginfo_t *siginfo, void *context) {
 }
 
 static void deInitializeRapDatabase(void * data) {
-	RAPDB * db = data;
-	if (db) {
-		while (db->firstRapSession) {
-			destroyRap(db->firstRapSession);
+	RapList * threadRapList = data;
+	if (threadRapList) {
+		if (threadRapList->firstRapSession) {
+			if (sem_wait(&rapPoolLock) == -1) {
+				stdLogError(errno, "Could not wait for rap pool lock cleaning up thread");
+				do {
+					destroyRap(threadRapList->firstRapSession);
+				} while (threadRapList->firstRapSession != NULL);
+			} else {
+				do {
+					RAP * rap = threadRapList->firstRapSession;
+					removeRapFromList(rap);
+					addRapToList(&rapPool, rap);
+				} while (threadRapList->firstRapSession != NULL);
+				sem_post(&rapPoolLock);
+			}
 		}
-		freeSafe(db);
+		freeSafe(threadRapList);
+	}
+}
+
+void runCleanRapPool() {
+	time_t expires = getExpiryTime();
+	if (sem_wait(&rapPoolLock) == -1) {
+		stdLogError(errno, "Could not wait for rap pool lock while cleaning pool");
+		return;
+	} else {
+		RAP * rap = rapPool.firstRapSession;
+		while (rap != NULL) {
+			RAP * next = rap->next;
+			if (rap->rapCreated < expires) {
+				destroyRap(rap);
+			}
+			rap = next;
+		}
+		sem_post(&rapPoolLock);
 	}
 }
 
 void initializeRapDatabase() {
-	struct sigaction act;
-	memset(&act, 0, sizeof(act));
-	act.sa_sigaction = &cleanupAfterRap;
-	act.sa_flags = SA_SIGINFO;
-	if (sigaction(SIGCHLD, &act, NULL) < 0) {
+	struct sigaction childCleanup = { .sa_sigaction = &cleanupAfterRap, .sa_flags = SA_SIGINFO };
+	if (sigaction(SIGCHLD, &childCleanup, NULL) < 0) {
 		stdLogError(errno, "Could not set handler method for finished child threads");
 		exit(255);
 	}
 
+	memset(&rapPool, 0, sizeof(rapPool));
+	sem_init(&rapPoolLock, 0, 1);
 	pthread_key_create(&rapDBThreadKey, &deInitializeRapDatabase);
 }
 
 ////////////////////////
 // End RAP Processing //
 ////////////////////////
+

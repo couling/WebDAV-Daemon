@@ -65,7 +65,7 @@ static size_t formatFileSize(char * buffer, size_t bufferSize, off_t size) {
 	double divisor;
 	char * format;
 	if (magnitude > 0) {
-		divisor = ((off_t)1) << (magnitude * 10);
+		divisor = ((off_t) 1) << (magnitude * 10);
 		if (tmpSize >= 100) {
 			format = "%.0f %s";
 		} else if (tmpSize >= 10) {
@@ -392,17 +392,17 @@ static void writePropFindResponsePart(const char * fileName, const char * displa
 
 }
 
-static int respondToPropFind(const char * file, const char * host, PropertySet * properties, int depth) {
+static int respondToPropFind(const char * file, PropertySet * properties, int depth) {
 	struct stat fileStat;
 	if (stat(file, &fileStat)) {
 		int e = errno;
 		switch (e) {
 		case EACCES:
-			stdLogError(e, "PROPFIND access denied %s %s %s", authenticatedUser, host, file);
+			stdLogError(e, "PROPFIND access denied %s %s", authenticatedUser, file);
 			return respond(RAP_ACCESS_DENIED, -1);
 		case ENOENT:
 		default:
-			stdLogError(e, "PROPFIND not found %s %s %s", authenticatedUser, host, file);
+			stdLogError(e, "PROPFIND not found %s %s", authenticatedUser, file);
 			return respond(RAP_NOT_FOUND, -1);
 		}
 	}
@@ -505,8 +505,7 @@ static ssize_t propfind(Message * requestMessage) {
 		}
 	}
 
-	return respondToPropFind(file, messageParamToString(&requestMessage->params[RAP_HOST_INDEX]), &properties,
-			(strcmp("0", depthString) ? 2 : 1));
+	return respondToPropFind(file, &properties, (strcmp("0", depthString) ? 2 : 1));
 }
 
 //////////////////
@@ -555,7 +554,6 @@ static ssize_t writeFile(Message * requestMessage) {
 		return respond(RAP_INTERNAL_ERROR, -1);
 	}
 
-	char * host = messageParamToString(&requestMessage->params[RAP_HOST_INDEX]);
 	char * file = messageParamToString(&requestMessage->params[RAP_FILE_INDEX]);
 	// TODO change file mode
 	int fd = open(file, O_WRONLY | O_CREAT, 0660);
@@ -563,11 +561,11 @@ static ssize_t writeFile(Message * requestMessage) {
 		int e = errno;
 		switch (e) {
 		case EACCES:
-			stdLogError(e, "PUT access denied %s %s %s", authenticatedUser, host, file);
+			stdLogError(e, "PUT access denied %s %s", authenticatedUser, file);
 			return respond(RAP_ACCESS_DENIED, -1);
 		case ENOENT:
 		default:
-			stdLogError(e, "PUT not found %s %s %s", authenticatedUser, host, file);
+			stdLogError(e, "PUT not found %s %s", authenticatedUser, file);
 			return respond(RAP_CONFLICT, -1);
 		}
 	}
@@ -700,18 +698,17 @@ static ssize_t readFile(Message * requestMessage) {
 		return respond(RAP_INTERNAL_ERROR, -1);
 	}
 
-	char * host = messageParamToString(&requestMessage->params[RAP_HOST_INDEX]);
 	char * file = messageParamToString(&requestMessage->params[RAP_FILE_INDEX]);
 	int fd = open(file, O_RDONLY);
 	if (fd == -1) {
 		int e = errno;
 		switch (e) {
 		case EACCES:
-			stdLogError(e, "GET access denied %s %s %s", authenticatedUser, host, file);
+			stdLogError(e, "GET access denied %s %s %s", authenticatedUser, file);
 			return respond(RAP_ACCESS_DENIED, -1);
 		case ENOENT:
 		default:
-			stdLogError(e, "GET not found %s %s %s", authenticatedUser, host, file);
+			stdLogError(e, "GET not found %s %s %s", authenticatedUser, file);
 			return respond(RAP_NOT_FOUND, -1);
 		}
 	} else {

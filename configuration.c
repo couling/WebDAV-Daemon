@@ -36,6 +36,45 @@ static int readConfigString(xmlTextReaderPtr reader, const char ** value) {
 	return stepOverText(reader, value);
 }
 
+static int readConfigTime(xmlTextReaderPtr reader, time_t * value, const char * configFile) {
+	const char * nodeName = xmlTextReaderConstLocalName(reader);
+	const char * sessionTimeoutString;
+	int result = stepOverText(reader, &sessionTimeoutString);
+	if (sessionTimeoutString) {
+		long int hour = 0, minute = 0, second;
+		char * endPtr;
+		second = strtol(sessionTimeoutString, &endPtr, 10);
+		if (*endPtr) {
+			if (*endPtr != ':' || endPtr == sessionTimeoutString) {
+				stdLogError(0, "Invalid %s %s in %s", nodeName, sessionTimeoutString, configFile);
+				exit(1);
+			}
+			minute = second;
+
+			char * endPtr2;
+			endPtr++;
+			second = strtol(endPtr, &endPtr2, 10);
+			if (*endPtr2) {
+				if (*endPtr2 != ':' || endPtr2 == endPtr) {
+					stdLogError(0, "Invalid s%s %s in %s", nodeName, sessionTimeoutString, configFile);
+					exit(1);
+				}
+				hour = minute;
+				minute = second;
+				endPtr2++;
+				second = strtol(endPtr2, &endPtr, 10);
+				if (*endPtr != '\0') {
+					stdLogError(0, "Invalid %s %s in %s", nodeName, sessionTimeoutString, configFile);
+					exit(1);
+				}
+			}
+		}
+		*value = (((hour * 60) + minute) * 60) + second;
+		xmlFree((char *) sessionTimeoutString);
+	}
+	return result;
+}
+
 static int configListen(WebdavdConfiguration * config, xmlTextReaderPtr reader, const char * configFile) {
 	//<listen><port>80</port><host>localhost</host><encryption>disabled</encryption></listen>
 	int index = config->daemonCount++;
@@ -116,41 +155,7 @@ static int configListen(WebdavdConfiguration * config, xmlTextReaderPtr reader, 
 
 static int configSessionTimeout(WebdavdConfiguration * config, xmlTextReaderPtr reader, const char * configFile) {
 	//<session-timeout>5:00</session-timeout>
-	const char * sessionTimeoutString;
-	int result = stepOverText(reader, &sessionTimeoutString);
-	if (sessionTimeoutString) {
-		long int hour = 0, minute = 0, second;
-		char * endPtr;
-		second = strtol(sessionTimeoutString, &endPtr, 10);
-		if (*endPtr) {
-			if (*endPtr != ':' || endPtr == sessionTimeoutString) {
-				stdLogError(0, "Invalid session timeout length %s in %s", sessionTimeoutString, configFile);
-				exit(1);
-			}
-			minute = second;
-
-			char * endPtr2;
-			endPtr++;
-			second = strtol(endPtr, &endPtr2, 10);
-			if (*endPtr2) {
-				if (*endPtr2 != ':' || endPtr2 == endPtr) {
-					stdLogError(0, "Invalid session timeout length %s in %s", sessionTimeoutString, configFile);
-					exit(1);
-				}
-				hour = minute;
-				minute = second;
-				endPtr2++;
-				second = strtol(endPtr2, &endPtr, 10);
-				if (*endPtr != '\0') {
-					stdLogError(0, "Invalid session timeout length %s in %s", sessionTimeoutString, configFile);
-					exit(1);
-				}
-			}
-		}
-		config->rapMaxSessionLife = (((hour * 60) + minute) * 60) + second;
-		xmlFree((char *) sessionTimeoutString);
-	}
-	return result;
+	return readConfigTime(reader, &config->rapMaxSessionLife, configFile);
 }
 
 static int configMaxIpConnections(WebdavdConfiguration * config, xmlTextReaderPtr reader, const char * configFile) {
@@ -159,8 +164,8 @@ static int configMaxIpConnections(WebdavdConfiguration * config, xmlTextReaderPt
 }
 
 static int configRapTimeout(WebdavdConfiguration * config, xmlTextReaderPtr reader, const char * configFile) {
-	// <rap-timeout>120</rap-timeout>
-	return readConfigInt(reader, &config->rapTimeoutRead, configFile);
+	// <rap-timeout>2:00</rap-timeout>
+	return readConfigTime(reader, &config->rapTimeoutRead, configFile);
 }
 
 static int configRestricted(WebdavdConfiguration * config, xmlTextReaderPtr reader, const char * configFile) {
@@ -189,6 +194,11 @@ static int configAccessLog(WebdavdConfiguration * config, xmlTextReaderPtr reade
 
 static int configErrorLog(WebdavdConfiguration * config, xmlTextReaderPtr reader, const char * configFile) {
 	return readConfigString(reader, &config->errorLog);
+}
+
+static int configMaxLockTime(WebdavdConfiguration * config, xmlTextReaderPtr reader, const char * configFile) {
+	// <max-lock-time>120</max-lock-time>
+	return readConfigTime(reader, &config->maxLockTime, configFile);
 }
 
 //<ssl-cert>...</ssl-cert>
@@ -268,7 +278,8 @@ static int compareConfigFunction(const void * a, const void * b) {
 static const ConfigurationFunction configFunctions[] = { { .nodeName = "access-log", .func = &configAccessLog }, //<access-log />
 		{ .nodeName = "error-log", .func = &configErrorLog },                  // <error-log />
 		{ .nodeName = "listen", .func = &configListen },                       // <listen />
-		{ .nodeName = "max-ip-connections", .func = &configMaxIpConnections }, //<max-ip-connections />
+		{ .nodeName = "max-ip-connections", .func = &configMaxIpConnections }, // <max-ip-connections />
+		{ .nodeName = "max-lock-time", .func = &configMaxLockTime},            // <max-lock-time />
 		{ .nodeName = "mime-file", .func = &configMimeFile },                  // <mime-file />
 		{ .nodeName = "pam-service", .func = &configPamService },              // <pam-service />
 		{ .nodeName = "rap-binary", .func = &configRapBinary },                // <rap-binary />
@@ -296,7 +307,7 @@ static int configureServer(WebdavdConfiguration * config, xmlTextReaderPtr reade
 					sizeof(*configFunctions), &compareConfigFunction);
 
 			if (function) {
-				function->func(config, reader, configFile);
+				result = function->func(config, reader, configFile);
 			} else {
 				result = stepOver(reader);
 			}
@@ -327,6 +338,9 @@ static int configureServer(WebdavdConfiguration * config, xmlTextReaderPtr reade
 	}
 	if (!config->pamServiceName) {
 		config->pamServiceName = "webdav";
+	}
+	if (!config->maxLockTime) {
+		config->maxLockTime = 60;
 	}
 
 	return result;

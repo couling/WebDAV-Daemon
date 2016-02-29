@@ -5,6 +5,7 @@
 #include "shared.h"
 #include "configuration.h"
 #include "rap-control.h"
+#include "lockdb.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -39,8 +40,9 @@ typedef struct SSLCertificate {
 typedef struct MHD_Connection Request;
 typedef struct MHD_Response Response;
 
-typedef struct FDResponse {
+typedef struct FDResponseData {
 	int fd;
+	const char * lockToken;
 	off_t pos;
 	off_t offset;
 	off_t size;
@@ -457,15 +459,21 @@ static ssize_t fdContentReader(void *cls, uint64_t pos, char *buf, size_t max) {
 static void fdContentReaderCleanup(void *cls) {
 	FDResponseData * fdResponseData = cls;
 	close(fdResponseData->fd);
+	if (fdResponseData->lockToken) {
+		unuseLock(fdResponseData->lockToken);
+	}
 	freeSafe(fdResponseData);
 }
 
-static Response * createFdResponse(int fd, uint64_t offset, uint64_t size, const char * mimeType, time_t date) {
+static Response * createFdResponse(int fd, uint64_t offset, uint64_t size, const char * mimeType, time_t date,
+		const char * lockToken) {
+
 	FDResponseData * fdResponseData = mallocSafe(sizeof(*fdResponseData));
 	fdResponseData->fd = fd;
 	fdResponseData->pos = 0;
 	fdResponseData->offset = offset;
 	fdResponseData->size = size;
+	fdResponseData->lockToken = lockToken;
 	Response * response = MHD_create_response_from_callback(size, 40960, &fdContentReader, fdResponseData,
 			&fdContentReaderCleanup);
 	if (!response) {
@@ -482,16 +490,19 @@ static Response * createFdResponse(int fd, uint64_t offset, uint64_t size, const
 	return response;
 }
 
-static Response * createFileResponse(Request *request, const char * fileName, const char * mimeType) {
+static Response * createFileResponse(Request *request, const char * fileName, const char * mimeType,
+		const char * lockToken) {
+
 	int fd = open(fileName, O_RDONLY | O_CLOEXEC);
 	if (fd == -1) {
 		stdLogError(errno, "Could not open file for response", fileName);
+		// TODO CHANGE THIS!!!
 		return NULL;
 	}
 
 	struct stat statBuffer;
 	fstat(fd, &statBuffer);
-	return createFdResponse(fd, 0, statBuffer.st_size, mimeType, statBuffer.st_mtime);
+	return createFdResponse(fd, 0, statBuffer.st_size, mimeType, statBuffer.st_mtime, lockToken);
 }
 
 static int processRangeHeader(off_t * offset, size_t * fileSize, const char *range) {
@@ -541,7 +552,7 @@ static int processRangeHeader(off_t * offset, size_t * fileSize, const char *ran
 	return 1;
 }
 
-static int createRapResponse(Request *request, struct Message * message, Response ** response) {
+static int createRapResponse(Request *request, struct Message * message, Response ** response, const char * lockToken) {
 	// Queue the response
 	switch (message->mID) {
 	case RAP_MULTISTATUS: {
@@ -552,13 +563,13 @@ static int createRapResponse(Request *request, struct Message * message, Respons
 			return MHD_HTTP_INTERNAL_SERVER_ERROR;
 		}
 
-		*response = createFdResponse(message->fd, 0, -1, mimeType, date);
+		*response = createFdResponse(message->fd, 0, -1, mimeType, date, lockToken);
 		return RAP_MULTISTATUS;
 	}
 
 	case RAP_SUCCESS: {
 		if (message->fd == -1) {
-			*response = createFileResponse(request, OK_PAGE, "text/html");
+			*response = createFileResponse(request, OK_PAGE, "text/html", lockToken);
 			return RAP_SUCCESS;
 		}
 
@@ -576,7 +587,7 @@ static int createRapResponse(Request *request, struct Message * message, Respons
 			if (rangeHeader && processRangeHeader(&offset, &fileSize, rangeHeader)) {
 				statusCode = MHD_HTTP_PARTIAL_CONTENT;
 			}
-			*response = createFdResponse(message->fd, offset, fileSize, mimeType, date);
+			*response = createFdResponse(message->fd, offset, fileSize, mimeType, date, lockToken);
 
 			char contentRangeHeader[200];
 			snprintf(contentRangeHeader, sizeof(contentRangeHeader), "bytes %lld-%lld/%lld", (long long) offset,
@@ -584,7 +595,7 @@ static int createRapResponse(Request *request, struct Message * message, Respons
 
 			addHeader(*response, "Content-Range", contentRangeHeader);
 		} else {
-			*response = createFdResponse(message->fd, 0, -1, mimeType, date);
+			*response = createFdResponse(message->fd, 0, -1, mimeType, date, lockToken);
 		}
 
 		if (message->bufferCount > RAP_LOCATION_INDEX) {
@@ -595,23 +606,23 @@ static int createRapResponse(Request *request, struct Message * message, Respons
 	}
 
 	case RAP_ACCESS_DENIED:
-		*response = createFileResponse(request, FORBIDDEN_PAGE, "text/html");
+		*response = createFileResponse(request, FORBIDDEN_PAGE, "text/html", lockToken);
 		return RAP_ACCESS_DENIED;
 
 	case RAP_NOT_FOUND:
-		*response = createFileResponse(request, NOT_FOUND_PAGE, "text/html");
+		*response = createFileResponse(request, NOT_FOUND_PAGE, "text/html", lockToken);
 		return RAP_NOT_FOUND;
 
 	case RAP_BAD_CLIENT_REQUEST:
-		*response = createFileResponse(request, BAD_REQUEST_PAGE, "text/html");
+		*response = createFileResponse(request, BAD_REQUEST_PAGE, "text/html", lockToken);
 		return RAP_BAD_CLIENT_REQUEST;
 
 	case RAP_INSUFFICIENT_STORAGE:
-		*response = createFileResponse(request, INSUFFICIENT_STORAGE_PAGE, "text/html");
+		*response = createFileResponse(request, INSUFFICIENT_STORAGE_PAGE, "text/html", lockToken);
 		return RAP_INSUFFICIENT_STORAGE;
 
 	case RAP_CONFLICT:
-		*response = createFileResponse(request, CONFLICT_PAGE, "text/html");
+		*response = createFileResponse(request, CONFLICT_PAGE, "text/html", lockToken);
 		return RAP_CONFLICT;
 
 	case RAP_INTERNAL_ERROR:
@@ -647,13 +658,12 @@ static int completeUpload(Request *request, RAP * processor, Response ** respons
 		if (readResult == 0) {
 			stdLogError(0, "RAP closed socket unexpectedly while waiting for response");
 		} // else { stdLogError ... has already been sent by recvMessage ... }
+		if (processor->lockToken) {
+			unuseLock(processor->lockToken);
+		}
 		return MHD_HTTP_INTERNAL_SERVER_ERROR;
-	}
-
-	if (readResult > 0) {
-		return createRapResponse(request, &message, response);
 	} else {
-		return MHD_HTTP_INTERNAL_SERVER_ERROR;
+		return createRapResponse(request, &message, response, processor->lockToken);
 	}
 }
 
@@ -677,10 +687,8 @@ static int processNewRequest(Request * request, const char * url, const char * h
 	// Interpret the method
 	Message message;
 	message.fd = rapSession->readDataFd;
-	message.params[RAP_HOST_INDEX].iov_len = strlen(host) + 1;
-	message.params[RAP_HOST_INDEX].iov_base = (void *) host;
-	message.params[RAP_FILE_INDEX].iov_len = strlen(url) + 1;
-	message.params[RAP_FILE_INDEX].iov_base = (void *) url;
+	message.params[RAP_LOCK_INDEX] = stringToMessageParam(rapSession->lockToken);
+	message.params[RAP_FILE_INDEX] = stringToMessageParam(url);
 	// TODO MKCOL
 	// TODO HEAD
 	// TODO DELETE
@@ -693,41 +701,34 @@ static int processNewRequest(Request * request, const char * url, const char * h
 	if (!strcmp("GET", method)) {
 		message.mID = RAP_READ_FILE;
 		message.bufferCount = 2;
+
 	} else if (!strcmp("PUT", method)) {
 		message.mID = RAP_WRITE_FILE;
 		message.bufferCount = 2;
+
 	} else if (!strcmp("PROPFIND", method)) {
 		message.mID = RAP_PROPFIND;
 		const char * depth = getHeader(request, "Depth");
-		if (depth) {
-			message.params[RAP_DEPTH_INDEX].iov_base = (void *) depth;
-			message.params[RAP_DEPTH_INDEX].iov_len = strlen(depth) + 1;
-		} else {
-			message.params[RAP_DEPTH_INDEX].iov_base = "infinity";
-			message.params[RAP_DEPTH_INDEX].iov_len = sizeof("infinity");
-		}
+		message.params[RAP_DEPTH_INDEX] = stringToMessageParam(depth ? depth : "infinity");
 		message.bufferCount = 3;
+
 	} else if (!strcmp("PROPPATCH", method)) {
 		message.mID = RAP_PROPPATCH;
 		const char * depth = getHeader(request, "Depth");
-		if (depth) {
-			message.params[RAP_DEPTH_INDEX].iov_base = (void *) depth;
-			message.params[RAP_DEPTH_INDEX].iov_len = strlen(depth) + 1;
-		} else {
-			message.params[RAP_DEPTH_INDEX].iov_base = "infinity";
-			message.params[RAP_DEPTH_INDEX].iov_len = sizeof("infinity");
-		}
+		message.params[RAP_DEPTH_INDEX] = stringToMessageParam(depth ? depth : "infinity");
 		message.bufferCount = 3;
+
 	} else if (!strcmp("OPTIONS", method)) {
-		*response = createFileResponse(request, OPTIONS_PAGE, "text/html");
+		*response = createFileResponse(request, OPTIONS_PAGE, "text/html", rapSession->lockToken);
 		addHeader(*response, "Accept", ACCEPT_HEADER);
 		return MHD_HTTP_OK;
+
 	} else {
 		stdLogError(0, "Can not cope with method: %s (%s data)", method,
 				(rapSession->writeDataFd != -1 ? "with" : "without"));
+
 		return MHD_HTTP_METHOD_NOT_ALLOWED;
 	}
-
 	// Send the request to the RAP
 	size_t ioResult = sendMessage(rapSession->socketFd, &message);
 	rapSession->readDataFd = -1; // this will always be closed by sendMessage even on failure!
@@ -751,7 +752,7 @@ static int processNewRequest(Request * request, const char * url, const char * h
 		}
 		return MHD_HTTP_CONTINUE;
 	} else {
-		return createRapResponse(request, &message, response);
+		return createRapResponse(request, &message, response, rapSession->lockToken);
 	}
 }
 
@@ -1044,10 +1045,18 @@ static int getBindAddress(struct sockaddr_in6 * address, DaemonConfig * daemon) 
 	return 1;
 }
 
+void cleaner() {
+	while (!sleep(60)) {
+		runCleanRapPool();
+		runCleanLocks();
+	}
+}
+
 static void runServer() {
 	initializeLogs();
 	initializeStaticResponses();
 	initializeRapDatabase();
+	initializeLockDB();
 	initializeSSL();
 
 	// Start up the daemons
@@ -1094,6 +1103,9 @@ static void runServer() {
 		}
 	}
 
+	// Use the main thread as the cleaner thread.  We could start a new dedicated cleaner thread here then exit this thread but what would be the point?
+	cleaner();
+	stdLogError(errno, "Cleaner thread shut down");
 	pthread_exit(NULL);
 }
 

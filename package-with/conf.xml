@@ -75,7 +75,7 @@
 
 		<!-- If a RAP hangs the thread waiting on it will wait this long before 
 			giving up -->
-		<rap-timeout>120</rap-timeout>
+		<rap-timeout>2:00</rap-timeout>
 
 		<!-- The service name for PAM. This corresponds to a file of the same name 
 			in /etc/pam.d/ on linux systems. default webdavd -->
@@ -85,6 +85,9 @@
 			Again this should only be changed on non-standard sytems or for testing when 
 			the files can not be placed in /usr/share/webdavd -->
 		<static-response-dir>/usr/share/webdav</static-response-dir>
+		
+		<!-- The maximum amount of time before a lock expires automatically -->
+		<max-lock-time>2:00</max-lock-time>
 
 		<!-- File location for logs. If not specified or left blank the error log 
 			will print to stdout and the access log to stderr -->
