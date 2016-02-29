@@ -375,7 +375,7 @@ static void xmlFreeIfNotNull(const char * value) {
 
 static void freeIfNotNull(void * value) {
 	if (value) {
-		free(value);
+		freeSafe(value);
 	}
 }
 

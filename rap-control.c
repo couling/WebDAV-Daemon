@@ -1,3 +1,5 @@
+// TODO re-introduce rap pool for clients which do not keep connections alive.
+
 #include "rap-control.h"
 
 #include "shared.h"
@@ -18,12 +20,11 @@ typedef struct RAPDB {
 
 // Used as a place holder for failed auth requests which failed due to invalid credentials
 const RAP AUTH_FAILED_RAP = { .pid = 0, .socketFd = -1, .user = "<auth failed>", .writeDataFd = -1, .readDataFd = -1,
-		.responseAlreadyGiven = 1 };
+		.responseAlreadyGiven = 403, .next = NULL, .prevPtr = NULL };
 
 // Used as a place holder for failed auth requests which failed due to errors
 const RAP AUTH_ERROR_RAP = { .pid = 0, .socketFd = -1, .user = "<auth error>", .writeDataFd = -1, .readDataFd = -1,
-		.responseAlreadyGiven = 1 };
-
+		.responseAlreadyGiven = 500, .next = NULL, .prevPtr = NULL };
 
 static pthread_key_t rapDBThreadKey;
 
@@ -112,10 +113,10 @@ void destroyRap(RAP * rapSession) {
 		close(rapSession->writeDataFd);
 	}
 
-	free((void *) rapSession->user);
-	free((void *) rapSession->password);
+	freeSafe((void * ) rapSession->user);
+	freeSafe((void * ) rapSession->password);
 	*(rapSession->prevPtr) = rapSession->next;
-	free(rapSession);
+	freeSafe(rapSession);
 }
 
 static RAP * createRap(RAPDB * db, const char * user, const char * password, const char * rhost) {
@@ -159,7 +160,7 @@ static RAP * createRap(RAPDB * db, const char * user, const char * password, con
 	}
 
 	// If successfully authenticated then populate the RAP structure and add it to the DB
-	RAP * newRap = mallocSafe(sizeof(RAP));
+	RAP * newRap = mallocSafe(sizeof(*newRap));
 	newRap->pid = pid;
 	newRap->socketFd = socketFd;
 	newRap->user = copyString(user);
@@ -171,7 +172,7 @@ static RAP * createRap(RAPDB * db, const char * user, const char * password, con
 	newRap->readDataFd = -1;
 	// newRap->responseAlreadyGiven // this is set elsewhere
 	db->firstRapSession = newRap;
-
+	stdLog("%p create rap (prev %p, next %p)", &newRap->next, newRap->prevPtr, &newRap->next->next);
 	return newRap;
 }
 
@@ -192,7 +193,9 @@ RAP * acquireRap(const char * user, const char * password, const char * clientIp
 			RAP * rap = rapDB->firstRapSession;
 			while (rap) {
 				if (rap->rapCreated < expires) {
+					RAP * raptmp = rap->next;
 					destroyRap(rap);
+					rap = raptmp;
 				} else if (!strcmp(user, rap->user) && !strcmp(password, rap->password)) {
 					return rap;
 				} else {
@@ -219,11 +222,10 @@ static void cleanupAfterRap(int sig, siginfo_t *siginfo, void *context) {
 static void deInitializeRapDatabase(void * data) {
 	RAPDB * db = data;
 	if (db) {
-		RAPDB * db = data;
 		while (db->firstRapSession) {
 			destroyRap(db->firstRapSession);
 		}
-		free(db);
+		freeSafe(db);
 	}
 }
 

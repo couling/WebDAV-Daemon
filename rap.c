@@ -434,7 +434,7 @@ static int respondToPropFind(const char * file, const char * host, PropertySet *
 	message.params[RAP_LOCATION_INDEX].iov_len = filePathSize + 1;
 	ssize_t messageResult = sendMessage(RAP_CONTROL_SOCKET, &message);
 	if (messageResult <= 0) {
-		free(filePath);
+		freeSafe(filePath);
 		close(pipeEnds[PIPE_WRITE]);
 		return messageResult;
 	}
@@ -469,11 +469,11 @@ static int respondToPropFind(const char * file, const char * host, PropertySet *
 			}
 		}
 		closedir(dir);
-		free(childFileName);
+		freeSafe(childFileName);
 	}
 	xmlTextWriterEndElement(writer);
 	xmlFreeTextWriter(writer);
-	free(filePath);
+	freeSafe(filePath);
 	return messageResult;
 
 }
@@ -680,10 +680,10 @@ static void listDir(const char * file, int dirFd, int writeFd) {
 	xmlTextWriterEndElement(writer);
 	xmlTextWriterEndElement(writer);
 
-	free(filePath);
+	freeSafe(filePath);
 	xmlFreeTextWriter(writer);
 	closedir(dir);
-	free(directoryEntries);
+	freeSafe(directoryEntries);
 }
 
 static ssize_t readFile(Message * requestMessage) {
@@ -817,9 +817,9 @@ static int pamAuthenticate(const char * user, const char * password, const char 
 	clearenv();
 	for (char ** pam_env = envList; *pam_env != NULL; ++pam_env) {
 		putenv(*pam_env);
-		free(*pam_env);
+		freeSafe(*pam_env);
 	}
-	free(envList);
+	freeSafe(envList);
 
 	if (!lockToUser(user)) {
 		stdLogError(errno, "Could not set uid or gid");

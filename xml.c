@@ -132,7 +132,7 @@ const char * nodeTypeToName(int nodeType) {
 
 static int xmlFdOutputCloseCallback(void * context) {
 	close(*((int *) context));
-	free(context);
+	freeSafe(context);
 	return 0;
 }
 

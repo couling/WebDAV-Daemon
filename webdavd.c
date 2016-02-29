@@ -44,7 +44,7 @@ typedef struct FDResponse {
 	off_t pos;
 	off_t offset;
 	off_t size;
-} FDResponse;
+} FDResponseData;
 
 ////////////////////
 // End Structures //
@@ -225,7 +225,7 @@ static SSLCertificate * findCertificateForHost(const char * hostname) {
 						&sslCertificateCompareHost);
 			}
 		} while (!found && *wildCardHostName);
-		free(newHostName);
+		freeSafe(newHostName);
 	}
 	return found;
 }
@@ -269,12 +269,12 @@ static int loadSSLCertificateFile(const char * fileName, gnutls_x509_crt_t * x50
 
 	int ret;
 	if ((ret = gnutls_x509_crt_init(x509Certificate)) < 0) {
-		free(certData.data);
+		freeSafe(certData.data);
 		return ret;
 	}
 
 	ret = gnutls_x509_crt_import(*x509Certificate, &certData, GNUTLS_X509_FMT_PEM);
-	free(certData.data);
+	freeSafe(certData.data);
 	if (ret < 0) {
 		gnutls_x509_crt_deinit(*x509Certificate);
 		return ret;
@@ -299,12 +299,12 @@ static int loadSSLKeyFile(const char * fileName, gnutls_privkey_t * key) {
 
 	int ret = gnutls_privkey_init(key);
 	if (ret < 0) {
-		free(keyData.data);
+		freeSafe(keyData.data);
 		return ret;
 	}
 
 	ret = gnutls_privkey_import_x509_raw(*key, &keyData, GNUTLS_X509_FMT_PEM, NULL, 0);
-	free(keyData.data);
+	freeSafe(keyData.data);
 	if (ret < 0) {
 		gnutls_privkey_deinit(*key);
 	}
@@ -332,7 +332,7 @@ static int loadSSLCertificate(SSLConfig * sslConfig) {
 			for (int j = 0; j < i; j++) {
 				gnutls_pcert_deinit(&newCertificate.certs[j + 1]);
 			}
-			free(newCertificate.certs);
+			freeSafe(newCertificate.certs);
 			return ret;
 		}
 		gnutls_x509_crt_deinit(x509Certificate);
@@ -344,7 +344,7 @@ static int loadSSLCertificate(SSLConfig * sslConfig) {
 		for (int i = 1; i < newCertificate.certCount; i++) {
 			gnutls_pcert_deinit(&newCertificate.certs[i]);
 		}
-		free(newCertificate.certs);
+		freeSafe(newCertificate.certs);
 	}
 
 	int found = 0;
@@ -374,7 +374,7 @@ static int loadSSLCertificate(SSLConfig * sslConfig) {
 		for (int i = 0; i < newCertificate.certCount; i++) {
 			gnutls_pcert_deinit(&newCertificate.certs[i]);
 		}
-		free(newCertificate.certs);
+		freeSafe(newCertificate.certs);
 		return -1;
 	}
 
@@ -419,7 +419,7 @@ static void addStaticHeaders(Response * response) {
 }
 
 static ssize_t fdContentReader(void *cls, uint64_t pos, char *buf, size_t max) {
-	FDResponse * fdResponsedata = cls;
+	FDResponseData * fdResponsedata = cls;
 	if (pos != fdResponsedata->pos) {
 		off_t seekTo = pos + fdResponsedata->offset;
 		off_t result = lseek(fdResponsedata->fd, pos + fdResponsedata->offset, SEEK_SET);
@@ -455,13 +455,13 @@ static ssize_t fdContentReader(void *cls, uint64_t pos, char *buf, size_t max) {
 }
 
 static void fdContentReaderCleanup(void *cls) {
-	FDResponse * fdResponseData = cls;
+	FDResponseData * fdResponseData = cls;
 	close(fdResponseData->fd);
-	free(fdResponseData);
+	freeSafe(fdResponseData);
 }
 
 static Response * createFdResponse(int fd, uint64_t offset, uint64_t size, const char * mimeType, time_t date) {
-	FDResponse * fdResponseData = mallocSafe(sizeof(FDResponse));
+	FDResponseData * fdResponseData = mallocSafe(sizeof(*fdResponseData));
 	fdResponseData->fd = fd;
 	fdResponseData->pos = 0;
 	fdResponseData->offset = offset;
@@ -813,19 +813,20 @@ static int answerToRequest(void *cls, Request *request, const char *url, const c
 
 	if (rapSession) {
 		if (*upload_data_size) {
-			// Finished uploading data
+			// Uploading more data
 			if (!rapSession->responseAlreadyGiven) {
 				processUploadData(request, upload_data, *upload_data_size, rapSession);
 			}
 			*upload_data_size = 0;
 			return MHD_YES;
 		} else {
-			// Uploading more data
+			// Finished uploading data
 			if (rapSession->responseAlreadyGiven) {
 				if (rapSession->responseAlreadyGiven == RAP_INTERNAL_ERROR) {
 					destroyRap(rapSession);
+				} else {
+					releaseRap(rapSession);
 				}
-				releaseRap(rapSession);
 				return MHD_YES;
 			} else {
 				Response * response;
@@ -989,17 +990,17 @@ static void initializeStaticResponses() {
 	char * string;
 	string = createStaticFileName("HTTP_INTERNAL_SERVER_ERROR.html");
 	initializeStaticResponse(&INTERNAL_SERVER_ERROR_PAGE, string, "text/html");
-	free(string);
+	freeSafe(string);
 
 	string = createStaticFileName("HTTP_UNAUTHORIZED.html");
 	initializeStaticResponse(&UNAUTHORIZED_PAGE, string, "text/html");
 	addHeader(UNAUTHORIZED_PAGE, "WWW-Authenticate", "Basic realm=\"My Server\"");
-	free(string);
+	freeSafe(string);
 
 	string = createStaticFileName("HTTP_METHOD_NOT_SUPPORTED.html");
 	initializeStaticResponse(&METHOD_NOT_SUPPORTED_PAGE, string, "text/html");
 	addHeader(METHOD_NOT_SUPPORTED_PAGE, "Allow", ACCEPT_HEADER);
-	free(string);
+	freeSafe(string);
 
 	FORBIDDEN_PAGE = createStaticFileName("HTTP_FORBIDDEN.html");
 	NOT_FOUND_PAGE = createStaticFileName("HTTP_NOT_FOUND.html");

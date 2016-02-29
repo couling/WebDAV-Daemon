@@ -70,6 +70,7 @@ void stdLogError(int errorNumber, const char * str, ...) {
 void * mallocSafe(size_t size) {
 	void * allocatedMemory = malloc(size);
 	if (allocatedMemory) {
+		//stdLog("%p malloc(%zd)", allocatedMemory, size );
 		return allocatedMemory;
 	} else {
 		stdLogError(errno, "Could not allocation %zd bytes of memory", size);
@@ -83,6 +84,7 @@ void * reallocSafe(void * mem, size_t newSize) {
 	}
 	void * allocatedMemory = realloc(mem, newSize);
 	if (allocatedMemory) {
+		//stdLog("%p realloc(%p, %zd)", allocatedMemory, mem, newSize );
 		return allocatedMemory;
 	} else {
 		stdLogError(errno, "Could not allocation %zd bytes of memory", newSize);
@@ -262,7 +264,7 @@ char * loadFileToBuffer(const char * file, size_t * size) {
 			size_t bytesRead = read(fd, buffer + totalBytesRead, stat.st_size - totalBytesRead);
 			if (bytesRead <= 0) {
 				stdLogError(bytesRead < 0 ? errno : 0, "Could not read whole file %s", file);
-				free(buffer);
+				freeSafe(buffer);
 				close(fd);
 				return NULL;
 			} else {

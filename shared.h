@@ -50,6 +50,8 @@ enum RapConstant {
 
 void * mallocSafe(size_t size);
 void * reallocSafe(void * mem, size_t newSize);
+#define freeSafe(foo) /*stdLog("%p free(%s)", foo, QUOTE(foo) );*/ free(foo)
+
 char * copyString(const char * string);
 
 char * timeNow(char * t);
@@ -57,6 +59,9 @@ size_t getWebDate(time_t rawtime, char * buf, size_t bufSize);
 
 void stdLog(const char * str, ...);
 void stdLogError(int errorNumber, const char * str, ...);
+
+#define QUOTE(name) #name
+#define STR(macro) QUOTE(macro)
 
 #define MAX_MESSAGE_PARAMS 3
 #define INCOMING_BUFFER_SIZE 4096
