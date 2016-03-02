@@ -8,10 +8,10 @@
 
 #define RAP_CONTROL_SOCKET 3
 
-enum RapConstant {
+typedef enum RapConstant {
 	RAP_AUTHENTICATE = 1,
-	RAP_READ_FILE,
-	RAP_WRITE_FILE,
+	RAP_GET,
+	RAP_PUT,
 	RAP_PROPFIND,
 	RAP_PROPPATCH,
 
@@ -25,7 +25,7 @@ enum RapConstant {
 	RAP_CONFLICT = 409,
 	RAP_BAD_CLIENT_REQUEST = 400,
 	RAP_INTERNAL_ERROR = 500
-};
+} RapConstant;
 
 // Auth Request
 #define RAP_USER_INDEX 0

@@ -9,7 +9,7 @@ typedef enum LockType {
 } LockType;
 
 int acquireLock(const char ** lockToken, const char * user, const char * file, LockType lockType, int fd);
-int useLock(const char * lockToken, const char * file, const char * user);
+int useLock(const char * lockToken, const char * file, const char * user, LockType lockType);
 void unuseLock(const char * lockToken);
 int releaseLock(const char * lockToken, const char * file, const char * user, int fd);
 

@@ -20,12 +20,12 @@ typedef struct RapList {
 } RapList;
 
 // Used as a place holder for failed auth requests which failed due to invalid credentials
-const RAP AUTH_FAILED_RAP = { .pid = 0, .socketFd = -1, .user = "<auth failed>", .writeDataFd = -1, .readDataFd = -1,
-		.responseAlreadyGiven = 403, .next = NULL, .prevPtr = NULL };
+const RAP AUTH_FAILED_RAP = { .pid = 0, .socketFd = -1, .user = "<auth failed>", .requestWriteDataFd = -1, .requestReadDataFd = -1,
+		.requestResponseAlreadyGiven = 403, .next = NULL, .prevPtr = NULL };
 
 // Used as a place holder for failed auth requests which failed due to errors
-const RAP AUTH_ERROR_RAP = { .pid = 0, .socketFd = -1, .user = "<auth error>", .writeDataFd = -1, .readDataFd = -1,
-		.responseAlreadyGiven = 500, .next = NULL, .prevPtr = NULL };
+const RAP AUTH_ERROR_RAP = { .pid = 0, .socketFd = -1, .user = "<auth error>", .requestWriteDataFd = -1, .requestReadDataFd = -1,
+		.requestResponseAlreadyGiven = 500, .next = NULL, .prevPtr = NULL };
 
 static pthread_key_t rapDBThreadKey;
 static sem_t rapPoolLock;
@@ -130,13 +130,13 @@ void destroyRap(RAP * rapSession) {
 		return;
 	}
 	close(rapSession->socketFd);
-	if (rapSession->readDataFd != -1) {
+	if (rapSession->requestReadDataFd != -1) {
 		stdLogError(0, "readDataFd was not properly closed before destroying rap");
-		close(rapSession->readDataFd);
+		close(rapSession->requestReadDataFd);
 	}
-	if (rapSession->writeDataFd != -1) {
+	if (rapSession->requestWriteDataFd != -1) {
 		stdLogError(0, "writeDataFd was not properly closed before destroying rap");
-		close(rapSession->writeDataFd);
+		close(rapSession->requestWriteDataFd);
 	}
 
 	freeSafe((void * ) rapSession->user);
@@ -191,8 +191,8 @@ static RAP * createRap(RapList * db, const char * user, const char * password, c
 	newRap->password = copyString(password);
 	newRap->clientIp = copyString(rhost);
 	time(&newRap->rapCreated);
-	newRap->writeDataFd = -1;
-	newRap->readDataFd = -1;
+	newRap->requestWriteDataFd = -1;
+	newRap->requestReadDataFd = -1;
 	addRapToList(db, newRap);
 	// newRap->responseAlreadyGiven // this is set elsewhere
 	return newRap;

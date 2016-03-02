@@ -14,9 +14,11 @@
 #include <time.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <uuid/uuid.h>
+
+typedef char LockToken[37];
 
 typedef struct Lock {
-	const char lockToken[16];
 	const char * user;
 	const char * file;
 	time_t lockAcquired;
@@ -24,17 +26,17 @@ typedef struct Lock {
 	int fd;
 	int useCount;
 	int released;
+	LockToken lockToken;
 } Lock;
 
 static void * rootNode = NULL;
 static sem_t lockDBLock;
-long long nextLockTocken = 1;
 
-#define addLockToDb(lock) tsearch(lock, &rootNode, &compareLock);
-#define findLockInDb(lock) tfind(lock, &rootNode, &compareLock);
-#define deleteLockFromDb(lock) tdelete(lock, &rootNode, &compareLock);
+#define addLockToDb(lock) tsearch(lock, &rootNode, &compareLockToken);
+#define findLockInDb(lock) tfind(lock, &rootNode, &compareLockToken);
+#define deleteLockFromDb(lock) tdelete(lock, &rootNode, &compareLockToken);
 
-static int compareLock(const void * a, const void * b) {
+static int compareLockToken(const void * a, const void * b) {
 	const Lock * lhs = a;
 	const Lock * rhs = b;
 	return strcmp(lhs->lockToken, rhs->lockToken);
@@ -47,37 +49,35 @@ static Lock * findLock(const char * lockToken) {
 }
 
 int acquireLock(const char ** lockToken, const char * user, const char * file, LockType lockType, int fd) {
-	if (flock(fd, lockType) == -1) {
-		stdLogError(errno, "Could not acquire explicit lock on %s", file);
+	size_t userSize = strlen(user) + 1;
+	size_t fileSize = strlen(file) + 1;
+	size_t bufferSize = sizeof(Lock) + userSize + fileSize;
+
+	char * buffer = mallocSafe(bufferSize);
+	Lock * newLock = (Lock *) buffer;
+	newLock->user = buffer + sizeof(Lock);
+	newLock->file = newLock->user + userSize;
+
+	uuid_t uuid;
+	uuid_generate(uuid);
+	uuid_unparse_upper(uuid, newLock->lockToken);
+	memcpy((char *) newLock->user, user, userSize);
+	memcpy((char *) newLock->file, file, fileSize);
+	time(&newLock->lockAcquired);
+	newLock->type = lockType;
+	newLock->fd = fd;
+	newLock->useCount = 1;
+	newLock->released = 0;
+
+	if (sem_wait(&lockDBLock) == -1) {
+		stdLogError(errno, "Could not wait for access to lock db");
 		close(fd);
+		freeSafe(newLock);
 		return 0;
 	} else {
-		size_t userSize = strlen(user) + 1;
-		size_t fileSize = strlen(file) + 1;
-		size_t bufferSize = sizeof(Lock) + userSize + fileSize;
-		char * buffer = mallocSafe(bufferSize);
-		Lock * newLock = (Lock *) buffer;
-		newLock->user = buffer + sizeof(Lock);
-		newLock->file = newLock->user + userSize;
-		memcpy((char *) newLock->user, user, userSize);
-		memcpy((char *) newLock->file, file, fileSize);
-		time(&newLock->lockAcquired);
-		newLock->type = lockType;
-		newLock->fd = fd;
-		newLock->useCount = 1;
-		newLock->released = 0;
-		if (sem_wait(&lockDBLock) == -1) {
-			stdLogError(errno, "Could not wait for access to lock db");
-			close(fd);
-			freeSafe(newLock);
-			return 0;
-		} else {
-			snprintf((char *) newLock->lockToken, 16, "%lld", nextLockTocken++);
-			addLockToDb(newLock);
-			sem_post(&lockDBLock);
-			return 1;
-		}
-
+		addLockToDb(newLock);
+		sem_post(&lockDBLock);
+		return 1;
 	}
 }
 
@@ -90,13 +90,14 @@ static void releaseUnusedLock(Lock * lock) {
 	}
 }
 
-int useLock(const char * lockToken, const char * file, const char * user) {
+int useLock(const char * lockToken, const char * file, const char * user, LockType lockType) {
 	if (sem_wait(&lockDBLock) == -1) {
 		stdLogError(errno, "Could not wait for access to lock db");
 		return 0;
 	}
 	Lock * foundLock = findLock(lockToken);
-	if (foundLock != NULL && !strcmp(foundLock->user, user) && !strcmp(foundLock->file, file) && !foundLock->released) {
+	if (foundLock != NULL && (lockType == foundLock->type || foundLock->type == LOCK_TYPE_EXCLUSIVE)
+			&& !strcmp(foundLock->user, user) && !strcmp(foundLock->file, file) && !foundLock->released) {
 		foundLock->useCount++;
 		time(&foundLock->lockAcquired);
 		sem_post(&lockDBLock);
@@ -147,7 +148,7 @@ static void cleanAction(const void *nodep, const VISIT which, const int depth) {
 	switch (which) {
 	case postorder:
 	case leaf: {
-		Lock ** node = (Lock **)nodep;
+		Lock ** node = (Lock **) nodep;
 		Lock * lock = *node;
 		if (lock->lockAcquired < expiryTime && !lock->released) {
 			int index = readyForReleaseCount++;
@@ -168,19 +169,21 @@ void runCleanLocks() {
 	if (sem_wait(&lockDBLock) == -1) {
 		stdLogError(errno, "Could not wait for access to lock db");
 	} else {
-		time(&expiryTime);
-		expiryTime -= config.maxLockTime;
-		readyForReleaseCount = 0;
-		readyForRelease = NULL;
-		twalk(&rootNode, &cleanAction);
+		if (rootNode) {
+			time(&expiryTime);
+			expiryTime -= config.maxLockTime;
+			readyForReleaseCount = 0;
+			readyForRelease = NULL;
+			twalk(&rootNode, &cleanAction);
 
-		if (readyForReleaseCount > 0) {
-			int i = 0;
-			do {
-				readyForRelease[i]->released = 1;
-				releaseUnusedLock(readyForRelease[i]);
-			} while (i < readyForReleaseCount);
-			freeSafe(readyForRelease);
+			if (readyForReleaseCount > 0) {
+				int i = 0;
+				do {
+					readyForRelease[i]->released = 1;
+					releaseUnusedLock(readyForRelease[i]);
+				} while (i < readyForReleaseCount);
+				freeSafe(readyForRelease);
+			}
 		}
 
 		sem_post(&lockDBLock);
@@ -188,6 +191,9 @@ void runCleanLocks() {
 }
 
 void initializeLockDB() {
+	time_t timeNow;
+	time(&timeNow);
+	srandom(timeNow);
 	if (sem_init(&lockDBLock, 0, 1) == -1) {
 		stdLogError(errno, "Could not create lock for lockdb");
 		exit(255);

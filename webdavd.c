@@ -197,6 +197,15 @@ static const char * getHeader(Request *request, const char * headerKey) {
 	return header.value;
 }
 
+static int requestHasData(Request *request) {
+	if (getHeader(request, "Content-Length")) {
+		return 1;
+	} else {
+		const char * te = getHeader(request, "Transfer-Encoding");
+		return te && !strcmp(te, "chunked");
+	}
+}
+
 /////////////////
 // End Utility //
 /////////////////
@@ -552,9 +561,19 @@ static int processRangeHeader(off_t * offset, size_t * fileSize, const char *ran
 	return 1;
 }
 
-static int createRapResponse(Request *request, struct Message * message, Response ** response, const char * lockToken) {
+static int createResponseFromMessage(Request *request, struct Message * message, Response ** response,
+		const char * lockToken) {
 	// Queue the response
 	switch (message->mID) {
+	case RAP_CONTINUE:
+	case RAP_INTERNAL_ERROR:
+		// There is no response body to set for these codes
+		// They will be handled elswehere.
+		if (message->fd != -1) {
+			close(message->fd);
+		}
+		return message->mID;
+
 	case RAP_MULTISTATUS: {
 		const char * mimeType = messageParamToString(&message->params[RAP_FILE_INDEX]);
 		time_t date = *((time_t *) message->params[RAP_DATE_INDEX].iov_base);
@@ -625,32 +644,22 @@ static int createRapResponse(Request *request, struct Message * message, Respons
 		*response = createFileResponse(request, CONFLICT_PAGE, "text/html", lockToken);
 		return RAP_CONFLICT;
 
-	case RAP_INTERNAL_ERROR:
 	default:
-		stdLogError(0, "Error response from RAP %d", (int) message->mID);
-		return message->mID;
+		stdLogError(0, "Response from RAP %d", (int) message->mID);
+		return RAP_INTERNAL_ERROR;
 	}
 
 }
 
 ///////////////////////////
-// End Response Queueing //
+// End Response Creation //
 ///////////////////////////
 
 //////////////////////////
 // Main Handler Methods //
 //////////////////////////
 
-static int completeUpload(Request *request, RAP * processor, Response ** response) {
-
-	// Closing this pipe signals to the rap that there is no more data
-	// This MUST happen before the recvMessage a few lines below or the RAP
-	// will NOT send a message and recvMessage will hang.
-	if (processor->writeDataFd != -1) {
-		close(processor->writeDataFd);
-		processor->writeDataFd = -1;
-	}
-
+static int finishProcessingRequest(Request *request, RAP * processor, Response ** response) {
 	Message message;
 	char incomingBuffer[INCOMING_BUFFER_SIZE];
 	int readResult = recvMessage(processor->socketFd, &message, incomingBuffer, INCOMING_BUFFER_SIZE);
@@ -658,37 +667,28 @@ static int completeUpload(Request *request, RAP * processor, Response ** respons
 		if (readResult == 0) {
 			stdLogError(0, "RAP closed socket unexpectedly while waiting for response");
 		} // else { stdLogError ... has already been sent by recvMessage ... }
-		if (processor->lockToken) {
-			unuseLock(processor->lockToken);
-		}
-		return MHD_HTTP_INTERNAL_SERVER_ERROR;
+		return RAP_INTERNAL_ERROR;
 	} else {
-		return createRapResponse(request, &message, response, processor->lockToken);
+		return createResponseFromMessage(request, &message, response, processor->requestLockToken);
 	}
 }
 
-static void processUploadData(Request * request, const char * upload_data, size_t upload_data_size, RAP * processor) {
-
-	if (processor->writeDataFd != -1) {
-		size_t bytesWritten = write(processor->writeDataFd, upload_data, upload_data_size);
-		if (bytesWritten < upload_data_size) {
-			// not all data could be written to the file handle and therefore
-			// the operation has now failed. There's nothing we can do now but report the error
-			// This may not actually be desirable and so we need to consider slamming closed the connection.
-			close(processor->writeDataFd);
-			processor->writeDataFd = -1;
-		}
+static ssize_t sendRecvMessage(int socket, Message * message, char * incomingBuffer, size_t incomingBufferSize) {
+	ssize_t result = sendMessage(socket, message);
+	if (result > 0) {
+		result = recvMessage(socket, message, incomingBuffer, incomingBufferSize);
+		if (result == 0) {
+			stdLogError(0, "RAP closed socket unexpectedly while waiting for response");
+		} // else { stdLogError ... has already been sent by recvMessage ... }
 	}
+	return result;
 }
 
-static int processNewRequest(Request * request, const char * url, const char * host, const char * method,
+static int startProcessingRequest(Request * request, const char * url, const char * method,
 		RAP * rapSession, Response ** response) {
 
+	char incomingBuffer[INCOMING_BUFFER_SIZE];
 	// Interpret the method
-	Message message;
-	message.fd = rapSession->readDataFd;
-	message.params[RAP_LOCK_INDEX] = stringToMessageParam(rapSession->lockToken);
-	message.params[RAP_FILE_INDEX] = stringToMessageParam(url);
 	// TODO MKCOL
 	// TODO HEAD
 	// TODO DELETE
@@ -698,96 +698,85 @@ static int processNewRequest(Request * request, const char * url, const char * h
 	// TODO UNLOCK
 	// TODO PROPPATCH // properly
 	//stdLog("%s %s data", method, writeHandle ? "with" : "without");
+
+	/* these *may* get spun out into individual little methods so lets keep this code wrapped in neat little bundles
+	 * The other option would be to try to code so that less code is repeated between these bundles... the resulting code
+	 * was becoming a little complicated */
 	if (!strcmp("GET", method)) {
-		message.mID = RAP_READ_FILE;
+		Message message;
+		message.mID = RAP_GET;
+		message.fd = -1; // There should never be a rapSession->requestReadDataFd but if there is just ignore it
 		message.bufferCount = 2;
+		message.params[RAP_LOCK_INDEX] = stringToMessageParam(rapSession->requestLockToken);
+		message.params[RAP_FILE_INDEX] = stringToMessageParam(url);
+
+		if (sendRecvMessage(rapSession->socketFd, &message, incomingBuffer, sizeof(incomingBuffer)) > 0) {
+			return createResponseFromMessage(request, &message, response, rapSession->requestLockToken);
+		} else {
+			return RAP_INTERNAL_ERROR;
+		}
 
 	} else if (!strcmp("PUT", method)) {
-		message.mID = RAP_WRITE_FILE;
+		Message message;
+		message.mID = RAP_PUT;
+		message.fd = rapSession->requestReadDataFd;
+		rapSession->requestReadDataFd = -1; // sendMessage takes ownership of this even on failure
 		message.bufferCount = 2;
+		message.params[RAP_LOCK_INDEX] = stringToMessageParam(rapSession->requestLockToken);
+		message.params[RAP_FILE_INDEX] = stringToMessageParam(url);
+
+		if (sendRecvMessage(rapSession->socketFd, &message, incomingBuffer, sizeof(incomingBuffer)) > 0) {
+			return createResponseFromMessage(request, &message, response, rapSession->requestLockToken);
+		} else {
+			return RAP_INTERNAL_ERROR;
+		}
 
 	} else if (!strcmp("PROPFIND", method)) {
+		Message message;
 		message.mID = RAP_PROPFIND;
+		message.fd = rapSession->requestReadDataFd;
+		rapSession->requestReadDataFd = -1; // sendMessage takes ownership of this even on failure
+		message.bufferCount = 3;
+		message.params[RAP_LOCK_INDEX] = stringToMessageParam(rapSession->requestLockToken);
+		message.params[RAP_FILE_INDEX] = stringToMessageParam(url);
 		const char * depth = getHeader(request, "Depth");
 		message.params[RAP_DEPTH_INDEX] = stringToMessageParam(depth ? depth : "infinity");
-		message.bufferCount = 3;
+
+		if (sendRecvMessage(rapSession->socketFd, &message, incomingBuffer, sizeof(incomingBuffer)) > 0) {
+			return createResponseFromMessage(request, &message, response, rapSession->requestLockToken);
+		} else {
+			return RAP_INTERNAL_ERROR;
+		}
 
 	} else if (!strcmp("PROPPATCH", method)) {
+		Message message;
 		message.mID = RAP_PROPPATCH;
+		message.fd = rapSession->requestReadDataFd;
+		rapSession->requestReadDataFd = -1; // sendMessage takes ownership of this even on failure
+		message.bufferCount = 3;
+		message.params[RAP_LOCK_INDEX] = stringToMessageParam(rapSession->requestLockToken);
+		message.params[RAP_FILE_INDEX] = stringToMessageParam(url);
 		const char * depth = getHeader(request, "Depth");
 		message.params[RAP_DEPTH_INDEX] = stringToMessageParam(depth ? depth : "infinity");
-		message.bufferCount = 3;
+
+		if (sendRecvMessage(rapSession->socketFd, &message, incomingBuffer, sizeof(incomingBuffer)) > 0) {
+			return createResponseFromMessage(request, &message, response, rapSession->requestLockToken);
+		} else {
+			return RAP_INTERNAL_ERROR;
+		}
 
 	} else if (!strcmp("OPTIONS", method)) {
-		*response = createFileResponse(request, OPTIONS_PAGE, "text/html", rapSession->lockToken);
+		*response = createFileResponse(request, OPTIONS_PAGE, "text/html", rapSession->requestLockToken);
 		addHeader(*response, "Accept", ACCEPT_HEADER);
-		return MHD_HTTP_OK;
+		return RAP_SUCCESS;
 
 	} else {
 		stdLogError(0, "Can not cope with method: %s (%s data)", method,
-				(rapSession->writeDataFd != -1 ? "with" : "without"));
+				(rapSession->requestWriteDataFd != -1 ? "with" : "without"));
 
 		return MHD_HTTP_METHOD_NOT_ALLOWED;
 	}
-	// Send the request to the RAP
-	size_t ioResult = sendMessage(rapSession->socketFd, &message);
-	rapSession->readDataFd = -1; // this will always be closed by sendMessage even on failure!
-	if (ioResult <= 0) {
-		return MHD_HTTP_INTERNAL_SERVER_ERROR;
-	}
 
-	// Get result from RAP
-	char incomingBuffer[INCOMING_BUFFER_SIZE];
-	ioResult = recvMessage(rapSession->socketFd, &message, incomingBuffer, INCOMING_BUFFER_SIZE);
-	if (ioResult <= 0) {
-		if (ioResult == 0) {
-			stdLogError(0, "RAP closed socket unexpectedly while waiting for response");
-		}
-		return MHD_HTTP_INTERNAL_SERVER_ERROR;
-	}
-
-	if (message.mID == RAP_CONTINUE) {
-		if (message.fd != -1) {
-			close(message.fd);
-		}
-		return MHD_HTTP_CONTINUE;
-	} else {
-		return createRapResponse(request, &message, response, rapSession->lockToken);
-	}
-}
-
-static int sendResponse(Request *request, int statusCode, Response * response, RAP * rapSession, const char * method,
-		const char * url) {
-
-	// This doesn't really belong here but its a good safty check. We should never try to send a response
-	// when the data pipes are still open
-	if (rapSession->readDataFd != -1) {
-		stdLogError(0, "readDataFd was not properly closed before sending response");
-		close(rapSession->readDataFd);
-		rapSession->readDataFd = -1;
-	}
-	if (rapSession->writeDataFd != -1) {
-		stdLogError(0, "writeDataFd was not properly closed before sending response");
-		close(rapSession->writeDataFd);
-		rapSession->writeDataFd = -1;
-	}
-
-	char clientIp[100];
-	getRequestIP(clientIp, sizeof(clientIp), request);
-	logAccess(statusCode, method, rapSession->user, url, clientIp);
-	switch (statusCode) {
-	case MHD_HTTP_INTERNAL_SERVER_ERROR:
-		return MHD_queue_response(request, MHD_HTTP_INTERNAL_SERVER_ERROR, INTERNAL_SERVER_ERROR_PAGE);
-	case MHD_HTTP_UNAUTHORIZED:
-		return MHD_queue_response(request, MHD_HTTP_UNAUTHORIZED, UNAUTHORIZED_PAGE);
-	case MHD_HTTP_METHOD_NOT_ALLOWED:
-		return MHD_queue_response(request, MHD_HTTP_METHOD_NOT_ALLOWED, METHOD_NOT_SUPPORTED_PAGE);
-	default: {
-		int queueResult = MHD_queue_response(request, statusCode, response);
-		MHD_destroy_response(response);
-		return queueResult;
-	}
-	}
 }
 
 //////////////////////////////
@@ -798,15 +787,60 @@ static int sendResponse(Request *request, int statusCode, Response * response, R
 // Low Level HTTP handling (Signpost //
 ///////////////////////////////////////
 
-static int requestHasData(Request *request) {
-	if (getHeader(request, "Content-Length")) {
-		return 1;
-	} else {
-		const char * te = getHeader(request, "Transfer-Encoding");
-		return te && !strcmp(te, "chunked");
+static int sendStaticResponse(Request * request, int statusCode, Response * response, const char * lockToken) {
+	// Usually the lock is embedded in the response body and released once the response body has been sent
+	// But fo static responses we can't do this (mostly because they are shared and that would not be thread safe)
+	// In practice once we know that the lock is no longer needed at the point we know we're sending a static response
+	// so we release it here.  It's a little counter-intuitive to put it here but works.
+	if (lockToken) {
+		unuseLock(lockToken);
 	}
+	return MHD_queue_response(request, statusCode, response);
 }
 
+static int sendResponse(Request * request, int statusCode, Response * response, RAP * rapSession) {
+	switch (statusCode) {
+	case RAP_CONTINUE:
+		stdLogError(0, "Attempt to send a continue (100) response");
+		/* no break */
+
+	case RAP_INTERNAL_ERROR:
+		return sendStaticResponse(request, MHD_HTTP_INTERNAL_SERVER_ERROR, INTERNAL_SERVER_ERROR_PAGE, rapSession->requestLockToken);
+
+	case RAP_AUTH_FAILLED:
+		return sendStaticResponse(request, MHD_HTTP_UNAUTHORIZED, UNAUTHORIZED_PAGE, rapSession->requestLockToken);
+
+	case MHD_HTTP_METHOD_NOT_ALLOWED:
+		return sendStaticResponse(request, MHD_HTTP_METHOD_NOT_ALLOWED, METHOD_NOT_SUPPORTED_PAGE, rapSession->requestLockToken);
+
+	default: {
+		int queueResult = MHD_queue_response(request, statusCode, response);
+		MHD_destroy_response(response);
+		return queueResult;
+	}
+
+	}
+
+}
+
+/**
+ * Main handler method for handling requests.  This method does quite a lot to make libmicrohttp easier to work with.
+ * Primarily this wraps up libmicrohttp's quirky multi-call aproach to handling request bodies.
+ *
+ * It authenticates all requests making an apropriate RAP session available and then calls startProcessingRequest()
+ * (Only) If startProcessingRequest returns RAP_CONTINUE will finishingProcessingRequest() be called.
+ *
+ * startProcessingRequest() and finishingProcessingRequest() are given a request and must (as a pair) return a response.
+ * The returned int for each is the http status code, the body is returned in the last argument.
+ *
+ * If a request has a body then this data will be pumped into rapSession->requestWriteDataFd between calling
+ * startProcessingRequest() and finishingProcessingRequest().  The existance of a body is signalled to startProcessingRequest()
+ * by rapSession->requestWriteDataFd != -1. If a body has been sent then startProcessingRequest() must take ownership of
+ * rapSession->requestWriteDataFd and set the field to -1 or it will be closed before any data can be pumped.
+ *
+ * In theory startProcessingRequest may replace with a different fd as long as it closes the one provided.  If it does this
+ * when rapSession->requestWriteDataFd == -1 then the handle will just be closed since there is no data to send.
+ */
 static int answerToRequest(void *cls, Request *request, const char *url, const char *method, const char *version,
 		const char *upload_data, size_t *upload_data_size, void ** s) {
 
@@ -815,15 +849,28 @@ static int answerToRequest(void *cls, Request *request, const char *url, const c
 	if (rapSession) {
 		if (*upload_data_size) {
 			// Uploading more data
-			if (!rapSession->responseAlreadyGiven) {
-				processUploadData(request, upload_data, *upload_data_size, rapSession);
+			if (rapSession->requestWriteDataFd != -1) {
+				size_t bytesWritten = write(rapSession->requestWriteDataFd, upload_data, *upload_data_size);
+				if (bytesWritten < *upload_data_size) {
+					// not all data could be written to the file handle and therefore
+					// the operation has now failed. There's nothing we can do now but report the error
+					// This may not actually be desirable and so we need to consider slamming closed the connection.
+					close(rapSession->requestWriteDataFd);
+					rapSession->requestWriteDataFd = -1;
+				}
 			}
 			*upload_data_size = 0;
 			return MHD_YES;
 		} else {
 			// Finished uploading data
-			if (rapSession->responseAlreadyGiven) {
-				if (rapSession->responseAlreadyGiven == RAP_INTERNAL_ERROR) {
+			if (rapSession->requestWriteDataFd != -1) {
+				close(rapSession->requestWriteDataFd);
+				rapSession->requestWriteDataFd = -1;
+			}
+			if (rapSession->requestResponseAlreadyGiven) {
+				if (rapSession->requestResponseAlreadyGiven == RAP_INTERNAL_ERROR) {
+					// internal errors can screw with RAPs or mean the RAP is already screwed.
+					// Get rid of it just in case
 					destroyRap(rapSession);
 				} else {
 					releaseRap(rapSession);
@@ -831,8 +878,9 @@ static int answerToRequest(void *cls, Request *request, const char *url, const c
 				return MHD_YES;
 			} else {
 				Response * response;
-				int statusCode = completeUpload(request, rapSession, &response);
-				int result = sendResponse(request, statusCode, response, rapSession, method, url);
+				int statusCode = finishProcessingRequest(request, rapSession, &response);
+				logAccess(statusCode, method, rapSession->user, url, rapSession->clientIp);
+				int result = sendResponse(request, statusCode, response, rapSession);
 				if (statusCode == RAP_INTERNAL_ERROR) {
 					destroyRap(rapSession);
 				} else if (AUTH_SUCCESS(rapSession)) {
@@ -842,12 +890,7 @@ static int answerToRequest(void *cls, Request *request, const char *url, const c
 			}
 		}
 	} else {
-		const char * host = getHeader(request, "Host");
-		if (host == NULL) {
-			host = "<host-unknown>";
-		}
-
-		// Authenticate all new requests regardless of anything else
+		// All requests must be Authenticated
 		char * password;
 		char * user = MHD_basic_auth_get_username_password(request, &password);
 		char clientIp[100];
@@ -855,7 +898,6 @@ static int answerToRequest(void *cls, Request *request, const char *url, const c
 		rapSession = acquireRap(user, password, clientIp);
 		*s = rapSession;
 		if (AUTH_SUCCESS(rapSession)) {
-			//urlDecode((char *) url);
 			if (requestHasData(request)) {
 				// If we have data to send then create a pipe to pump it through
 				// To avoid the "non-standard" pipe2() we use unix domain sockets with socketpair
@@ -863,50 +905,68 @@ static int answerToRequest(void *cls, Request *request, const char *url, const c
 				int pipeEnds[2];
 				if (socketpair(PF_LOCAL, SOCK_STREAM | SOCK_CLOEXEC, 0, pipeEnds)) {
 					stdLogError(errno, "Could not create write pipe");
-					return sendResponse(request, MHD_HTTP_INTERNAL_SERVER_ERROR, NULL, rapSession, method, url);
+					logAccess(RAP_INTERNAL_ERROR, method, rapSession->user, url, rapSession->clientIp);
+					return sendResponse(request, RAP_INTERNAL_ERROR, NULL, rapSession);
 				}
+				rapSession->requestReadDataFd = pipeEnds[CHILD_SOCKET];
+				rapSession->requestWriteDataFd = pipeEnds[PARENT_SOCKET];
 
-				rapSession->readDataFd = pipeEnds[CHILD_SOCKET];
-				rapSession->writeDataFd = pipeEnds[PARENT_SOCKET];
+				Response * response = NULL;
+				int statusCode = startProcessingRequest(request, url, method, rapSession, &response);
 
-				Response * response;
-				int statusCode = processNewRequest(request, url, host, method, rapSession, &response);
+				if (rapSession->requestReadDataFd != -1) {
+					close(rapSession->requestReadDataFd);
+					rapSession->requestReadDataFd = -1;
+				}
 
 				if (statusCode == RAP_CONTINUE) {
 					// do not queue a response for contiune
-					rapSession->responseAlreadyGiven = 0;
+					rapSession->requestResponseAlreadyGiven = 0;
 					//logAccess(statusCode, method, (*rapSession)->user, url);
 					return MHD_YES;
 				} else {
-					rapSession->responseAlreadyGiven = statusCode;
-					return sendResponse(request, statusCode, response, rapSession, method, url);
+					if (rapSession->requestWriteDataFd != -1) {
+						close(rapSession->requestWriteDataFd);
+						rapSession->requestWriteDataFd = -1;
+					}
+					rapSession->requestResponseAlreadyGiven = statusCode;
+					logAccess(statusCode, method, rapSession->user, url, rapSession->clientIp);
+					return sendResponse(request, statusCode, response, rapSession);
 				}
 			} else {
-				rapSession->readDataFd = -1;
-				rapSession->writeDataFd = -1;
-				Response * response;
+				rapSession->requestReadDataFd = -1;
+				rapSession->requestWriteDataFd = -1;
+				Response * response = NULL;
 
-				int statusCode = processNewRequest(request, url, host, method, rapSession, &response);
+				int statusCode = startProcessingRequest(request, url, method, rapSession, &response);
+				if (rapSession->requestReadDataFd != -1) {
+					close(rapSession->requestReadDataFd);
+					rapSession->requestReadDataFd = -1;
+				}
+				if (rapSession->requestWriteDataFd != -1) {
+					close(rapSession->requestWriteDataFd);
+					rapSession->requestWriteDataFd = -1;
+				}
 
 				if (statusCode == RAP_CONTINUE) {
-					stdLogError(0, "RAP returned CONTINUE when there is no data");
-					int ret = sendResponse(request, MHD_HTTP_INTERNAL_SERVER_ERROR, NULL, rapSession, method, url);
-					releaseRap(rapSession);
-					return ret;
-				} else {
-					int ret = sendResponse(request, statusCode, response, rapSession, method, url);
-					if (statusCode == RAP_INTERNAL_ERROR) {
-						destroyRap(rapSession);
-					} else {
-						releaseRap(rapSession);
-					}
-					return ret;
+					statusCode = finishProcessingRequest(request, rapSession, &response);
 				}
+				logAccess(RAP_AUTH_FAILLED, method, rapSession->user, url, rapSession->clientIp);
+				int ret = sendResponse(request, statusCode, response, rapSession);
+				if (statusCode == RAP_INTERNAL_ERROR) {
+					destroyRap(rapSession);
+				} else {
+					releaseRap(rapSession);
+				}
+				return ret;
+
 			}
 		} else if (rapSession == AUTH_FAILED) {
-			return sendResponse(request, MHD_HTTP_UNAUTHORIZED, NULL, rapSession, method, url);
+			logAccess(RAP_AUTH_FAILLED, method, rapSession->user, url, clientIp);
+			return sendResponse(request, RAP_AUTH_FAILLED, NULL, rapSession);
 		} else /*if (*rapSession == AUTH_ERROR)*/{
-			return sendResponse(request, MHD_HTTP_INTERNAL_SERVER_ERROR, NULL, rapSession, method, url);
+			logAccess(RAP_INTERNAL_ERROR, method, rapSession->user, url, clientIp);
+			return sendResponse(request, RAP_INTERNAL_ERROR, NULL, rapSession);
 		}
 	}
 }

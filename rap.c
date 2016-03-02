@@ -892,10 +892,10 @@ int main(int argCount, char * args[]) {
 		case RAP_AUTHENTICATE:
 			ioResult = authenticate(&message);
 			break;
-		case RAP_READ_FILE:
+		case RAP_GET:
 			ioResult = readFile(&message);
 			break;
-		case RAP_WRITE_FILE:
+		case RAP_PUT:
 			ioResult = writeFile(&message);
 			break;
 		case RAP_PROPFIND:

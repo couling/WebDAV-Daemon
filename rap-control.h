@@ -16,11 +16,13 @@ typedef struct RAP {
 	struct RAP * next;
 	struct RAP ** prevPtr;
 
-	// Managed by Low level handler function
-	int writeDataFd; // Should be closed by uploadComplete()
-	int readDataFd;  // Should be closed by processNewRequest() when sent to the RAP.
-	int responseAlreadyGiven;
-	const char * lockToken;
+	// Managed per request this rap is used for
+	// This is not really data about the rap at all but storing it here saves allocating an extra structure
+	int requestWriteDataFd; // Should be closed by uploadComplete()
+	int requestReadDataFd;  // Should be closed by processNewRequest() when sent to the RAP.
+	int requestResponseAlreadyGiven;
+	const char * requestLockToken;
+
 } RAP;
 
 // Used as a place holder for failed auth requests which failed due to invalid credentials
