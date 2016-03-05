@@ -12,13 +12,22 @@
 #include <pwd.h>
 #include <grp.h>
 
-char * timeNow(char * t) {
+size_t getWebDate(time_t rawtime, char * buf, size_t bufSize) {
+	struct tm * timeinfo = gmtime(&rawtime);
+	return strftime(buf, bufSize, "%a, %d %b %Y %H:%M:%S %Z", timeinfo);
+}
+
+size_t getLocalDate(time_t rawtime, char * buf, size_t bufSize) {
+	struct tm * timeinfo = gmtime(&rawtime);
+	return strftime(buf, bufSize, "%a %b %d %H:%M:%S %Y", timeinfo);
+}
+
+size_t timeNow(char * buf, size_t bufSize) {
 	time_t rawtime;
 	time(&rawtime);
 	struct tm * timeinfo;
 	timeinfo = localtime(&rawtime);
-	strftime(t, 100, "%a %b %d %H:%M:%S %Y", timeinfo);
-	return t;
+	return strftime(buf, bufSize, "%a %b %d %H:%M:%S %Y", timeinfo);
 }
 
 void stdLog(const char * str, ...) {
@@ -26,7 +35,8 @@ void stdLog(const char * str, ...) {
 	int remaining = 10240;
 	char * ptr = buffer;
 	char t[100];
-	int written = snprintf(ptr, remaining, "%s [%d] ", timeNow(t), getpid());
+	timeNow(t, 100);
+	int written = snprintf(ptr, remaining, "%s [%d] ", t, getpid());
 	ptr += written;
 	remaining -= written;
 	va_list ap;
@@ -46,7 +56,8 @@ void stdLogError(int errorNumber, const char * str, ...) {
 	int remaining = 10240;
 	char * ptr = buffer;
 	char t[100];
-	int written = snprintf(ptr, remaining, "%s [%d] Error: ", timeNow(t), getpid());
+	timeNow(t, sizeof(t));
+	int written = snprintf(ptr, remaining, "%s [%d] Error: ", t, getpid());
 	ptr += written;
 	remaining -= written;
 	va_list ap;
@@ -79,10 +90,7 @@ void * mallocSafe(size_t size) {
 }
 
 void * reallocSafe(void * mem, size_t newSize) {
-	if (mem == NULL) {
-		return mallocSafe(newSize);
-	}
-	void * allocatedMemory = realloc(mem, newSize);
+	void * allocatedMemory = mem ? realloc(mem, newSize) : malloc(newSize);
 	if (allocatedMemory) {
 		//stdLog("%p realloc(%p, %zd)", allocatedMemory, mem, newSize );
 		return allocatedMemory;
@@ -215,6 +223,17 @@ ssize_t recvMessage(int sock, Message * message, char * incomingBuffer, size_t i
 	return size;
 }
 
+ssize_t sendRecvMessage(int sock, Message * message, char * incomingBuffer, size_t incomingBufferSize) {
+	ssize_t result = sendMessage(sock, message);
+	if (result > 0) {
+		result = recvMessage(sock, message, incomingBuffer, incomingBufferSize);
+		if (result == 0) {
+			stdLogError(0, "socket closed unexpectedly while waiting for response");
+		} // else { stdLogError ... has already been sent by recvMessage ... }
+	}
+	return result;
+}
+
 char * messageParamToString(MessageParam * iovec) {
 	char * buffer = iovec->iov_base;
 	buffer[iovec->iov_len - 1] = '\0';
@@ -229,11 +248,6 @@ MessageParam stringToMessageParam(const char * string) {
 		MessageParam param = { .iov_base = NULL, .iov_len = 0 };
 		return param;
 	}
-}
-
-size_t getWebDate(time_t rawtime, char * buf, size_t bufSize) {
-	struct tm * timeinfo = gmtime(&rawtime);
-	return strftime(buf, bufSize, "%a, %d %b %Y %H:%M:%S %Z", timeinfo);
 }
 
 int lockToUser(const char * user) {

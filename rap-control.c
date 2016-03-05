@@ -20,12 +20,28 @@ typedef struct RapList {
 } RapList;
 
 // Used as a place holder for failed auth requests which failed due to invalid credentials
-const RAP AUTH_FAILED_RAP = { .pid = 0, .socketFd = -1, .user = "<auth failed>", .requestWriteDataFd = -1, .requestReadDataFd = -1,
-		.requestResponseAlreadyGiven = 403, .next = NULL, .prevPtr = NULL };
+const RAP AUTH_FAILED_RAP = {
+		.pid = 0,
+		.socketFd = -1,
+		.user = "<auth failed>",
+		.requestWriteDataFd = -1,
+		.requestReadDataFd = -1,
+		.requestResponseAlreadyGiven = 403,
+		.requestLockToken = NULL,
+		.next = NULL,
+		.prevPtr = NULL };
 
 // Used as a place holder for failed auth requests which failed due to errors
-const RAP AUTH_ERROR_RAP = { .pid = 0, .socketFd = -1, .user = "<auth error>", .requestWriteDataFd = -1, .requestReadDataFd = -1,
-		.requestResponseAlreadyGiven = 500, .next = NULL, .prevPtr = NULL };
+const RAP AUTH_ERROR_RAP = {
+		.pid = 0,
+		.socketFd = -1,
+		.user = "<auth error>",
+		.requestWriteDataFd = -1,
+		.requestReadDataFd = -1,
+		.requestResponseAlreadyGiven = 500,
+		.requestLockToken = NULL,
+		.next = NULL,
+		.prevPtr = NULL };
 
 static pthread_key_t rapDBThreadKey;
 static sem_t rapPoolLock;
@@ -95,13 +111,17 @@ static int forkRapProcess(const char * path, int * newSockFd) {
 			// This previously abused STD_IN and STD_OUT for this but instead we now
 			// reserve a different FD (3) AKA RAP_CONTROL_SOCKET
 			if (dup2(sockFd[CHILD_SOCKET], RAP_CONTROL_SOCKET) == -1) {
-				stdLogError(errno, "Could not assign new socket (%d) to %d", newSockFd[1], (int) RAP_CONTROL_SOCKET);
+				stdLogError(errno, "Could not assign new socket (%d) to %d", newSockFd[1],
+						(int) RAP_CONTROL_SOCKET);
 				exit(255);
 			}
 		}
 
-		char * argv[] =
-				{ (char *) config.rapBinary, (char *) config.pamServiceName, (char *) config.mimeTypesFile, NULL };
+		char * argv[] = {
+				(char *) config.rapBinary,
+				(char *) config.pamServiceName,
+				(char *) config.mimeTypesFile,
+				NULL };
 		execv(path, argv);
 
 		stdLogError(errno, "Could not start rap: %s", path);
@@ -155,12 +175,12 @@ static RAP * createRap(RapList * db, const char * user, const char * password, c
 
 	// Send Auth Request
 	Message message;
-	message.mID = RAP_AUTHENTICATE;
+	message.mID = RAP_REQUEST_AUTHENTICATE;
 	message.fd = -1;
 	message.bufferCount = 3;
-	message.params[RAP_USER_INDEX] = stringToMessageParam(user);
-	message.params[RAP_PASSWORD_INDEX] = stringToMessageParam(password);
-	message.params[RAP_RHOST_INDEX] = stringToMessageParam(rhost);
+	message.params[RAP_PARAM_AUTH_USER] = stringToMessageParam(user);
+	message.params[RAP_PARAM_AUTH_PASSWORD] = stringToMessageParam(password);
+	message.params[RAP_PARAM_AUTH_RHOST] = stringToMessageParam(rhost);
 	if (sendMessage(socketFd, &message) <= 0) {
 		close(socketFd);
 		return AUTH_ERROR;
@@ -169,7 +189,7 @@ static RAP * createRap(RapList * db, const char * user, const char * password, c
 	// Read Auth Result
 	char incomingBuffer[INCOMING_BUFFER_SIZE];
 	ssize_t readResult = recvMessage(socketFd, &message, incomingBuffer, INCOMING_BUFFER_SIZE);
-	if (readResult <= 0 || message.mID != RAP_SUCCESS) {
+	if (readResult <= 0 || message.mID != RAP_RESPOND_SUCCESS) {
 		close(socketFd);
 		if (readResult < 0) {
 			stdLogError(0, "Could not read result from RAP ");

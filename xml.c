@@ -196,4 +196,3 @@ void xmlTextWriterWriteURL(xmlTextWriterPtr writer, const char * url) {
 // End XML Text Writer //
 /////////////////////////
 
-

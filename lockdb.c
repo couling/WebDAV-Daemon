@@ -99,7 +99,6 @@ int useLock(const char * lockToken, const char * file, const char * user, LockTy
 	if (foundLock != NULL && (lockType == foundLock->type || foundLock->type == LOCK_TYPE_EXCLUSIVE)
 			&& !strcmp(foundLock->user, user) && !strcmp(foundLock->file, file) && !foundLock->released) {
 		foundLock->useCount++;
-		time(&foundLock->lockAcquired);
 		sem_post(&lockDBLock);
 		return 1;
 	} else {
@@ -128,7 +127,8 @@ int releaseLock(const char * lockToken, const char * file, const char * user, in
 		return 0;
 	}
 	Lock * foundLock = findLock(lockToken);
-	if (foundLock != NULL && !strcmp(foundLock->user, user) && !strcmp(foundLock->file, file) && !foundLock->released) {
+	if (foundLock != NULL && !strcmp(foundLock->user, user) && !strcmp(foundLock->file, file)
+			&& !foundLock->released) {
 		foundLock->useCount--;
 		releaseUnusedLock(foundLock);
 		sem_post(&lockDBLock);
@@ -153,7 +153,8 @@ static void cleanAction(const void *nodep, const VISIT which, const int depth) {
 		if (lock->lockAcquired < expiryTime && !lock->released) {
 			int index = readyForReleaseCount++;
 			if (!(readyForReleaseCount & 0xF)) {
-				readyForRelease = reallocSafe(readyForRelease, (readyForReleaseCount | 0xF) * sizeof(*readyForRelease));
+				readyForRelease = reallocSafe(readyForRelease,
+						(readyForReleaseCount | 0xF) * sizeof(*readyForRelease));
 			}
 			readyForRelease[index] = lock;
 		}
@@ -191,9 +192,6 @@ void runCleanLocks() {
 }
 
 void initializeLockDB() {
-	time_t timeNow;
-	time(&timeNow);
-	srandom(timeNow);
 	if (sem_init(&lockDBLock, 0, 1) == -1) {
 		stdLogError(errno, "Could not create lock for lockdb");
 		exit(255);
