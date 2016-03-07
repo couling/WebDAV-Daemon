@@ -48,6 +48,7 @@ file:package-with/pam.conf:etc/pam.d/webdav:644
 file:package-with/conf.xml:etc/webdavd:644
 file:package-with/share:usr/share/webdav:644
 file:package-with/systemd.service:lib/systemd/system/webdav.service:644
+file:package-with/logrotate.d:etc/logrotate.d/webdav:644
 
 file:build/webdavd:usr/sbin/webdavd:755
 file:build/rap:usr/sbin/webdav-rap:755

@@ -1,6 +1,7 @@
 // TODO auth modes other than basic?
 // TODO check into what happens when a connection is closed early during upload.
 // TODO prevent PUT clobbering files.
+// TODO catch interupt and clean shutdown
 
 #include "shared.h"
 #include "configuration.h"
