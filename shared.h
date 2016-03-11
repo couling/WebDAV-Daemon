@@ -3,6 +3,7 @@
 
 #define _FILE_OFFSET_BITS 64
 
+#include <sys/file.h>
 #include <sys/socket.h>
 #include <stdarg.h>
 
@@ -20,6 +21,7 @@ typedef enum RapConstant {
 
 	// sent by rap, processed by finishProcessingRequest
 	RAP_INTERIM_RESPOND_LOCK,
+	RAP_INTERIM_RESPOND_RELOCK,
 
 	// sent by finishProcessingRequest to complete processing a request
 	RAP_COMPLETE_REQUEST_LOCK,
@@ -27,6 +29,7 @@ typedef enum RapConstant {
 	// sent by rap once a request has completed - deliberately HTTP response codes
 	RAP_RESPOND_CONTINUE = 100,
 	RAP_RESPOND_SUCCESS = 200,
+	RAP_RESPOND_NO_CONTENT = 204,
 	RAP_RESPOND_MULTISTATUS = 207,
 	RAP_RESPOND_BAD_CLIENT_REQUEST = 400,
 	RAP_RESPOND_AUTH_FAILLED = 401,
@@ -39,19 +42,24 @@ typedef enum RapConstant {
 } RapConstant;
 
 // Auth Request
-#define RAP_PARAM_AUTH_USER     0
-#define RAP_PARAM_AUTH_PASSWORD 1
-#define RAP_PARAM_AUTH_RHOST    2
+#define RAP_PARAM_AUTH_USER         0
+#define RAP_PARAM_AUTH_PASSWORD     1
+#define RAP_PARAM_AUTH_RHOST        2
 
 // Generic Requet
-#define RAP_PARAM_REQUEST_LOCK  0
-#define RAP_PARAM_REQUEST_FILE  1
-#define RAP_PARAM_REQUEST_DEPTH 2
+#define RAP_PARAM_REQUEST_LOCK      0
+#define RAP_PARAM_REQUEST_FILE      1
+#define RAP_PARAM_REQUEST_DEPTH     2
 
 // Generic Response
 #define RAP_PARAM_RESPONSE_DATE     0
 #define RAP_PARAM_RESPONSE_MIME     1
 #define RAP_PARAM_RESPONSE_LOCATION 2
+
+// Lock request
+#define RAP_PARAM_LOCK_LOCATION     0
+#define RAP_PARAM_LOCK_TYPE         1
+#define RAP_PARAM_LOCK_TOKEN        1
 
 #define PIPE_READ     0
 #define PIPE_WRITE    1
@@ -59,8 +67,10 @@ typedef enum RapConstant {
 #define PARENT_SOCKET 0
 #define CHILD_SOCKET  1
 
-#define WEBDAV_NAMESPACE "DAV:"
-#define MICROSOFT_NAMESPACE "urn:schemas-microsoft-com:"
+typedef enum LockType {
+	LOCK_TYPE_SHARED = LOCK_SH | LOCK_NB,
+	LOCK_TYPE_EXCLUSIVE = LOCK_EX | LOCK_NB
+} LockType;
 
 /*
  * #define QUOTE(name) #name

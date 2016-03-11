@@ -3,7 +3,6 @@
 #include "lockdb.h"
 
 #include "configuration.h"
-#include "shared.h"
 
 #include <errno.h>
 #include <string.h>
@@ -81,6 +80,23 @@ int acquireLock(const char ** lockToken, const char * user, const char * file, L
 	}
 }
 
+int refreshLock(const char * lockToken, const char * user, const char * file) {
+	if (sem_wait(&lockDBLock) == -1) {
+		stdLogError(errno, "Could not wait for access to lock db");
+		return 0;
+	}
+	Lock * lock = findLock(lockToken);
+	if (lock && !strcmp(lock->user, user) && !strcmp(lock->file, file) && !lock->released) {
+		time(&lock->lockAcquired);
+		sem_post(&lockDBLock);
+		return 1;
+	} else {
+		sem_post(&lockDBLock);
+		stdLogError(0, "Could not find lock %s for user %s on file %s", lockToken, user, file);
+		return 0;
+	}
+}
+
 static void releaseUnusedLock(Lock * lock) {
 	lock->useCount--;
 	if (lock->useCount == 0) {
@@ -102,8 +118,8 @@ int useLock(const char * lockToken, const char * file, const char * user, LockTy
 		sem_post(&lockDBLock);
 		return 1;
 	} else {
-		stdLogError(0, "Could not find lock %s for user %s on file %s", lockToken, user, file);
 		sem_post(&lockDBLock);
+		stdLogError(0, "Could not find lock %s for user %s on file %s", lockToken, user, file);
 		return 0;
 	}
 }
@@ -120,7 +136,7 @@ void unuseLock(const char * lockToken) {
 	}
 }
 
-int releaseLock(const char * lockToken, const char * file, const char * user, int fd) {
+int releaseLock(const char * lockToken, const char * file, const char * user) {
 	// TODO better return values to distinguish between internal error and non-existant lock
 	if (sem_wait(&lockDBLock) == -1) {
 		stdLogError(errno, "Could not wait for access to lock db");
@@ -129,13 +145,13 @@ int releaseLock(const char * lockToken, const char * file, const char * user, in
 	Lock * foundLock = findLock(lockToken);
 	if (foundLock != NULL && !strcmp(foundLock->user, user) && !strcmp(foundLock->file, file)
 			&& !foundLock->released) {
-		foundLock->useCount--;
+		foundLock->released = 1;
 		releaseUnusedLock(foundLock);
 		sem_post(&lockDBLock);
 		return 1;
 	} else {
-		stdLogError(0, "Could not find lock %s for user %s on file %s", lockToken, user, file);
 		sem_post(&lockDBLock);
+		stdLogError(0, "Could not find lock %s for user %s on file %s", lockToken, user, file);
 		return 0;
 	}
 }

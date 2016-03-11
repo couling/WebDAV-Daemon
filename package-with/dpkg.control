@@ -3,7 +3,7 @@ Version: 0.2
 Section: devel
 Priority: optional
 Architecture: amd64
-Depends: libc6, libmicrohttpd10, libpam0g, libxml2, libgnutls-deb0-28
+Depends: libc6, libmicrohttpd10, libpam0g, libxml2, libgnutls-deb0-28, libuuid1
 Suggests:
 Conflicts:
 Replaces:

@@ -13,6 +13,9 @@
 #include <locale.h>
 #include <security/pam_appl.h>
 
+#define WEBDAV_NAMESPACE "DAV:"
+#define MICROSOFT_NAMESPACE "urn:schemas-microsoft-com:"
+
 #define BUFFER_SIZE 40960
 
 typedef struct MimeType {
@@ -43,8 +46,8 @@ static MimeType XML_MIME_TYPE = {
 		.type = "application/xml; charset=utf-8",
 		.typeStringSize = sizeof("application/xml; charset=utf-8") };
 
-static ssize_t respond(enum RapConstant result, int fd) {
-	Message message = { .mID = result, .fd = fd, .bufferCount = 0 };
+static ssize_t respond(RapConstant result) {
+	Message message = { .mID = result, .fd = -1, .bufferCount = 0 };
 	return sendMessage(RAP_CONTROL_SOCKET, &message);
 }
 
@@ -198,6 +201,86 @@ static void initializeMimeTypes(const char * mimeTypesFile) {
 // End Mime //
 //////////////
 
+//////////
+// LOCK //
+//////////
+
+#define LOCK_REQUST_ROOT_NODE "lockinfo"
+#define LOCK_SCOPE            "lockscope"
+#define LOCK_TYPE             "locktype"
+#define LOCK_OWNER            "owner" // ignored
+
+#define LOCK_DISCOVERY_ROOT   "lockdiscovery"
+#define LOCK_DISCOVERY_CHILD  "activelock"
+
+typedef struct LockRequest {
+	int isNewLock;
+	int type;
+	LockType scope;
+} LockRequest;
+
+static int parseLockRequest(int fd, LockRequest * lockRequest) {
+	memset(&lockRequest, 0, sizeof(LockRequest));
+	if (fd == -1) return 0;
+	xmlTextReaderPtr reader = xmlReaderForFd(fd, NULL, NULL, XML_PARSE_NOENT);
+	xmlReaderSuppressErrors(reader);
+
+	if (!reader || !stepInto(reader) || !elementMatches(reader, WEBDAV_NAMESPACE, LOCK_REQUST_ROOT_NODE)) {
+		if (reader) xmlFreeTextReader(reader);
+		close(fd);
+		return 0;
+	}
+
+	lockRequest->isNewLock = 1;
+	int readResult = stepInto(reader);
+	while (readResult && xmlTextReaderDepth(reader) == 1) {
+		if (xmlTextReaderNodeType(reader) == XML_READER_TYPE_ELEMENT
+				&& !strcmp(xmlTextReaderConstNamespaceUri(reader), WEBDAV_NAMESPACE)) {
+			if (!strcmp(xmlTextReaderConstLocalName(reader), LOCK_SCOPE)) {
+				readResult = stepOver(reader);
+				// TODO
+			} else if (!strcmp(xmlTextReaderConstLocalName(reader), LOCK_TYPE)) {
+				readResult = stepOver(reader);
+				// TODO
+			} else {
+				readResult = stepOver(reader);
+			}
+		}
+	}
+	// TODO
+
+	// finish up
+	while (stepOver(reader))
+		// consume the rest of the input
+		;
+
+	xmlFreeTextReader(reader);
+	close(fd);
+	return readResult;
+}
+
+static ssize_t lockFile(Message * message) {
+	respond(RAP_RESPOND_CONTINUE);
+	LockRequest lockRequest;
+	memset(&lockRequest, 0, sizeof(LockRequest));
+	if (!parseLockRequest(message->fd, &lockRequest)) {
+		// TODO provide a body for the bad request
+		// TODO return the correct code
+		return respond(RAP_RESPOND_BAD_CLIENT_REQUEST);
+	}
+	if (lockRequest.isNewLock) {
+		// TODO
+		return -1;
+	} else {
+		// TODO
+		return -1;
+	}
+}
+
+//////////////
+// End Lock //
+//////////////
+
 //////////////
 // PROPFIND //
 //////////////
@@ -233,6 +316,7 @@ static int parsePropFind(int fd, PropertySet * properties) {
 	int readResult;
 	if (!reader || !stepInto(reader)) {
 		stdLogError(0, "could not create xml reader");
+		if (reader) xmlFreeTextReader(reader);
 		close(fd);
 		return 0;
 	}
@@ -240,17 +324,19 @@ static int parsePropFind(int fd, PropertySet * properties) {
 	if (xmlTextReaderNodeType(reader) == XML_READER_TYPE_NONE) {
 		// No body has been sent
 		// so assume the client is asking for everything.
-		readResult = 1;
 		memset(properties, 1, sizeof(*properties));
-		goto CLEANUP;
+		xmlFreeTextReader(reader);
+		close(fd);
+		return 1;
 	} else {
 		memset(properties, 0, sizeof(PropertySet));
 	}
 
 	if (!elementMatches(reader, WEBDAV_NAMESPACE, "propfind")) {
 		stdLogError(0, "Request body was not a propfind document");
-		readResult = 0;
-		goto CLEANUP;
+		xmlFreeTextReader(reader);
+		close(fd);
+		return 0;
 	}
 
 	readResult = stepInto(reader);
@@ -259,7 +345,9 @@ static int parsePropFind(int fd, PropertySet * properties) {
 	}
 
 	if (!readResult) {
-		goto CLEANUP;
+		xmlFreeTextReader(reader);
+		close(fd);
+		return 0;
 	}
 
 	readResult = stepInto(reader);
@@ -291,19 +379,15 @@ static int parsePropFind(int fd, PropertySet * properties) {
 				properties->windowsHidden = 1;
 			}
 		}
-		stepOver(reader);
+		readResult = stepOver(reader);
 	}
 
-	if (!readResult) {
-		goto CLEANUP;
-	}
+	readResult = 1;
 
 	// finish up
 	while (stepOver(reader))
 		// consume the rest of the input
 		;
-
-	CLEANUP:
 
 	xmlFreeTextReader(reader);
 	close(fd);
@@ -404,18 +488,18 @@ static int respondToPropFind(const char * file, PropertySet * properties, int de
 		switch (e) {
 		case EACCES:
 			stdLogError(e, "PROPFIND access denied %s %s", authenticatedUser, file);
-			return respond(RAP_RESPOND_ACCESS_DENIED, -1);
+			return respond(RAP_RESPOND_ACCESS_DENIED);
 		case ENOENT:
 		default:
 			stdLogError(e, "PROPFIND not found %s %s", authenticatedUser, file);
-			return respond(RAP_RESPOND_NOT_FOUND, -1);
+			return respond(RAP_RESPOND_NOT_FOUND);
 		}
 	}
 
 	int pipeEnds[2];
 	if (pipe(pipeEnds)) {
 		stdLogError(errno, "Could not create pipe to write content");
-		return respond(RAP_RESPOND_INTERNAL_ERROR, -1);
+		return respond(RAP_RESPOND_INTERNAL_ERROR);
 	}
 
 	size_t fileNameSize = strlen(file);
@@ -493,7 +577,7 @@ static ssize_t propfind(Message * requestMessage) {
 					requestMessage->bufferCount);
 		}
 		close(requestMessage->fd);
-		return respond(RAP_RESPOND_INTERNAL_ERROR, -1);
+		return respond(RAP_RESPOND_INTERNAL_ERROR);
 	}
 
 	char * depthString = messageParamToString(&requestMessage->params[RAP_PARAM_REQUEST_DEPTH]);
@@ -503,12 +587,12 @@ static ssize_t propfind(Message * requestMessage) {
 	if (requestMessage->fd == -1) {
 		memset(&properties, 1, sizeof(properties));
 	} else {
-		int ret = respond(RAP_RESPOND_CONTINUE, -1);
+		int ret = respond(RAP_RESPOND_CONTINUE);
 		if (ret < 0) {
 			return ret;
 		}
 		if (!parsePropFind(requestMessage->fd, &properties)) {
-			return respond(RAP_RESPOND_BAD_CLIENT_REQUEST, -1);
+			return respond(RAP_RESPOND_BAD_CLIENT_REQUEST);
 		}
 	}
 
@@ -526,7 +610,7 @@ static ssize_t propfind(Message * requestMessage) {
 static ssize_t proppatch(Message * requestMessage) {
 	// TODO Need to actually implement something here
 	if (requestMessage->fd != -1) {
-		respond(RAP_RESPOND_CONTINUE, -1);
+		respond(RAP_RESPOND_CONTINUE);
 		char buffer[BUFFER_SIZE];
 		ssize_t bytesRead;
 		while ((bytesRead = read(requestMessage->fd, buffer, sizeof(buffer))) > 0) {
@@ -537,7 +621,7 @@ static ssize_t proppatch(Message * requestMessage) {
 		close(requestMessage->fd);
 
 	}
-	return respond(RAP_RESPOND_SUCCESS, -1);
+	return respond(RAP_RESPOND_SUCCESS);
 }
 
 ///////////////////
@@ -551,16 +635,16 @@ static ssize_t proppatch(Message * requestMessage) {
 static ssize_t writeFile(Message * requestMessage) {
 	if (requestMessage->fd == -1) {
 		stdLogError(0, "write file request sent without incoming data!");
-		return respond(RAP_RESPOND_INTERNAL_ERROR, -1);
+		return respond(RAP_RESPOND_INTERNAL_ERROR);
 	}
 	if (!authenticated) {
 		stdLogError(0, "Not authenticated RAP");
-		return respond(RAP_RESPOND_INTERNAL_ERROR, -1);
+		return respond(RAP_RESPOND_INTERNAL_ERROR);
 	}
 	if (requestMessage->bufferCount != 2) {
 		stdLogError(0, "Get request did not provide correct buffers: %d buffer(s)",
 				requestMessage->bufferCount);
-		return respond(RAP_RESPOND_INTERNAL_ERROR, -1);
+		return respond(RAP_RESPOND_INTERNAL_ERROR);
 	}
 
 	char * file = messageParamToString(&requestMessage->params[RAP_PARAM_REQUEST_FILE]);
@@ -571,14 +655,14 @@ static ssize_t writeFile(Message * requestMessage) {
 		switch (e) {
 		case EACCES:
 			stdLogError(e, "PUT access denied %s %s", authenticatedUser, file);
-			return respond(RAP_RESPOND_ACCESS_DENIED, -1);
+			return respond(RAP_RESPOND_ACCESS_DENIED);
 		case ENOENT:
 		default:
 			stdLogError(e, "PUT not found %s %s", authenticatedUser, file);
-			return respond(RAP_RESPOND_CONFLICT, -1);
+			return respond(RAP_RESPOND_CONFLICT);
 		}
 	}
-	int ret = respond(RAP_RESPOND_CONTINUE, -1);
+	int ret = respond(RAP_RESPOND_CONTINUE);
 	if (ret < 0) {
 		return ret;
 	}
@@ -592,13 +676,13 @@ static ssize_t writeFile(Message * requestMessage) {
 			stdLogError(errno, "Could wite data to file %s", file);
 			close(fd);
 			close(requestMessage->fd);
-			return respond(RAP_RESPOND_INSUFFICIENT_STORAGE, -1);
+			return respond(RAP_RESPOND_INSUFFICIENT_STORAGE);
 		}
 	}
 
 	close(fd);
 	close(requestMessage->fd);
-	return respond(RAP_RESPOND_SUCCESS, -1);
+	return respond(RAP_RESPOND_SUCCESS);
 }
 
 /////////////
@@ -626,14 +710,13 @@ static void listDir(const char * file, int dirFd, int writeFd) {
 	size_t fileSize = strlen(file);
 	char * filePath = normalizeDirName(file, &fileSize, 1);
 
-	size_t entryCount = 0, allocatedEntries = 0;
+	size_t entryCount = 0;
 	struct dirent ** directoryEntries = NULL;
 	struct dirent * dp;
 	while ((dp = readdir(dir)) != NULL) {
 		int index = entryCount++;
-		if (entryCount > allocatedEntries) {
-			allocatedEntries += 200;
-			directoryEntries = reallocSafe(directoryEntries, sizeof(struct dirent **) * allocatedEntries);
+		if (!(index & 0x7F)) {
+			directoryEntries = reallocSafe(directoryEntries, sizeof(struct dirent **) * (entryCount + 0x7F));
 		}
 		directoryEntries[index] = dp;
 	}
@@ -673,12 +756,10 @@ static void listDir(const char * file, int dirFd, int writeFd) {
 			xmlTextWriterStartAttribute(writer, "href");
 			xmlTextWriterWriteURL(writer, filePath);
 			xmlTextWriterWriteURL(writer, dp->d_name);
-			if (dp->d_type == DT_DIR)
-				xmlTextWriterWriteString(writer, "/");
+			if (dp->d_type == DT_DIR) xmlTextWriterWriteString(writer, "/");
 			xmlTextWriterEndAttribute(writer);
 			xmlTextWriterWriteString(writer, dp->d_name);
-			if (dp->d_type == DT_DIR)
-				xmlTextWriterWriteString(writer, "/");
+			if (dp->d_type == DT_DIR) xmlTextWriterWriteString(writer, "/");
 			xmlTextWriterEndElement(writer);
 
 			// File Size
@@ -718,12 +799,12 @@ static ssize_t readFile(Message * requestMessage) {
 	}
 	if (!authenticated) {
 		stdLogError(0, "Not authenticated RAP");
-		return respond(RAP_RESPOND_INTERNAL_ERROR, -1);
+		return respond(RAP_RESPOND_INTERNAL_ERROR);
 	}
 	if (requestMessage->bufferCount != 2) {
 		stdLogError(0, "Get request did not provide correct buffers: %d buffer(s)",
 				requestMessage->bufferCount);
-		return respond(RAP_RESPOND_INTERNAL_ERROR, -1);
+		return respond(RAP_RESPOND_INTERNAL_ERROR);
 	}
 
 	char * file = messageParamToString(&requestMessage->params[RAP_PARAM_REQUEST_FILE]);
@@ -733,11 +814,11 @@ static ssize_t readFile(Message * requestMessage) {
 		switch (e) {
 		case EACCES:
 			stdLogError(e, "GET access denied %s %s", authenticatedUser, file);
-			return respond(RAP_RESPOND_ACCESS_DENIED, -1);
+			return respond(RAP_RESPOND_ACCESS_DENIED);
 		case ENOENT:
 		default:
 			stdLogError(e, "GET not found %s %s", authenticatedUser, file);
-			return respond(RAP_RESPOND_NOT_FOUND, -1);
+			return respond(RAP_RESPOND_NOT_FOUND);
 		}
 	} else {
 		struct stat statinfo;
@@ -748,7 +829,7 @@ static ssize_t readFile(Message * requestMessage) {
 			if (pipe(pipeEnds)) {
 				stdLogError(errno, "Could not create pipe to write content");
 				close(fd);
-				return respond(RAP_RESPOND_INTERNAL_ERROR, -1);
+				return respond(RAP_RESPOND_INTERNAL_ERROR);
 			}
 
 			time_t fileTime;
@@ -869,11 +950,11 @@ static ssize_t authenticate(Message * message) {
 	}
 	if (authenticated) {
 		stdLogError(0, "Login for already logged in RAP");
-		return respond(RAP_RESPOND_INTERNAL_ERROR, -1);
+		return respond(RAP_RESPOND_INTERNAL_ERROR);
 	}
 	if (authenticated) {
 		stdLogError(0, "Login provided %d buffer(s) instead of 3", message->bufferCount);
-		return respond(RAP_RESPOND_INTERNAL_ERROR, -1);
+		return respond(RAP_RESPOND_INTERNAL_ERROR);
 	}
 
 	char * user = messageParamToString(&message->params[RAP_PARAM_AUTH_USER]);
@@ -882,9 +963,9 @@ static ssize_t authenticate(Message * message) {
 
 	if (pamAuthenticate(user, password, rhost)) {
 		//stdLog("Login accepted for %s", user);
-		return respond(RAP_RESPOND_SUCCESS, -1);
+		return respond(RAP_RESPOND_SUCCESS);
 	} else {
-		return respond(RAP_RESPOND_AUTH_FAILLED, -1);
+		return respond(RAP_RESPOND_AUTH_FAILLED);
 	}
 }
 
@@ -932,9 +1013,12 @@ int main(int argCount, char * args[]) {
 		case RAP_REQUEST_PROPPATCH:
 			ioResult = proppatch(&message);
 			break;
+		case RAP_REQUEST_LOCK:
+			ioResult = lockFile(&message);
+			break;
 		default:
 			stdLogError(0, "Invalid rap request id %d", message.mID);
-			ioResult = respond(RAP_RESPOND_INTERNAL_ERROR, -1);
+			ioResult = respond(RAP_RESPOND_INTERNAL_ERROR);
 		}
 		if (ioResult < 0) {
 			ioResult = 0;
