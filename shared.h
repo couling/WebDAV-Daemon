@@ -28,14 +28,15 @@ typedef enum RapConstant {
 
 	// sent by rap once a request has completed - deliberately HTTP response codes
 	RAP_RESPOND_CONTINUE = 100,
-	RAP_RESPOND_SUCCESS = 200,
-	RAP_RESPOND_NO_CONTENT = 204,
+	RAP_RESPOND_OK = 200,
+	RAP_RESPOND_OK_NO_CONTENT = 204,
 	RAP_RESPOND_MULTISTATUS = 207,
 	RAP_RESPOND_BAD_CLIENT_REQUEST = 400,
 	RAP_RESPOND_AUTH_FAILLED = 401,
 	RAP_RESPOND_ACCESS_DENIED = 403,
 	RAP_RESPOND_NOT_FOUND = 404,
 	RAP_RESPOND_CONFLICT = 409,
+	RAP_RESPOND_LOCKED = 423,
 	RAP_RESPOND_INTERNAL_ERROR = 500,
 	RAP_RESPOND_INSUFFICIENT_STORAGE = 507
 
@@ -56,10 +57,16 @@ typedef enum RapConstant {
 #define RAP_PARAM_RESPONSE_MIME     1
 #define RAP_PARAM_RESPONSE_LOCATION 2
 
-// Lock request
+// Lock interim response
 #define RAP_PARAM_LOCK_LOCATION     0
 #define RAP_PARAM_LOCK_TYPE         1
 #define RAP_PARAM_LOCK_TOKEN        1
+#define RAP_PARAM_LOCK_TIMEOUT      2
+
+// Error responses
+#define RAP_PARAM_ERROR_LOCATION    0
+#define RAP_PARAM_ERROR_REASON      1
+#define RAP_PARAM_ERROR_NAMESPACE   2
 
 #define PIPE_READ     0
 #define PIPE_WRITE    1
@@ -97,7 +104,7 @@ typedef struct iovec MessageParam;
 typedef struct Message {
 	enum RapConstant mID;
 	int fd;
-	int bufferCount;
+	int paramCount;
 	MessageParam params[MAX_MESSAGE_PARAMS];
 } Message;
 

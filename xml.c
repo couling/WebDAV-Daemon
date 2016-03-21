@@ -153,17 +153,14 @@ xmlTextWriterPtr xmlNewFdTextWriter(int out) {
 int xmlTextWriterWriteElementString(xmlTextWriterPtr writer, const char * prefix, const char * elementName,
 		const char * string) {
 	int ret;
-	if (prefix) {
-		if ((ret = xmlTextWriterStartElementNS(writer, prefix, elementName, NULL)) < 0)
-			return ret;
-	} else {
-		if ((ret = xmlTextWriterStartElement(writer, elementName)) < 0)
-			return ret;
-	}
-	if ((ret = xmlTextWriterWriteString(writer, string)) < 0)
-		return ret;
-	if ((ret = xmlTextWriterEndElement(writer)) < 0)
-		return ret;
+	//if (prefix) {
+	if ((ret = xmlTextWriterStartElementNS(writer, prefix, elementName, NULL)) < 0) return ret;
+	//} else {
+	//	if ((ret = xmlTextWriterStartElement(writer, elementName)) < 0)
+	//		return ret;
+	//}
+	if (string && (ret = xmlTextWriterWriteString(writer, string)) < 0) return ret;
+	if ((ret = xmlTextWriterEndElement(writer)) < 0) return ret;
 	return ret;
 }
 

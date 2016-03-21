@@ -574,7 +574,7 @@ static int createResponseFromMessage(Request *request, struct Message * message,
 	// Queue the response
 	switch (message->mID) {
 	case RAP_RESPOND_CONTINUE:
-	case RAP_RESPOND_NO_CONTENT:
+	case RAP_RESPOND_OK_NO_CONTENT:
 	case RAP_RESPOND_INTERNAL_ERROR:
 		// There is no response body to set for these codes
 		// They will be handled elswehere.
@@ -583,7 +583,8 @@ static int createResponseFromMessage(Request *request, struct Message * message,
 		}
 		return message->mID;
 
-	case RAP_RESPOND_MULTISTATUS: {
+	case RAP_RESPOND_MULTISTATUS:
+	case RAP_RESPOND_LOCKED: {
 		const char * mimeType = messageParamToString(&message->params[RAP_PARAM_REQUEST_FILE]);
 		time_t date = *((time_t *) message->params[RAP_PARAM_RESPONSE_DATE].iov_base);
 
@@ -592,12 +593,12 @@ static int createResponseFromMessage(Request *request, struct Message * message,
 		}
 
 		*response = createFdResponse(message->fd, 0, -1, mimeType, date, lockToken);
-		return RAP_RESPOND_MULTISTATUS;
+		return message->mID;
 	}
 
-	case RAP_RESPOND_SUCCESS: {
+	case RAP_RESPOND_OK: {
 		if (message->fd == -1) {
-			return RAP_RESPOND_NO_CONTENT;
+			return RAP_RESPOND_OK_NO_CONTENT;
 		}
 
 		int statusCode = message->mID;
@@ -625,7 +626,7 @@ static int createResponseFromMessage(Request *request, struct Message * message,
 			*response = createFdResponse(message->fd, 0, -1, mimeType, date, lockToken);
 		}
 
-		if (message->bufferCount > RAP_PARAM_RESPONSE_LOCATION) {
+		if (message->paramCount > RAP_PARAM_RESPONSE_LOCATION) {
 			addHeader(*response, "Location",
 					messageParamToString(&message->params[RAP_PARAM_RESPONSE_LOCATION]));
 		}
@@ -687,7 +688,11 @@ static int finishProcessingRequest(Request * request, RAP * processor, Response 
 		if (acquireLock(&lockToken, processor->user, location, lockType, message.fd)) {
 			message.mID = RAP_COMPLETE_REQUEST_LOCK;
 			message.fd = -1;
+			message.paramCount = 3;
+			// message.params[RAP_PARAM_LOCK_LOCATION] = leave this unchanged
 			message.params[RAP_PARAM_LOCK_TOKEN] = stringToMessageParam(lockToken);
+			message.params[RAP_PARAM_LOCK_TIMEOUT].iov_base = &config.maxLockTime;
+			message.params[RAP_PARAM_LOCK_TIMEOUT].iov_len = sizeof(config.maxLockTime);
 			readResult = sendRecvMessage(processor->socketFd, &message, incomingBuffer, INCOMING_BUFFER_SIZE);
 			if (readResult <= 0) {
 				return RAP_RESPOND_INTERNAL_ERROR;
@@ -748,7 +753,7 @@ static int startProcessingRequest(Request * request, const char * url, const cha
 		Message message;
 		message.mID = RAP_REQUEST_GET;
 		message.fd = -1; // There should never be a rapSession->requestReadDataFd but if there is just ignore it
-		message.bufferCount = 2;
+		message.paramCount = 2;
 		message.params[RAP_PARAM_REQUEST_LOCK] = stringToMessageParam(rapSession->requestLockToken);
 		message.params[RAP_PARAM_REQUEST_FILE] = stringToMessageParam(url);
 
@@ -763,7 +768,7 @@ static int startProcessingRequest(Request * request, const char * url, const cha
 		message.mID = RAP_REQUEST_PUT;
 		message.fd = rapSession->requestReadDataFd;
 		rapSession->requestReadDataFd = -1; // sendMessage takes ownership of this even on failure
-		message.bufferCount = 2;
+		message.paramCount = 2;
 		message.params[RAP_PARAM_REQUEST_LOCK] = stringToMessageParam(rapSession->requestLockToken);
 		message.params[RAP_PARAM_REQUEST_FILE] = stringToMessageParam(url);
 
@@ -780,7 +785,7 @@ static int startProcessingRequest(Request * request, const char * url, const cha
 		message.mID = RAP_REQUEST_PROPFIND;
 		message.fd = rapSession->requestReadDataFd;
 		rapSession->requestReadDataFd = -1; // sendMessage takes ownership of this even on failure
-		message.bufferCount = 3;
+		message.paramCount = 3;
 		message.params[RAP_PARAM_REQUEST_LOCK] = stringToMessageParam(rapSession->requestLockToken);
 		message.params[RAP_PARAM_REQUEST_FILE] = stringToMessageParam(url);
 		message.params[RAP_PARAM_REQUEST_DEPTH] = stringToMessageParam(depth ? depth : "infinity");
@@ -799,10 +804,10 @@ static int startProcessingRequest(Request * request, const char * url, const cha
 		message.mID = RAP_REQUEST_LOCK;
 		message.fd = rapSession->requestReadDataFd;
 		rapSession->requestReadDataFd = -1; // sendMessage takes ownership of this even on failure
-		message.bufferCount = 3;
+		message.paramCount = 3;
 		message.params[RAP_PARAM_REQUEST_LOCK] = stringToMessageParam(lockToken);
 		message.params[RAP_PARAM_REQUEST_FILE] = stringToMessageParam(url);
-		message.params[RAP_PARAM_REQUEST_DEPTH] = stringToMessageParam(depth ? depth : "infinity");
+		message.params[RAP_PARAM_REQUEST_DEPTH] = stringToMessageParam(depth);
 
 		if (sendRecvMessage(rapSession->socketFd, &message, incomingBuffer, sizeof(incomingBuffer)) <= 0) {
 			return RAP_RESPOND_INTERNAL_ERROR;
@@ -817,7 +822,7 @@ static int startProcessingRequest(Request * request, const char * url, const cha
 		message.mID = RAP_REQUEST_PROPPATCH;
 		message.fd = rapSession->requestReadDataFd;
 		rapSession->requestReadDataFd = -1; // sendMessage takes ownership of this even on failure
-		message.bufferCount = 3;
+		message.paramCount = 3;
 		message.params[RAP_PARAM_REQUEST_LOCK] = stringToMessageParam(rapSession->requestLockToken);
 		message.params[RAP_PARAM_REQUEST_FILE] = stringToMessageParam(url);
 		message.params[RAP_PARAM_REQUEST_DEPTH] = stringToMessageParam(depth ? depth : "infinity");
@@ -831,7 +836,7 @@ static int startProcessingRequest(Request * request, const char * url, const cha
 	} else if (!strcmp("OPTIONS", method)) {
 		*response = createFileResponse(request, OPTIONS_PAGE, "text/html", rapSession->requestLockToken);
 		addHeader(*response, "Accept", ACCEPT_HEADER);
-		return RAP_RESPOND_SUCCESS;
+		return RAP_RESPOND_OK;
 
 	} else {
 		stdLogError(0, "Can not cope with method: %s (%s data)", method,
@@ -875,8 +880,8 @@ static int sendResponse(Request * request, int statusCode, Response * response, 
 		return sendStaticResponse(request, MHD_HTTP_UNAUTHORIZED, UNAUTHORIZED_PAGE,
 				rapSession->requestLockToken);
 
-	case RAP_RESPOND_NO_CONTENT:
-		return sendStaticResponse(request, RAP_RESPOND_NO_CONTENT, response, rapSession->requestLockToken);
+	case RAP_RESPOND_OK_NO_CONTENT:
+		return sendStaticResponse(request, RAP_RESPOND_OK_NO_CONTENT, NO_CONTENT_PAGE, rapSession->requestLockToken);
 
 	case MHD_HTTP_METHOD_NOT_ALLOWED:
 		return sendStaticResponse(request, MHD_HTTP_METHOD_NOT_ALLOWED, METHOD_NOT_SUPPORTED_PAGE,

@@ -177,7 +177,7 @@ static RAP * createRap(RapList * db, const char * user, const char * password, c
 	Message message;
 	message.mID = RAP_REQUEST_AUTHENTICATE;
 	message.fd = -1;
-	message.bufferCount = 3;
+	message.paramCount = 3;
 	message.params[RAP_PARAM_AUTH_USER] = stringToMessageParam(user);
 	message.params[RAP_PARAM_AUTH_PASSWORD] = stringToMessageParam(password);
 	message.params[RAP_PARAM_AUTH_RHOST] = stringToMessageParam(rhost);
@@ -189,7 +189,7 @@ static RAP * createRap(RapList * db, const char * user, const char * password, c
 	// Read Auth Result
 	char incomingBuffer[INCOMING_BUFFER_SIZE];
 	ssize_t readResult = recvMessage(socketFd, &message, incomingBuffer, INCOMING_BUFFER_SIZE);
-	if (readResult <= 0 || message.mID != RAP_RESPOND_SUCCESS) {
+	if (readResult <= 0 || message.mID != RAP_RESPOND_OK) {
 		close(socketFd);
 		if (readResult < 0) {
 			stdLogError(0, "Could not read result from RAP ");

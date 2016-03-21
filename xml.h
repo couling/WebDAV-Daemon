@@ -11,6 +11,8 @@ int stepOver(xmlTextReaderPtr reader);
 int stepOut(xmlTextReaderPtr reader);
 int stepOverText(xmlTextReaderPtr reader, const char ** text);
 int elementMatches(xmlTextReaderPtr reader, const char * namespace, const char * nodeName);
+#define isNamespaceElement(reader, namespace) (xmlTextReaderNodeType(reader) == XML_READER_TYPE_ELEMENT && \
+		!strcmp(xmlTextReaderConstNamespaceUri(reader), namespace))
 const char * nodeTypeToName(int nodeType);
 
 // XML Writer

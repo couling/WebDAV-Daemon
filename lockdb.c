@@ -15,7 +15,7 @@
 #include <stdlib.h>
 #include <uuid/uuid.h>
 
-typedef char LockToken[37];
+typedef char LockToken[46];
 
 typedef struct Lock {
 	const char * user;
@@ -57,9 +57,10 @@ int acquireLock(const char ** lockToken, const char * user, const char * file, L
 	newLock->user = buffer + sizeof(Lock);
 	newLock->file = newLock->user + userSize;
 
+	strcpy(newLock->lockToken, "urn:uuid:");
 	uuid_t uuid;
 	uuid_generate(uuid);
-	uuid_unparse_upper(uuid, newLock->lockToken);
+	uuid_unparse_lower(uuid, newLock->lockToken + 9);
 	memcpy((char *) newLock->user, user, userSize);
 	memcpy((char *) newLock->file, file, fileSize);
 	time(&newLock->lockAcquired);
@@ -76,6 +77,7 @@ int acquireLock(const char ** lockToken, const char * user, const char * file, L
 	} else {
 		addLockToDb(newLock);
 		sem_post(&lockDBLock);
+		*lockToken = newLock->lockToken;
 		return 1;
 	}
 }
@@ -164,11 +166,10 @@ static void cleanAction(const void *nodep, const VISIT which, const int depth) {
 	switch (which) {
 	case postorder:
 	case leaf: {
-		Lock ** node = (Lock **) nodep;
-		Lock * lock = *node;
-		if (lock->lockAcquired < expiryTime && !lock->released) {
+		Lock * lock = *((Lock **) nodep);
+		if (lock && lock->lockAcquired < expiryTime && !lock->released) {
 			int index = readyForReleaseCount++;
-			if (!(readyForReleaseCount & 0xF)) {
+			if (!(index & 0xF)) {
 				readyForRelease = reallocSafe(readyForRelease,
 						(readyForReleaseCount | 0xF) * sizeof(*readyForRelease));
 			}
@@ -191,13 +192,14 @@ void runCleanLocks() {
 			expiryTime -= config.maxLockTime;
 			readyForReleaseCount = 0;
 			readyForRelease = NULL;
-			twalk(&rootNode, &cleanAction);
+			twalk(rootNode, &cleanAction);
 
 			if (readyForReleaseCount > 0) {
 				int i = 0;
 				do {
 					readyForRelease[i]->released = 1;
 					releaseUnusedLock(readyForRelease[i]);
+					i++;
 				} while (i < readyForReleaseCount);
 				freeSafe(readyForRelease);
 			}

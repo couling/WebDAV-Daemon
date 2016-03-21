@@ -107,8 +107,8 @@ ssize_t sendMessage(int sock, Message * message) {
 	char ctrl_buf[CMSG_SPACE(sizeof(int))];
 	struct iovec messageParts[MAX_MESSAGE_PARAMS + 1];
 
-	if (message->bufferCount > MAX_MESSAGE_PARAMS || message->bufferCount < 0) {
-		stdLogError(0, "Can not send message with %d parts", message->bufferCount);
+	if (message->paramCount > MAX_MESSAGE_PARAMS || message->paramCount < 0) {
+		stdLogError(0, "Can not send message with %d parts", message->paramCount);
 		if (message->fd != -1) {
 			close(message->fd);
 		}
@@ -118,10 +118,10 @@ ssize_t sendMessage(int sock, Message * message) {
 	msg.msg_name = NULL;
 	msg.msg_namelen = 0;
 	msg.msg_iov = messageParts;
-	msg.msg_iovlen = message->bufferCount + 1;
+	msg.msg_iovlen = message->paramCount + 1;
 	messageParts[0].iov_base = message;
 	messageParts[0].iov_len = sizeof(*message);
-	memcpy(&(messageParts[1]), message->params, sizeof(*message->params) * message->bufferCount);
+	memcpy(&(messageParts[1]), message->params, sizeof(*message->params) * message->paramCount);
 
 	if (message->fd != -1) {
 		memset(&ctrl_buf, 0, sizeof(ctrl_buf));
@@ -195,8 +195,8 @@ ssize_t recvMessage(int sock, Message * message, char * incomingBuffer, size_t i
 		message->fd = -1;
 	}
 
-	if (size < sizeof(*message) || message->bufferCount < 0 || message->bufferCount > MAX_MESSAGE_PARAMS) {
-		stdLogError(0, "Invalid message received %zd %d", size, message->bufferCount);
+	if (size < sizeof(*message) || message->paramCount < 0 || message->paramCount > MAX_MESSAGE_PARAMS) {
+		stdLogError(0, "Invalid message received %zd %d", size, message->paramCount);
 		if (message->fd != -1) {
 			close(message->fd);
 		}
@@ -204,8 +204,8 @@ ssize_t recvMessage(int sock, Message * message, char * incomingBuffer, size_t i
 	}
 
 	char * partPtr = incomingBuffer;
-	for (int i = 0; i < message->bufferCount; i++) {
-		message->params[i].iov_base = partPtr;
+	for (int i = 0; i < message->paramCount; i++) {
+		message->params[i].iov_base = (message->params[i].iov_len > 0 ? partPtr : NULL);
 		partPtr += message->params[i].iov_len;
 		if (partPtr > incomingBuffer + size - sizeof(*message)) {
 			stdLogError(0, "Invalid message received: parts too long\n");
@@ -215,7 +215,7 @@ ssize_t recvMessage(int sock, Message * message, char * incomingBuffer, size_t i
 			return -1;
 		}
 	}
-	for (int i = message->bufferCount; i < MAX_MESSAGE_PARAMS; i++) {
+	for (int i = message->paramCount; i < MAX_MESSAGE_PARAMS; i++) {
 		message->params[i].iov_base = NULL;
 		message->params[i].iov_len = 0;
 	}
@@ -236,7 +236,7 @@ ssize_t sendRecvMessage(int sock, Message * message, char * incomingBuffer, size
 
 char * messageParamToString(MessageParam * iovec) {
 	char * buffer = iovec->iov_base;
-	buffer[iovec->iov_len - 1] = '\0';
+	if (buffer) buffer[iovec->iov_len - 1] = '\0';
 	return buffer;
 }
 

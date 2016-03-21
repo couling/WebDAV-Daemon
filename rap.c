@@ -14,6 +14,7 @@
 #include <security/pam_appl.h>
 
 #define WEBDAV_NAMESPACE "DAV:"
+#define EXTENSIONS_NAMESPACE "urn:couling-webdav:"
 #define MICROSOFT_NAMESPACE "urn:schemas-microsoft-com:"
 
 #define BUFFER_SIZE 40960
@@ -47,7 +48,7 @@ static MimeType XML_MIME_TYPE = {
 		.typeStringSize = sizeof("application/xml; charset=utf-8") };
 
 static ssize_t respond(RapConstant result) {
-	Message message = { .mID = result, .fd = -1, .bufferCount = 0 };
+	Message message = { .mID = result, .fd = -1, .paramCount = 0 };
 	return sendMessage(RAP_CONTROL_SOCKET, &message);
 }
 
@@ -201,80 +202,271 @@ static void initializeMimeTypes(const char * mimeTypesFile) {
 // End Mime //
 //////////////
 
+////////////////////
+// Error Response //
+////////////////////
+
+static ssize_t writeErrorResponse(RapConstant responseCode, const char * namespace, const char * error,
+		const char * file) {
+	int pipeEnds[2];
+	if (pipe(pipeEnds)) {
+		stdLogError(errno, "Could not create pipe to write content");
+		return respond(RAP_RESPOND_INTERNAL_ERROR);
+	}
+
+	time_t fileTime;
+	time(&fileTime);
+	Message message = { .mID = responseCode, .fd = pipeEnds[PIPE_READ], .paramCount = 2 };
+	message.params[RAP_PARAM_RESPONSE_DATE].iov_base = &fileTime;
+	message.params[RAP_PARAM_RESPONSE_DATE].iov_len = sizeof(fileTime);
+	message.params[RAP_PARAM_RESPONSE_MIME].iov_base = (void *) XML_MIME_TYPE.type;
+	message.params[RAP_PARAM_RESPONSE_MIME].iov_len = XML_MIME_TYPE.typeStringSize;
+	message.params[RAP_PARAM_RESPONSE_LOCATION] = stringToMessageParam(file);
+
+	ssize_t messageResult = sendMessage(RAP_CONTROL_SOCKET, &message);
+	if (messageResult <= 0) {
+		close(pipeEnds[PIPE_WRITE]);
+		return messageResult;
+	}
+
+	// We've set up the pipe and sent read end across so now write the result
+	xmlTextWriterPtr writer = xmlNewFdTextWriter(pipeEnds[PIPE_WRITE]);
+	xmlTextWriterStartDocument(writer, "1.0", "utf-8", NULL);
+	xmlTextWriterStartElementNS(writer, "d", "error", WEBDAV_NAMESPACE);
+	if (namespace) {
+		xmlTextWriterWriteAttributeNS(writer, "xmlns", "x", NULL, namespace);
+		xmlTextWriterStartElementNS(writer, "x", error, NULL);
+	} else {
+		xmlTextWriterStartElementNS(writer, namespace ? "x" : "d", error, NULL);
+	}
+	xmlTextWriterStartElementNS(writer, "d", "href", NULL);
+	xmlTextWriterWriteURL(writer, file);
+	xmlTextWriterEndElement(writer);
+	xmlTextWriterEndElement(writer);
+	xmlTextWriterEndElement(writer);
+	xmlFreeTextWriter(writer);
+	return messageResult;
+}
+
+////////////////////////
+// End Error Response //
+////////////////////////
+
 //////////
 // LOCK //
 //////////
 
-#define LOCK_REQUST_ROOT_NODE "lockinfo"
-#define LOCK_SCOPE            "lockscope"
-#define LOCK_TYPE             "locktype"
-#define LOCK_OWNER            "owner" // ignored
-
-#define LOCK_DISCOVERY_ROOT   "lockdiscovery"
-#define LOCK_DISCOVERY_CHILD  "activelock"
-
 typedef struct LockRequest {
 	int isNewLock;
-	int type;
-	LockType scope;
+	LockType type;
 } LockRequest;
 
-static int parseLockRequest(int fd, LockRequest * lockRequest) {
-	memset(&lockRequest, 0, sizeof(LockRequest));
-	if (fd == -1) return 0;
+static void parseLockRequest(int fd, LockRequest * lockRequest) {
+	memset(lockRequest, 0, sizeof(LockRequest));
+	if (fd == -1) return;
 	xmlTextReaderPtr reader = xmlReaderForFd(fd, NULL, NULL, XML_PARSE_NOENT);
 	xmlReaderSuppressErrors(reader);
 
-	if (!reader || !stepInto(reader) || !elementMatches(reader, WEBDAV_NAMESPACE, LOCK_REQUST_ROOT_NODE)) {
+	if (!reader || !stepInto(reader) || !elementMatches(reader, WEBDAV_NAMESPACE, "lockinfo")) {
 		if (reader) xmlFreeTextReader(reader);
 		close(fd);
-		return 0;
+		return;
 	}
 
 	lockRequest->isNewLock = 1;
 	int readResult = stepInto(reader);
 	while (readResult && xmlTextReaderDepth(reader) == 1) {
-		if (xmlTextReaderNodeType(reader) == XML_READER_TYPE_ELEMENT
-				&& !strcmp(xmlTextReaderConstNamespaceUri(reader), WEBDAV_NAMESPACE)) {
-			if (!strcmp(xmlTextReaderConstLocalName(reader), LOCK_SCOPE)) {
-				readResult = stepOver(reader);
-				// TODO
-			} else if (!strcmp(xmlTextReaderConstLocalName(reader), LOCK_TYPE)) {
-				readResult = stepOver(reader);
-				// TODO
+		if (isNamespaceElement(reader, WEBDAV_NAMESPACE)) {
+			const char * nodeName = xmlTextReaderConstLocalName(reader);
+			if (!strcmp(nodeName, "lockscope")) {
+				readResult = stepInto(reader);
+				while (readResult && xmlTextReaderDepth(reader) == 2) {
+					if (isNamespaceElement(reader, WEBDAV_NAMESPACE)) {
+						nodeName = xmlTextReaderConstLocalName(reader);
+						if (!strcmp(nodeName, "shared")) {
+							if (lockRequest->type != LOCK_TYPE_EXCLUSIVE) {
+								lockRequest->type = LOCK_TYPE_SHARED;
+							}
+						} else if (!strcmp(nodeName, "exclusive")) {
+							lockRequest->type = LOCK_TYPE_EXCLUSIVE;
+						}
+					}
+					readResult = stepOver(reader);
+				}
+			} else if (!strcmp(nodeName, "locktype")) {
+				readResult = stepInto(reader);
+				while (readResult && xmlTextReaderDepth(reader) == 2) {
+					if (isNamespaceElement(reader, WEBDAV_NAMESPACE)) {
+						nodeName = xmlTextReaderConstLocalName(reader);
+						if (!strcmp(nodeName, "read") && lockRequest->type != LOCK_TYPE_EXCLUSIVE) {
+							lockRequest->type = LOCK_TYPE_SHARED;
+						} else if (!strcmp(nodeName, "write")) {
+							lockRequest->type = LOCK_TYPE_EXCLUSIVE;
+						}
+					}
+					readResult = stepOver(reader);
+				}
 			} else {
 				readResult = stepOver(reader);
 			}
 		}
 	}
-	// TODO
 
 	// finish up
-	while (stepOver(reader))
-		// consume the rest of the input
-		;
+	while (readResult) {
+		readResult = stepOver(reader);
+	}
 
 	xmlFreeTextReader(reader);
 	close(fd);
-	return readResult;
+}
+
+static ssize_t writeLockResponse(const char * fileName, LockRequest * request, const char * lockToken,
+		time_t timeout) {
+	int pipeEnds[2];
+	if (pipe(pipeEnds)) {
+		stdLogError(errno, "Could not create pipe to write content");
+		return respond(RAP_RESPOND_INTERNAL_ERROR);
+	}
+
+	time_t fileTime;
+	time(&fileTime);
+	Message message = { .mID = RAP_RESPOND_OK, .fd = pipeEnds[PIPE_READ], .paramCount = 2 };
+	message.params[RAP_PARAM_RESPONSE_DATE].iov_base = &fileTime;
+	message.params[RAP_PARAM_RESPONSE_DATE].iov_len = sizeof(fileTime);
+	message.params[RAP_PARAM_RESPONSE_MIME].iov_base = (void *) XML_MIME_TYPE.type;
+	message.params[RAP_PARAM_RESPONSE_MIME].iov_len = XML_MIME_TYPE.typeStringSize;
+	message.params[RAP_PARAM_RESPONSE_LOCATION] = stringToMessageParam(fileName);
+
+	ssize_t messageResult = sendMessage(RAP_CONTROL_SOCKET, &message);
+	if (messageResult <= 0) {
+		close(pipeEnds[PIPE_WRITE]);
+		return messageResult;
+	}
+
+	// We've set up the pipe and sent read end across so now write the result
+	xmlTextWriterPtr writer = xmlNewFdTextWriter(pipeEnds[PIPE_WRITE]);
+	xmlTextWriterStartDocument(writer, "1.0", "utf-8", NULL);
+	xmlTextWriterStartElementNS(writer, "d", "prop", WEBDAV_NAMESPACE);
+	xmlTextWriterStartElementNS(writer, "d", "lockdiscovery", NULL);
+	xmlTextWriterStartElementNS(writer, "d", "activelock", NULL);
+	// <d:locktype><d:write></d:locktype>
+	xmlTextWriterStartElementNS(writer, "d", "locktype", NULL);
+	xmlTextWriterWriteElementString(writer, "d", (request->type == LOCK_TYPE_EXCLUSIVE ? "write" : "read"),
+	NULL);
+	xmlTextWriterEndElement(writer);
+	// <d:lockscope><d:exclusive></d:lockscope>
+	xmlTextWriterStartElementNS(writer, "d", "lockscope", NULL);
+	xmlTextWriterWriteElementString(writer, "d",
+			(request->type == LOCK_TYPE_EXCLUSIVE ? "exclusive" : "shared"), NULL);
+	xmlTextWriterEndElement(writer);
+	// <d:depth>Infinity</d:depth>
+	xmlTextWriterWriteElementString(writer, "d", "depth", "infinity");
+	// <d:owner>Bob</d:owner>
+	// TODO check that this owner format is valid it may not be
+	xmlTextWriterWriteElementString(writer, "d", "owner", authenticatedUser);
+	// <d:lockroot><d:href>/foo/bar</d:lockroot></d:href>
+	xmlTextWriterStartElementNS(writer, "d", "lockroot", NULL);
+	xmlTextWriterStartElementNS(writer, "d", "href", NULL);
+	xmlTextWriterWriteURL(writer, fileName);
+	xmlTextWriterEndElement(writer);
+	xmlTextWriterEndElement(writer);
+	// <d:locktoken><d:href>urn:uuid:e71d4fae-5dec-22d6-fea5-00a0c91e6be4</d:href></d:locktoken>
+	xmlTextWriterStartElementNS(writer, "d", "locktoken", NULL);
+	xmlTextWriterWriteElementString(writer, "d", "href", lockToken);
+	xmlTextWriterEndElement(writer);
+
+	// TODO timeout
+
+	xmlTextWriterEndElement(writer);
+	xmlTextWriterEndElement(writer);
+	xmlTextWriterEndElement(writer);
+
+	xmlFreeTextWriter(writer);
+	return messageResult;
 }
 
 static ssize_t lockFile(Message * message) {
+	const char * file = messageParamToString(&message->params[RAP_PARAM_REQUEST_FILE]);
+	const char * lockToken = messageParamToString(&message->params[RAP_PARAM_REQUEST_LOCK]);
+	const char * depth = messageParamToString(&message->params[RAP_PARAM_REQUEST_DEPTH]);
+	if (depth == NULL) depth = "infinity";
 	respond(RAP_RESPOND_CONTINUE);
+
 	LockRequest lockRequest;
-	memset(&lockRequest, 0, sizeof(LockRequest));
-	if (!parseLockRequest(message->fd, &lockRequest)) {
-		// TODO provide a body for the bad request
-		// TODO return the correct code
-		return respond(RAP_RESPOND_BAD_CLIENT_REQUEST);
-	}
+	parseLockRequest(message->fd, &lockRequest);
+
+	Message interimMessage;
+	char incomingBuffer[INCOMING_BUFFER_SIZE];
+	ssize_t ioResponse;
+
 	if (lockRequest.isNewLock) {
-		// TODO
-		return -1;
+		if (lockToken) {
+			// Lock token must be empty but isn't
+			return writeErrorResponse(RAP_RESPOND_BAD_CLIENT_REQUEST, NULL, "lock-token-submitted", file);
+		}
+
+		int openFlags = (lockRequest.type == LOCK_TYPE_EXCLUSIVE ? O_WRONLY | O_CREAT : O_RDONLY);
+		interimMessage.fd = open(file, openFlags, 0666);
+		if (interimMessage.fd == -1) {
+			stdLogError(errno, "Could not open file for lock %s", file);
+			switch (errno) {
+			case EACCES:
+				return writeErrorResponse(RAP_RESPOND_ACCESS_DENIED, EXTENSIONS_NAMESPACE, "access-denied",
+						file);
+			case ENOENT:
+				return writeErrorResponse(RAP_RESPOND_NOT_FOUND, EXTENSIONS_NAMESPACE, "not-found-for-read",
+						file);
+			default:
+				return writeErrorResponse(RAP_RESPOND_NOT_FOUND, EXTENSIONS_NAMESPACE,
+						"could-not-open-to-lock", file);
+			}
+		}
+		struct stat s;
+		fstat(interimMessage.fd, &s);
+		if ((s.st_mode & S_IFMT) != S_IFREG) {
+			stdLogError(0, "Refusing to lock non-regular file %s", file);
+			close(interimMessage.fd);
+			return respond(RAP_RESPOND_CONFLICT);
+		}
+
+		if (flock(interimMessage.fd, lockRequest.type) == -1) {
+			stdLogError(errno, "Could not lock file %s", file);
+			close(interimMessage.fd);
+			return writeErrorResponse(RAP_RESPOND_LOCKED, NULL, "no-conflicting-lock", file);
+		}
+
+		interimMessage.mID = RAP_INTERIM_RESPOND_LOCK;
+		interimMessage.paramCount = 2;
+		interimMessage.params[RAP_PARAM_LOCK_LOCATION] = message->params[RAP_PARAM_REQUEST_FILE];
+		interimMessage.params[RAP_PARAM_LOCK_TYPE].iov_base = &lockRequest.type;
+		interimMessage.params[RAP_PARAM_LOCK_TYPE].iov_len = sizeof(lockRequest.type);
 	} else {
-		// TODO
-		return -1;
+		if (!lockToken) {
+			// Lock token must not be empty
+			return writeErrorResponse(RAP_RESPOND_BAD_CLIENT_REQUEST, NULL, "lock-token-submitted", file);
+		}
+		interimMessage.mID = RAP_INTERIM_RESPOND_RELOCK;
+		interimMessage.fd = -1;
+		interimMessage.paramCount = 2;
+		interimMessage.params[RAP_PARAM_LOCK_LOCATION] = message->params[RAP_PARAM_REQUEST_FILE];
+		interimMessage.params[RAP_PARAM_LOCK_TOKEN] = stringToMessageParam(lockToken);
 	}
+
+	ioResponse = sendRecvMessage(RAP_CONTROL_SOCKET, &interimMessage, incomingBuffer, INCOMING_BUFFER_SIZE);
+	if (ioResponse <= 0) return ioResponse;
+
+	if (interimMessage.mID == RAP_COMPLETE_REQUEST_LOCK) {
+		lockToken = messageParamToString(&interimMessage.params[RAP_PARAM_LOCK_TOKEN]);
+		time_t timeout = *((time_t *) interimMessage.params[RAP_PARAM_LOCK_TIMEOUT].iov_base);
+		return writeLockResponse(file, &lockRequest, lockToken, timeout);
+	} else {
+		const char * reason = messageParamToString(&interimMessage.params[RAP_PARAM_ERROR_REASON]);
+		const char * errorNamespace = messageParamToString(&interimMessage.params[RAP_PARAM_ERROR_NAMESPACE]);
+
+		return writeErrorResponse(interimMessage.mID, errorNamespace, reason, file);
+	}
+
 }
 
 //////////////
@@ -514,7 +706,7 @@ static int respondToPropFind(const char * file, PropertySet * properties, int de
 
 	time_t fileTime;
 	time(&fileTime);
-	Message message = { .mID = RAP_RESPOND_MULTISTATUS, .fd = pipeEnds[PIPE_READ], .bufferCount = 2 };
+	Message message = { .mID = RAP_RESPOND_MULTISTATUS, .fd = pipeEnds[PIPE_READ], .paramCount = 2 };
 	message.params[RAP_PARAM_RESPONSE_DATE].iov_base = &fileTime;
 	message.params[RAP_PARAM_RESPONSE_DATE].iov_len = sizeof(fileTime);
 	message.params[RAP_PARAM_RESPONSE_MIME].iov_base = (void *) XML_MIME_TYPE.type;
@@ -569,12 +761,12 @@ static int respondToPropFind(const char * file, PropertySet * properties, int de
 }
 
 static ssize_t propfind(Message * requestMessage) {
-	if (!authenticated || requestMessage->bufferCount != 3) {
+	if (!authenticated || requestMessage->paramCount != 3) {
 		if (!authenticated) {
 			stdLogError(0, "Not authenticated RAP");
 		} else {
-			stdLogError(0, "Get request did not provide correct buffers: %d buffer(s)",
-					requestMessage->bufferCount);
+			stdLogError(0, "PROPFIND request did not provide correct buffers: %d buffer(s)",
+					requestMessage->paramCount);
 		}
 		close(requestMessage->fd);
 		return respond(RAP_RESPOND_INTERNAL_ERROR);
@@ -621,7 +813,7 @@ static ssize_t proppatch(Message * requestMessage) {
 		close(requestMessage->fd);
 
 	}
-	return respond(RAP_RESPOND_SUCCESS);
+	return respond(RAP_RESPOND_OK);
 }
 
 ///////////////////
@@ -641,15 +833,15 @@ static ssize_t writeFile(Message * requestMessage) {
 		stdLogError(0, "Not authenticated RAP");
 		return respond(RAP_RESPOND_INTERNAL_ERROR);
 	}
-	if (requestMessage->bufferCount != 2) {
-		stdLogError(0, "Get request did not provide correct buffers: %d buffer(s)",
-				requestMessage->bufferCount);
+	if (requestMessage->paramCount != 2) {
+		stdLogError(0, "PUT request did not provide correct buffers: %d buffer(s)",
+				requestMessage->paramCount);
 		return respond(RAP_RESPOND_INTERNAL_ERROR);
 	}
 
 	char * file = messageParamToString(&requestMessage->params[RAP_PARAM_REQUEST_FILE]);
 	// TODO change file mode
-	int fd = open(file, O_WRONLY | O_CREAT, 0660);
+	int fd = open(file, O_WRONLY | O_CREAT | O_TRUNC, 0660);
 	if (fd == -1) {
 		int e = errno;
 		switch (e) {
@@ -682,7 +874,7 @@ static ssize_t writeFile(Message * requestMessage) {
 
 	close(fd);
 	close(requestMessage->fd);
-	return respond(RAP_RESPOND_SUCCESS);
+	return respond(RAP_RESPOND_OK);
 }
 
 /////////////
@@ -801,9 +993,9 @@ static ssize_t readFile(Message * requestMessage) {
 		stdLogError(0, "Not authenticated RAP");
 		return respond(RAP_RESPOND_INTERNAL_ERROR);
 	}
-	if (requestMessage->bufferCount != 2) {
+	if (requestMessage->paramCount != 2) {
 		stdLogError(0, "Get request did not provide correct buffers: %d buffer(s)",
-				requestMessage->bufferCount);
+				requestMessage->paramCount);
 		return respond(RAP_RESPOND_INTERNAL_ERROR);
 	}
 
@@ -835,7 +1027,7 @@ static ssize_t readFile(Message * requestMessage) {
 			time_t fileTime;
 			time(&fileTime);
 
-			Message message = { .mID = RAP_RESPOND_SUCCESS, .fd = pipeEnds[PIPE_READ], 3 };
+			Message message = { .mID = RAP_RESPOND_OK, .fd = pipeEnds[PIPE_READ], 3 };
 			message.params[RAP_PARAM_RESPONSE_DATE].iov_base = &fileTime;
 			message.params[RAP_PARAM_RESPONSE_DATE].iov_len = sizeof(fileTime);
 			message.params[RAP_PARAM_RESPONSE_MIME].iov_base = "text/html";
@@ -851,7 +1043,7 @@ static ssize_t readFile(Message * requestMessage) {
 			listDir(file, fd, pipeEnds[PIPE_WRITE]);
 			return messageResult;
 		} else {
-			Message message = { .mID = RAP_RESPOND_SUCCESS, .fd = fd, .bufferCount = 3 };
+			Message message = { .mID = RAP_RESPOND_OK, .fd = fd, .paramCount = 3 };
 			message.params[RAP_PARAM_RESPONSE_DATE].iov_base = &statinfo.st_mtime;
 			message.params[RAP_PARAM_RESPONSE_DATE].iov_len = sizeof(statinfo.st_mtime);
 			MimeType * mimeType = findMimeType(file);
@@ -953,7 +1145,7 @@ static ssize_t authenticate(Message * message) {
 		return respond(RAP_RESPOND_INTERNAL_ERROR);
 	}
 	if (authenticated) {
-		stdLogError(0, "Login provided %d buffer(s) instead of 3", message->bufferCount);
+		stdLogError(0, "Login provided %d buffer(s) instead of 3", message->paramCount);
 		return respond(RAP_RESPOND_INTERNAL_ERROR);
 	}
 
@@ -963,7 +1155,7 @@ static ssize_t authenticate(Message * message) {
 
 	if (pamAuthenticate(user, password, rhost)) {
 		//stdLog("Login accepted for %s", user);
-		return respond(RAP_RESPOND_SUCCESS);
+		return respond(RAP_RESPOND_OK);
 	} else {
 		return respond(RAP_RESPOND_AUTH_FAILLED);
 	}
