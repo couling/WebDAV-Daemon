@@ -2,6 +2,7 @@ CFLAGS=-O3 -s
 STATIC_FLAGS=-Werror -Wall -Wno-pointer-sign -std=gnu99 -pthread
 
 all: build/rap build/webdavd
+	ls -lh $^
 
 build/webdavd: build/webdavd.o build/shared.o build/configuration.o build/rap-control.o build/xml.o build/lockdb.o
 	gcc ${CFLAGS} ${STATIC_FLAGS} -o $@ $(filter %.o,$^) -lmicrohttpd -lxml2 -lgnutls -luuid

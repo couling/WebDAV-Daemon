@@ -18,6 +18,9 @@ typedef enum RapConstant {
 	RAP_REQUEST_PROPFIND,
 	RAP_REQUEST_PROPPATCH,
 	RAP_REQUEST_LOCK,
+	RAP_REQUEST_MKCOL,
+	RAP_REQUEST_MOVE,
+	RAP_REQUEST_DELETE,
 
 	// sent by rap, processed by finishProcessingRequest
 	RAP_INTERIM_RESPOND_LOCK,
@@ -29,6 +32,7 @@ typedef enum RapConstant {
 	// sent by rap once a request has completed - deliberately HTTP response codes
 	RAP_RESPOND_CONTINUE = 100,
 	RAP_RESPOND_OK = 200,
+	RAP_RESPOND_CREATED = 201,
 	RAP_RESPOND_OK_NO_CONTENT = 204,
 	RAP_RESPOND_MULTISTATUS = 207,
 	RAP_RESPOND_BAD_CLIENT_REQUEST = 400,
@@ -74,6 +78,14 @@ typedef enum RapConstant {
 #define PARENT_SOCKET 0
 #define CHILD_SOCKET  1
 
+typedef char LockToken[37];
+
+#define LOCK_TOKEN_URN_PREFIX "urn:uuid:"
+#define LOCK_TOKEN_PREFIX "<urn:uuid:"
+#define LOCK_TOKEN_PREFIX_LENGTH (sizeof(LOCK_TOKEN_PREFIX) - 1)
+#define LOCK_TOKEN_SUFFIX ">"
+#define LOCK_TOKEN_LENGTH (LOCK_TOKEN_PREFIX_LENGTH + sizeof(LockToken) + sizeof(LOCK_TOKEN_SUFFIX))
+
 typedef enum LockType {
 	LOCK_TYPE_SHARED = LOCK_SH | LOCK_NB,
 	LOCK_TYPE_EXCLUSIVE = LOCK_EX | LOCK_NB
@@ -100,6 +112,7 @@ void stdLogError(int errorNumber, const char * str, ...);
 #define MAX_MESSAGE_PARAMS 3
 #define INCOMING_BUFFER_SIZE 4096
 typedef struct iovec MessageParam;
+#define NULL_PARAM ( ( MessageParam ) { .iov_base = NULL, .iov_len = 0} )
 
 typedef struct Message {
 	enum RapConstant mID;

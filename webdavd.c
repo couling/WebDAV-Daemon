@@ -2,6 +2,7 @@
 // TODO check into what happens when a connection is closed early during upload.
 // TODO prevent PUT clobbering files.
 // TODO catch interupt and clean shutdown
+// TODO accept suggested timeout values from clients during LOCK requests
 
 #include "shared.h"
 #include "configuration.h"
@@ -575,6 +576,7 @@ static int createResponseFromMessage(Request *request, struct Message * message,
 	switch (message->mID) {
 	case RAP_RESPOND_CONTINUE:
 	case RAP_RESPOND_OK_NO_CONTENT:
+	case RAP_RESPOND_CREATED:
 	case RAP_RESPOND_INTERNAL_ERROR:
 		// There is no response body to set for these codes
 		// They will be handled elswehere.
@@ -681,52 +683,42 @@ static int finishProcessingRequest(Request * request, RAP * processor, Response 
 	}
 
 	switch (message.mID) {
-	case RAP_INTERIM_RESPOND_LOCK: {
-		const char * location = messageParamToString(&message.params[RAP_PARAM_LOCK_LOCATION]);
-		LockType lockType = *((LockType *) message.params[RAP_PARAM_LOCK_TYPE].iov_base);
-		const char * lockToken;
-		if (acquireLock(&lockToken, processor->user, location, lockType, message.fd)) {
-			message.mID = RAP_COMPLETE_REQUEST_LOCK;
-			message.fd = -1;
-			message.paramCount = 3;
-			// message.params[RAP_PARAM_LOCK_LOCATION] = leave this unchanged
-			message.params[RAP_PARAM_LOCK_TOKEN] = stringToMessageParam(lockToken);
-			message.params[RAP_PARAM_LOCK_TIMEOUT].iov_base = &config.maxLockTime;
-			message.params[RAP_PARAM_LOCK_TIMEOUT].iov_len = sizeof(config.maxLockTime);
-			readResult = sendRecvMessage(processor->socketFd, &message, incomingBuffer, INCOMING_BUFFER_SIZE);
-			if (readResult <= 0) {
-				return RAP_RESPOND_INTERNAL_ERROR;
-			}
-		} else {
-			// TODO failed lock
-			return RAP_RESPOND_INTERNAL_ERROR;
-		}
-		break;
-
-	}
-
+	case RAP_INTERIM_RESPOND_LOCK:
 	case RAP_INTERIM_RESPOND_RELOCK: {
 		const char * location = messageParamToString(&message.params[RAP_PARAM_LOCK_LOCATION]);
-		const char * lockToken = messageParamToString(&message.params[RAP_PARAM_LOCK_TOKEN]);
-		if (refreshLock(lockToken, processor->user, location)) {
-			message.mID = RAP_COMPLETE_REQUEST_LOCK;
-			readResult = sendRecvMessage(processor->socketFd, &message, incomingBuffer, INCOMING_BUFFER_SIZE);
-			if (readResult <= 0) {
+		const char * lockToken;
+		if (message.mID == RAP_INTERIM_RESPOND_LOCK) {
+			LockType lockType = *((LockType *) message.params[RAP_PARAM_LOCK_TYPE].iov_base);
+			if (!acquireLock(&lockToken, processor->user, location, lockType, message.fd))
 				return RAP_RESPOND_INTERNAL_ERROR;
-			}
-		} else {
-			// TODO failed lock
-			return RAP_RESPOND_INTERNAL_ERROR;
+		} else /* if (message.mID == RAP_INTERIM_RESPOND_RELOCK) */{
+			lockToken = messageParamToString(&message.params[RAP_PARAM_LOCK_TOKEN]);
+			if (!refreshLock(lockToken, processor->user, location)) return RAP_RESPOND_INTERNAL_ERROR;
 		}
-		break;
+
+		message.mID = RAP_COMPLETE_REQUEST_LOCK;
+		message.fd = -1;
+		message.paramCount = 3;
+		// message.params[RAP_PARAM_LOCK_LOCATION] = leave this unchanged
+		message.params[RAP_PARAM_LOCK_TOKEN] = stringToMessageParam(lockToken);
+		message.params[RAP_PARAM_LOCK_TIMEOUT].iov_base = &config.maxLockTime;
+		message.params[RAP_PARAM_LOCK_TIMEOUT].iov_len = sizeof(config.maxLockTime);
+		readResult = sendRecvMessage(processor->socketFd, &message, incomingBuffer, INCOMING_BUFFER_SIZE);
+		if (readResult <= 0) return RAP_RESPOND_INTERNAL_ERROR;
+		int statusCode = createResponseFromMessage(request, &message, response, processor->requestLockToken);
+		if (statusCode == 200) {
+			// TODO add timeout header here too
+			char tokenBuffer[LOCK_TOKEN_LENGTH];
+			sprintf(tokenBuffer, LOCK_TOKEN_PREFIX "%s" LOCK_TOKEN_SUFFIX, lockToken);
+			addHeader(*response, "Lock-Token", tokenBuffer);
+		}
+		return statusCode;
+
 	}
 
 	default:
-		// We only need to do something for RAP_INTERIM_... messages
-		break;
+		return createResponseFromMessage(request, &message, response, processor->requestLockToken);
 	}
-
-	return createResponseFromMessage(request, &message, response, processor->requestLockToken);
 
 }
 
@@ -734,105 +726,52 @@ static int startProcessingRequest(Request * request, const char * url, const cha
 		Response ** response) {
 
 	char incomingBuffer[INCOMING_BUFFER_SIZE];
-	// TODO processing lock header
+
+	// TODO processing IF <lock> header
 	rapSession->requestLockToken = NULL;
+
 	// Interpret the method
-	// TODO MKCOL
-	// TODO HEAD
-	// TODO DELETE
 	// TODO COPY
-	// TODO MOVE
-	// TODO UNLOCK
 	// TODO PROPPATCH // properly
 	//stdLog("%s %s data", method, writeHandle ? "with" : "without");
 
-	/* these *may* get spun out into individual little methods so lets keep this code wrapped in neat little
-	 * bundles. The other option would be to try to code so that less code is repeated between these bundles...
-	 * the resulting code was becoming a little complicated */
-	if (!strcmp("GET", method)) {
-		Message message;
+	Message message;
+	// These methods are all passed to the RAP in a very similar way
+	if (!strcmp("GET", method) || !strcmp("HEAD", method)) {
 		message.mID = RAP_REQUEST_GET;
-		message.fd = -1; // There should never be a rapSession->requestReadDataFd but if there is just ignore it
 		message.paramCount = 2;
-		message.params[RAP_PARAM_REQUEST_LOCK] = stringToMessageParam(rapSession->requestLockToken);
-		message.params[RAP_PARAM_REQUEST_FILE] = stringToMessageParam(url);
-
-		if (sendRecvMessage(rapSession->socketFd, &message, incomingBuffer, sizeof(incomingBuffer)) <= 0) {
-			return RAP_RESPOND_INTERNAL_ERROR;
-		}
-
-		return createResponseFromMessage(request, &message, response, rapSession->requestLockToken);
-
 	} else if (!strcmp("PUT", method)) {
-		Message message;
 		message.mID = RAP_REQUEST_PUT;
-		message.fd = rapSession->requestReadDataFd;
-		rapSession->requestReadDataFd = -1; // sendMessage takes ownership of this even on failure
 		message.paramCount = 2;
-		message.params[RAP_PARAM_REQUEST_LOCK] = stringToMessageParam(rapSession->requestLockToken);
-		message.params[RAP_PARAM_REQUEST_FILE] = stringToMessageParam(url);
-
-		if (sendRecvMessage(rapSession->socketFd, &message, incomingBuffer, sizeof(incomingBuffer)) <= 0) {
-			return RAP_RESPOND_INTERNAL_ERROR;
-		}
-
-		return createResponseFromMessage(request, &message, response, rapSession->requestLockToken);
-
 	} else if (!strcmp("PROPFIND", method)) {
-		const char * depth = getHeader(request, HEADER_DEPTH);
-
-		Message message;
 		message.mID = RAP_REQUEST_PROPFIND;
-		message.fd = rapSession->requestReadDataFd;
-		rapSession->requestReadDataFd = -1; // sendMessage takes ownership of this even on failure
 		message.paramCount = 3;
-		message.params[RAP_PARAM_REQUEST_LOCK] = stringToMessageParam(rapSession->requestLockToken);
-		message.params[RAP_PARAM_REQUEST_FILE] = stringToMessageParam(url);
-		message.params[RAP_PARAM_REQUEST_DEPTH] = stringToMessageParam(depth ? depth : "infinity");
-
-		if (sendRecvMessage(rapSession->socketFd, &message, incomingBuffer, sizeof(incomingBuffer)) <= 0) {
-			return RAP_RESPOND_INTERNAL_ERROR;
-		}
-
-		return createResponseFromMessage(request, &message, response, rapSession->requestLockToken);
-
+	} else if (!strcmp("PROPPATCH", method)) {
+		message.mID = RAP_REQUEST_PROPPATCH;
+		message.paramCount = 3;
+	} else if (!strcmp("MKCOL", method)) {
+		message.mID = RAP_REQUEST_MKCOL;
+		message.paramCount = 2;
+	} else if (!strcmp("DELETE", method)) {
+		message.mID = RAP_REQUEST_DELETE;
+		message.paramCount = 2;
 	} else if (!strcmp("LOCK", method)) {
-		const char * depth = getHeader(request, HEADER_DEPTH);
+		message.mID = RAP_REQUEST_LOCK;
+		message.paramCount = 3;
+		// These methods are handled in a very different way
+	} else if (!strcmp("UNLOCK", method)) {
 		const char * lockToken = getHeader(request, HEADER_LOCK_TOKEN);
 
-		Message message;
-		message.mID = RAP_REQUEST_LOCK;
-		message.fd = rapSession->requestReadDataFd;
-		rapSession->requestReadDataFd = -1; // sendMessage takes ownership of this even on failure
-		message.paramCount = 3;
-		message.params[RAP_PARAM_REQUEST_LOCK] = stringToMessageParam(lockToken);
-		message.params[RAP_PARAM_REQUEST_FILE] = stringToMessageParam(url);
-		message.params[RAP_PARAM_REQUEST_DEPTH] = stringToMessageParam(depth);
-
-		if (sendRecvMessage(rapSession->socketFd, &message, incomingBuffer, sizeof(incomingBuffer)) <= 0) {
+		if (releaseLock(lockToken, url, rapSession->user)) {
+			return RAP_RESPOND_OK_NO_CONTENT;
+		} else {
+			// TODO return correct error response here.
 			return RAP_RESPOND_INTERNAL_ERROR;
 		}
-
-		return createResponseFromMessage(request, &message, response, rapSession->requestLockToken);
-
-	} else if (!strcmp("PROPPATCH", method)) {
-		const char * depth = getHeader(request, HEADER_DEPTH);
-
-		Message message;
-		message.mID = RAP_REQUEST_PROPPATCH;
-		message.fd = rapSession->requestReadDataFd;
-		rapSession->requestReadDataFd = -1; // sendMessage takes ownership of this even on failure
-		message.paramCount = 3;
-		message.params[RAP_PARAM_REQUEST_LOCK] = stringToMessageParam(rapSession->requestLockToken);
-		message.params[RAP_PARAM_REQUEST_FILE] = stringToMessageParam(url);
-		message.params[RAP_PARAM_REQUEST_DEPTH] = stringToMessageParam(depth ? depth : "infinity");
-
-		if (sendRecvMessage(rapSession->socketFd, &message, incomingBuffer, sizeof(incomingBuffer)) <= 0) {
-			return RAP_RESPOND_INTERNAL_ERROR;
-		}
-
-		return createResponseFromMessage(request, &message, response, rapSession->requestLockToken);
-
+	} else if (!strcmp("MOVE", method)) {
+		// TODO Code this
+		message.mID = RAP_REQUEST_MOVE;
+		message.paramCount = 2;
 	} else if (!strcmp("OPTIONS", method)) {
 		*response = createFileResponse(request, OPTIONS_PAGE, "text/html", rapSession->requestLockToken);
 		addHeader(*response, "Accept", ACCEPT_HEADER);
@@ -845,6 +784,22 @@ static int startProcessingRequest(Request * request, const char * url, const cha
 		return MHD_HTTP_METHOD_NOT_ALLOWED;
 	}
 
+	message.fd = rapSession->requestReadDataFd;
+	rapSession->requestReadDataFd = -1; // sendMessage takes ownership of this even on failure
+	message.paramCount = 3;
+	message.params[RAP_PARAM_REQUEST_LOCK] = stringToMessageParam(rapSession->requestLockToken);
+	message.params[RAP_PARAM_REQUEST_FILE] = stringToMessageParam(url);
+	if (message.paramCount == 3) {
+		const char * depth = getHeader(request, HEADER_DEPTH);
+		message.params[RAP_PARAM_REQUEST_DEPTH] = stringToMessageParam(depth ? depth : "infinity");
+	}
+
+	if (sendRecvMessage(rapSession->socketFd, &message, incomingBuffer, sizeof(incomingBuffer)) <= 0) {
+		return RAP_RESPOND_INTERNAL_ERROR;
+	}
+
+	return createResponseFromMessage(request, &message, response, rapSession->requestLockToken);
+
 }
 
 //////////////////////////////
@@ -855,44 +810,45 @@ static int startProcessingRequest(Request * request, const char * url, const cha
 // Low Level HTTP handling (Signpost //
 ///////////////////////////////////////
 
-static int sendStaticResponse(Request * request, int statusCode, Response * response, const char * lockToken) {
-	/*Usually the lock is embedded in the response body and released once the response body has been sent
-	 * But fo static responses we can't do this (mostly because they are shared and that would not be thread safe)
-	 * In practice once we know that the lock is no longer needed at the point we know we're sending a static
-	 * response so we release it here.  It's a little counter-intuitive to put it here but works. */
-	if (lockToken) {
-		unuseLock(lockToken);
-	}
-	return MHD_queue_response(request, statusCode, response);
-}
-
 static int sendResponse(Request * request, int statusCode, Response * response, RAP * rapSession) {
-	switch (statusCode) {
-	case RAP_RESPOND_CONTINUE:
-		stdLogError(0, "Attempt to send a continue (100) response");
-		/* no break */
-
-	case RAP_RESPOND_INTERNAL_ERROR:
-		return sendStaticResponse(request, MHD_HTTP_INTERNAL_SERVER_ERROR, INTERNAL_SERVER_ERROR_PAGE,
-				rapSession->requestLockToken);
-
-	case RAP_RESPOND_AUTH_FAILLED:
-		return sendStaticResponse(request, MHD_HTTP_UNAUTHORIZED, UNAUTHORIZED_PAGE,
-				rapSession->requestLockToken);
-
-	case RAP_RESPOND_OK_NO_CONTENT:
-		return sendStaticResponse(request, RAP_RESPOND_OK_NO_CONTENT, NO_CONTENT_PAGE, rapSession->requestLockToken);
-
-	case MHD_HTTP_METHOD_NOT_ALLOWED:
-		return sendStaticResponse(request, MHD_HTTP_METHOD_NOT_ALLOWED, METHOD_NOT_SUPPORTED_PAGE,
-				rapSession->requestLockToken);
-
-	default: {
+	if (response) {
 		int queueResult = MHD_queue_response(request, statusCode, response);
 		MHD_destroy_response(response);
 		return queueResult;
-	}
 
+	} else {
+
+		switch (statusCode) {
+		case RAP_RESPOND_CONTINUE:
+			stdLogError(0, "Attempt to send a continue (100) response");
+			statusCode = MHD_HTTP_INTERNAL_SERVER_ERROR;
+			response = INTERNAL_SERVER_ERROR_PAGE;
+			break;
+
+		case RAP_RESPOND_INTERNAL_ERROR:
+			response = INTERNAL_SERVER_ERROR_PAGE;
+			break;
+
+		case RAP_RESPOND_AUTH_FAILLED:
+			response = UNAUTHORIZED_PAGE;
+			break;
+
+		case MHD_HTTP_METHOD_NOT_ALLOWED:
+			response = METHOD_NOT_SUPPORTED_PAGE;
+			break;
+
+		default:
+			response = NO_CONTENT_PAGE;
+		}
+
+		/* Usually the lock is embedded in the response body and released once the response body has been sent.
+		 * But for static responses we can't do this because static responses are shared between threads.
+		 * As it happens we know that the lock is no longer needed at the point we know we're sending a static
+		 * response becase locks don't apply to static responses... so we release it here.
+		 * It's counter-intuitive to put it here, but it works and I havn't found a better place to put it. */
+		if (rapSession->requestLockToken) unuseLock(rapSession->requestLockToken);
+
+		return MHD_queue_response(request, statusCode, response);
 	}
 
 }
@@ -1188,7 +1144,8 @@ static int getBindAddress(struct sockaddr_in6 * address, DaemonConfig * daemon) 
 void cleaner() {
 	while (!shuttingDown) {
 		int total = 60;
-		do total = sleep(total);
+		do
+			total = sleep(total);
 		while (total > 0);
 		runCleanRapPool();
 		runCleanLocks();
@@ -1203,7 +1160,6 @@ static void runServer() {
 	initializeSSL();
 
 	// Start up the daemons
-
 	daemons = mallocSafe(sizeof(*daemons) * config.daemonCount);
 	for (int i = 0; i < config.daemonCount; i++) {
 		struct sockaddr_in6 address;

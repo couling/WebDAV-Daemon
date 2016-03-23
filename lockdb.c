@@ -1,5 +1,5 @@
 // TODO find a way to make this work with propfind and proppatch responses which to not return an handle to the file
-
+// TODO implement locking for methods other than LOCK and UNLOCK
 #include "lockdb.h"
 
 #include "configuration.h"
@@ -14,8 +14,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <uuid/uuid.h>
-
-typedef char LockToken[46];
 
 typedef struct Lock {
 	const char * user;
@@ -38,13 +36,16 @@ static sem_t lockDBLock;
 static int compareLockToken(const void * a, const void * b) {
 	const Lock * lhs = a;
 	const Lock * rhs = b;
-	return strcmp(lhs->lockToken, rhs->lockToken);
+	return strcasecmp(lhs->lockToken, rhs->lockToken);
 }
 
 static Lock * findLock(const char * lockToken) {
+	if (strncmp(lockToken, LOCK_TOKEN_PREFIX, LOCK_TOKEN_PREFIX_LENGTH)) return NULL;
 	Lock toFind;
-	strncpy((char *) toFind.lockToken, lockToken, 16);
-	return findLockInDb(&toFind);
+	strncpy((char *) toFind.lockToken, lockToken + LOCK_TOKEN_PREFIX_LENGTH, sizeof(LockToken) - 1);
+	toFind.lockToken[sizeof(toFind.lockToken) -1] = '\0';
+	Lock ** result = findLockInDb(&toFind);
+	return result ? *result : NULL;
 }
 
 int acquireLock(const char ** lockToken, const char * user, const char * file, LockType lockType, int fd) {
@@ -57,10 +58,9 @@ int acquireLock(const char ** lockToken, const char * user, const char * file, L
 	newLock->user = buffer + sizeof(Lock);
 	newLock->file = newLock->user + userSize;
 
-	strcpy(newLock->lockToken, "urn:uuid:");
 	uuid_t uuid;
 	uuid_generate(uuid);
-	uuid_unparse_lower(uuid, newLock->lockToken + 9);
+	uuid_unparse_lower(uuid, newLock->lockToken);
 	memcpy((char *) newLock->user, user, userSize);
 	memcpy((char *) newLock->file, file, fileSize);
 	time(&newLock->lockAcquired);

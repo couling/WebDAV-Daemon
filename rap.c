@@ -17,6 +17,9 @@
 #define EXTENSIONS_NAMESPACE "urn:couling-webdav:"
 #define MICROSOFT_NAMESPACE "urn:schemas-microsoft-com:"
 
+#define NEW_FILE_PERMISSIONS 0666
+#define NEW_DIR_PREMISSIONS 0777
+
 #define BUFFER_SIZE 40960
 
 typedef struct MimeType {
@@ -373,10 +376,14 @@ static ssize_t writeLockResponse(const char * fileName, LockRequest * request, c
 	xmlTextWriterEndElement(writer);
 	// <d:locktoken><d:href>urn:uuid:e71d4fae-5dec-22d6-fea5-00a0c91e6be4</d:href></d:locktoken>
 	xmlTextWriterStartElementNS(writer, "d", "locktoken", NULL);
-	xmlTextWriterWriteElementString(writer, "d", "href", lockToken);
+	xmlTextWriterStartElementNS(writer, "d", "href", NULL);
+	xmlTextWriterWriteFormatString(writer, LOCK_TOKEN_URN_PREFIX "%s", lockToken);
+	xmlTextWriterEndElement(writer);
 	xmlTextWriterEndElement(writer);
 
-	// TODO timeout
+	xmlTextWriterStartElement(writer, "d:timeout");
+	xmlTextWriterWriteFormatString(writer, "Second-%d", (int) timeout);
+	xmlTextWriterEndElement(writer);
 
 	xmlTextWriterEndElement(writer);
 	xmlTextWriterEndElement(writer);
@@ -407,7 +414,7 @@ static ssize_t lockFile(Message * message) {
 		}
 
 		int openFlags = (lockRequest.type == LOCK_TYPE_EXCLUSIVE ? O_WRONLY | O_CREAT : O_RDONLY);
-		interimMessage.fd = open(file, openFlags, 0666);
+		interimMessage.fd = open(file, openFlags, NEW_FILE_PERMISSIONS);
 		if (interimMessage.fd == -1) {
 			stdLogError(errno, "Could not open file for lock %s", file);
 			switch (errno) {
@@ -598,7 +605,7 @@ static void writePropFindResponsePart(const char * fileName, const char * displa
 
 	if (properties->etag) {
 		char buffer[200];
-		snprintf(buffer, sizeof(buffer), "\"%lld-%lld\"", (long long) fileStat->st_size,
+		snprintf(buffer, sizeof(buffer), "%lld-%lld", (long long) fileStat->st_size,
 				(long long) fileStat->st_mtime);
 		xmlTextWriterWriteElementString(writer, "d", PROPFIND_ETAG, buffer);
 	}
@@ -761,13 +768,9 @@ static int respondToPropFind(const char * file, PropertySet * properties, int de
 }
 
 static ssize_t propfind(Message * requestMessage) {
-	if (!authenticated || requestMessage->paramCount != 3) {
-		if (!authenticated) {
-			stdLogError(0, "Not authenticated RAP");
-		} else {
-			stdLogError(0, "PROPFIND request did not provide correct buffers: %d buffer(s)",
-					requestMessage->paramCount);
-		}
+	if (requestMessage->paramCount != 3) {
+		stdLogError(0, "PROPFIND request did not provide correct buffers: %d buffer(s)",
+				requestMessage->paramCount);
 		close(requestMessage->fd);
 		return respond(RAP_RESPOND_INTERNAL_ERROR);
 	}
@@ -820,28 +823,111 @@ static ssize_t proppatch(Message * requestMessage) {
 // End PROPPATCH //
 ///////////////////
 
+///////////
+// MKCOL //
+///////////
+
+static ssize_t mkcol(Message * requestMessage) {
+	if (requestMessage->fd != -1) {
+		// stdLogError(0, "MKCOL request sent incoming data!");
+		close(requestMessage->fd);
+	}
+
+	const char * fileName = messageParamToString(&requestMessage->params[RAP_PARAM_REQUEST_FILE]);
+
+	if (mkdir(fileName, NEW_DIR_PREMISSIONS) == -1) {
+		stdLogError(errno, "MKCOL Can not create directory %s", fileName);
+		switch (errno) {
+		case EACCES:
+			return writeErrorResponse(RAP_RESPOND_ACCESS_DENIED, EXTENSIONS_NAMESPACE, "access-denied",
+					fileName);
+		case ENOSPC:
+		case EDQUOT:
+			return writeErrorResponse(RAP_RESPOND_INSUFFICIENT_STORAGE, EXTENSIONS_NAMESPACE,
+					"insufficient-storage", fileName);
+		case ENOENT:
+		case EPERM:
+		case EEXIST:
+		case ENOTDIR:
+		default:
+			return writeErrorResponse(RAP_RESPOND_CONFLICT, EXTENSIONS_NAMESPACE, "not-directory", fileName);
+		}
+	}
+	return respond(RAP_RESPOND_CREATED);
+}
+
+///////////////
+// End MKCOL //
+///////////////
+
+//////////
+// MOVE //
+//////////
+
+static ssize_t moveFile(Message * requestMessage) {
+	if (requestMessage->fd != -1) {
+		// stdLogError(0, "MKCOL request sent incoming data!");
+		close(requestMessage->fd);
+	}
+
+	return respond(RAP_RESPOND_INTERNAL_ERROR);
+
+}
+
+//////////////
+// End MOVE //
+//////////////
+
+////////////
+// DELETE //
+////////////
+
+static ssize_t deleteFile(Message * requestMessage) {
+	if (requestMessage->fd != -1) {
+		// stdLogError(0, "MKCOL request sent incoming data!");
+		close(requestMessage->fd);
+	}
+
+	const char * file = messageParamToString(&requestMessage->params[RAP_PARAM_REQUEST_FILE]);
+	struct stat fileStat;
+	if (stat(file, &fileStat) == -1 || ((fileStat.st_mode & S_IFMT) != S_IFDIR && unlink(file) == -1)
+			|| ((fileStat.st_mode & S_IFMT) == S_IFDIR && rmdir(file) == -1)) {
+
+		stdLogError(errno, "Could not delete file %s", file);
+		// TODO write error responses
+		switch (errno) {
+		case EACCES:
+		case EPERM:
+			return respond(RAP_RESPOND_ACCESS_DENIED);
+		case ENOTDIR:
+		case ENOENT:
+			return respond(RAP_RESPOND_NOT_FOUND);
+		default:
+			return respond(RAP_RESPOND_INTERNAL_ERROR);
+		}
+	}
+
+	return respond(RAP_RESPOND_OK_NO_CONTENT);
+
+}
+
+////////////////
+// End DELETE //
+////////////////
+
 /////////
 // PUT //
 /////////
 
 static ssize_t writeFile(Message * requestMessage) {
 	if (requestMessage->fd == -1) {
-		stdLogError(0, "write file request sent without incoming data!");
-		return respond(RAP_RESPOND_INTERNAL_ERROR);
-	}
-	if (!authenticated) {
-		stdLogError(0, "Not authenticated RAP");
-		return respond(RAP_RESPOND_INTERNAL_ERROR);
-	}
-	if (requestMessage->paramCount != 2) {
-		stdLogError(0, "PUT request did not provide correct buffers: %d buffer(s)",
-				requestMessage->paramCount);
+		stdLogError(0, "PUT request sent without incoming data!");
 		return respond(RAP_RESPOND_INTERNAL_ERROR);
 	}
 
 	char * file = messageParamToString(&requestMessage->params[RAP_PARAM_REQUEST_FILE]);
 	// TODO change file mode
-	int fd = open(file, O_WRONLY | O_CREAT | O_TRUNC, 0660);
+	int fd = open(file, O_WRONLY | O_CREAT | O_TRUNC, NEW_FILE_PERMISSIONS);
 	if (fd == -1) {
 		int e = errno;
 		switch (e) {
@@ -986,17 +1072,8 @@ static void listDir(const char * file, int dirFd, int writeFd) {
 
 static ssize_t readFile(Message * requestMessage) {
 	if (requestMessage->fd != -1) {
-		stdLogError(0, "read file request sent incoming data!");
+		stdLogError(0, "GET request sent incoming data!");
 		close(requestMessage->fd);
-	}
-	if (!authenticated) {
-		stdLogError(0, "Not authenticated RAP");
-		return respond(RAP_RESPOND_INTERNAL_ERROR);
-	}
-	if (requestMessage->paramCount != 2) {
-		stdLogError(0, "Get request did not provide correct buffers: %d buffer(s)",
-				requestMessage->paramCount);
-		return respond(RAP_RESPOND_INTERNAL_ERROR);
 	}
 
 	char * file = messageParamToString(&requestMessage->params[RAP_PARAM_REQUEST_FILE]);
@@ -1140,14 +1217,6 @@ static ssize_t authenticate(Message * message) {
 		stdLogError(0, "authenticate request send incoming data!");
 		close(message->fd);
 	}
-	if (authenticated) {
-		stdLogError(0, "Login for already logged in RAP");
-		return respond(RAP_RESPOND_INTERNAL_ERROR);
-	}
-	if (authenticated) {
-		stdLogError(0, "Login provided %d buffer(s) instead of 3", message->paramCount);
-		return respond(RAP_RESPOND_INTERNAL_ERROR);
-	}
 
 	char * user = messageParamToString(&message->params[RAP_PARAM_AUTH_USER]);
 	char * password = messageParamToString(&message->params[RAP_PARAM_AUTH_PASSWORD]);
@@ -1183,21 +1252,43 @@ int main(int argCount, char * args[]) {
 	}
 
 	do {
-		// Read a message
 		ioResult = recvMessage(RAP_CONTROL_SOCKET, &message, incomingBuffer, INCOMING_BUFFER_SIZE);
 		if (ioResult <= 0) {
-			continue;
+			if (errno == EBADF) {
+				stdLogError(0, "Worker threads (%s) must only be created by webdavd", args[0]);
+			}
+			break;
 		}
 
-		switch (message.mID) {
-		case RAP_REQUEST_AUTHENTICATE:
+		if (message.mID == RAP_REQUEST_AUTHENTICATE) {
 			ioResult = authenticate(&message);
-			break;
+		} else {
+			stdLogError(0, "Invalid request id %d on unauthenticted worker", message.mID);
+			ioResult = respond(RAP_RESPOND_INTERNAL_ERROR);
+		}
+
+	} while (ioResult > 0 && !authenticated);
+
+	while (ioResult > 0) {
+		// Read a message
+		ioResult = recvMessage(RAP_CONTROL_SOCKET, &message, incomingBuffer, INCOMING_BUFFER_SIZE);
+		if (ioResult <= 0) return ioResult == 0 ? 0 : 1;
+
+		switch (message.mID) {
 		case RAP_REQUEST_GET:
 			ioResult = readFile(&message);
 			break;
 		case RAP_REQUEST_PUT:
 			ioResult = writeFile(&message);
+			break;
+		case RAP_REQUEST_MKCOL:
+			ioResult = mkcol(&message);
+			break;
+		case RAP_REQUEST_DELETE:
+			ioResult = deleteFile(&message);
+			break;
+		case RAP_REQUEST_MOVE:
+			ioResult = moveFile(&message);
 			break;
 		case RAP_REQUEST_PROPFIND:
 			ioResult = propfind(&message);
@@ -1209,14 +1300,10 @@ int main(int argCount, char * args[]) {
 			ioResult = lockFile(&message);
 			break;
 		default:
-			stdLogError(0, "Invalid rap request id %d", message.mID);
+			stdLogError(0, "Invalid request id %d on authenticated worker", message.mID);
 			ioResult = respond(RAP_RESPOND_INTERNAL_ERROR);
 		}
-		if (ioResult < 0) {
-			ioResult = 0;
-		}
+	}
 
-	} while (ioResult);
-
-	return ioResult < 0 ? -1 : 0;
+	return ioResult < 0 ? 1 : 0;
 }

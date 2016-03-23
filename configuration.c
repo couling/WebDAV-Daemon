@@ -319,7 +319,7 @@ static int configureServer(WebdavdConfiguration * config, xmlTextReaderPtr reade
 
 	// Set the defaults for some fields if they were not set.
 	if (!config->maxConnectionsPerIp) {
-		config->maxConnectionsPerIp = 20;
+		config->maxConnectionsPerIp = 50;
 	}
 	if (!config->rapMaxSessionLife) {
 		config->rapMaxSessionLife = 60 * 5;
