@@ -9,6 +9,8 @@
 
 #define RAP_CONTROL_SOCKET 3
 
+#define BUFFER_SIZE 40960
+
 typedef enum RapConstant {
 	RAP_REQUEST_AUTHENTICATE = 1,
 
@@ -20,6 +22,7 @@ typedef enum RapConstant {
 	RAP_REQUEST_LOCK,
 	RAP_REQUEST_MKCOL,
 	RAP_REQUEST_MOVE,
+	RAP_REQUEST_COPY,
 	RAP_REQUEST_DELETE,
 
 	// sent by rap, processed by finishProcessingRequest
@@ -55,6 +58,7 @@ typedef enum RapConstant {
 #define RAP_PARAM_REQUEST_LOCK      0
 #define RAP_PARAM_REQUEST_FILE      1
 #define RAP_PARAM_REQUEST_DEPTH     2
+#define RAP_PARAM_REQUEST_TARGET    2
 
 // Generic Response
 #define RAP_PARAM_RESPONSE_DATE     0

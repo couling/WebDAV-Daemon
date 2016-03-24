@@ -81,6 +81,8 @@ static struct MHD_Daemon **daemons;
 
 #define HEADER_LOCK_TOKEN "Lock-Token"
 #define HEADER_DEPTH "Depth"
+// TODO find the target header
+#define HEADER_TARGET "Destination"
 
 /////////////
 // Utility //
@@ -217,6 +219,16 @@ static int requestHasData(Request *request) {
 		const char * te = getHeader(request, "Transfer-Encoding");
 		return te && !strcmp(te, "chunked");
 	}
+}
+
+static const char * getFilePathFromUrl(const char * url) {
+	if (!url) return NULL;
+	int count = 0;
+	do {
+		url++;
+		if (*url == '/') count++;
+	} while (*url != '\0' && count < 3);
+	return url;
 }
 
 /////////////////
@@ -731,8 +743,6 @@ static int startProcessingRequest(Request * request, const char * url, const cha
 	rapSession->requestLockToken = NULL;
 
 	// Interpret the method
-	// TODO COPY
-	// TODO PROPPATCH // properly
 	//stdLog("%s %s data", method, writeHandle ? "with" : "without");
 
 	Message message;
@@ -746,9 +756,11 @@ static int startProcessingRequest(Request * request, const char * url, const cha
 	} else if (!strcmp("PROPFIND", method)) {
 		message.mID = RAP_REQUEST_PROPFIND;
 		message.paramCount = 3;
+		message.params[RAP_PARAM_REQUEST_DEPTH] = stringToMessageParam(getHeader(request, HEADER_DEPTH));
 	} else if (!strcmp("PROPPATCH", method)) {
 		message.mID = RAP_REQUEST_PROPPATCH;
 		message.paramCount = 3;
+		message.params[RAP_PARAM_REQUEST_DEPTH] = stringToMessageParam(getHeader(request, HEADER_DEPTH));
 	} else if (!strcmp("MKCOL", method)) {
 		message.mID = RAP_REQUEST_MKCOL;
 		message.paramCount = 2;
@@ -758,20 +770,26 @@ static int startProcessingRequest(Request * request, const char * url, const cha
 	} else if (!strcmp("LOCK", method)) {
 		message.mID = RAP_REQUEST_LOCK;
 		message.paramCount = 3;
+		message.params[RAP_PARAM_REQUEST_DEPTH] = stringToMessageParam(getHeader(request, HEADER_DEPTH));
+	} else if (!strcmp("MOVE", method)) {
+		message.mID = RAP_REQUEST_MOVE;
+		message.paramCount = 3;
+		message.params[RAP_PARAM_REQUEST_TARGET] = stringToMessageParam(
+				getFilePathFromUrl(getHeader(request, HEADER_TARGET)));
+	} else if (!strcmp("COPY", method)) {
+		message.mID = RAP_REQUEST_COPY;
+		message.paramCount = 3;
+		message.params[RAP_PARAM_REQUEST_TARGET] = stringToMessageParam(
+				getFilePathFromUrl(getHeader(request, HEADER_TARGET)));
 		// These methods are handled in a very different way
 	} else if (!strcmp("UNLOCK", method)) {
 		const char * lockToken = getHeader(request, HEADER_LOCK_TOKEN);
-
 		if (releaseLock(lockToken, url, rapSession->user)) {
 			return RAP_RESPOND_OK_NO_CONTENT;
 		} else {
 			// TODO return correct error response here.
 			return RAP_RESPOND_INTERNAL_ERROR;
 		}
-	} else if (!strcmp("MOVE", method)) {
-		// TODO Code this
-		message.mID = RAP_REQUEST_MOVE;
-		message.paramCount = 2;
 	} else if (!strcmp("OPTIONS", method)) {
 		*response = createFileResponse(request, OPTIONS_PAGE, "text/html", rapSession->requestLockToken);
 		addHeader(*response, "Accept", ACCEPT_HEADER);
@@ -786,13 +804,8 @@ static int startProcessingRequest(Request * request, const char * url, const cha
 
 	message.fd = rapSession->requestReadDataFd;
 	rapSession->requestReadDataFd = -1; // sendMessage takes ownership of this even on failure
-	message.paramCount = 3;
 	message.params[RAP_PARAM_REQUEST_LOCK] = stringToMessageParam(rapSession->requestLockToken);
 	message.params[RAP_PARAM_REQUEST_FILE] = stringToMessageParam(url);
-	if (message.paramCount == 3) {
-		const char * depth = getHeader(request, HEADER_DEPTH);
-		message.params[RAP_PARAM_REQUEST_DEPTH] = stringToMessageParam(depth ? depth : "infinity");
-	}
 
 	if (sendRecvMessage(rapSession->socketFd, &message, incomingBuffer, sizeof(incomingBuffer)) <= 0) {
 		return RAP_RESPOND_INTERNAL_ERROR;

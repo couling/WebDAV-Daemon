@@ -328,7 +328,7 @@ static int configureServer(WebdavdConfiguration * config, xmlTextReaderPtr reade
 		config->rapTimeoutRead = 120;
 	}
 	if (!config->rapBinary) {
-		config->rapBinary = "/usr/sbin/webdav-rap";
+		config->rapBinary = "/usr/lib/webdav/webdav-worker";
 	}
 	if (!config->mimeTypesFile) {
 		config->mimeTypesFile = "/etc/mime.types";

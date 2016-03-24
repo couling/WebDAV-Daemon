@@ -18,9 +18,7 @@
 #define MICROSOFT_NAMESPACE "urn:schemas-microsoft-com:"
 
 #define NEW_FILE_PERMISSIONS 0666
-#define NEW_DIR_PREMISSIONS 0777
-
-#define BUFFER_SIZE 40960
+#define NEW_DIR_PREMISSIONS  0777
 
 typedef struct MimeType {
 	const char * fileExtension;
@@ -209,7 +207,7 @@ static void initializeMimeTypes(const char * mimeTypesFile) {
 // Error Response //
 ////////////////////
 
-static ssize_t writeErrorResponse(RapConstant responseCode, const char * namespace, const char * error,
+static ssize_t writeErrorResponse(RapConstant responseCode, const char * textError, const char * error,
 		const char * file) {
 	int pipeEnds[2];
 	if (pipe(pipeEnds)) {
@@ -236,16 +234,23 @@ static ssize_t writeErrorResponse(RapConstant responseCode, const char * namespa
 	xmlTextWriterPtr writer = xmlNewFdTextWriter(pipeEnds[PIPE_WRITE]);
 	xmlTextWriterStartDocument(writer, "1.0", "utf-8", NULL);
 	xmlTextWriterStartElementNS(writer, "d", "error", WEBDAV_NAMESPACE);
-	if (namespace) {
-		xmlTextWriterWriteAttributeNS(writer, "xmlns", "x", NULL, namespace);
-		xmlTextWriterStartElementNS(writer, "x", error, NULL);
-	} else {
-		xmlTextWriterStartElementNS(writer, namespace ? "x" : "d", error, NULL);
+	xmlTextWriterWriteAttributeNS(writer, "xmlns", "x", NULL, EXTENSIONS_NAMESPACE);
+	if (error) {
+		xmlTextWriterStartElementNS(writer, "d", error, NULL);
+		xmlTextWriterStartElementNS(writer, "d", "href", NULL);
+		xmlTextWriterWriteURL(writer, file);
+		xmlTextWriterEndElement(writer);
+		xmlTextWriterEndElement(writer);
 	}
-	xmlTextWriterStartElementNS(writer, "d", "href", NULL);
-	xmlTextWriterWriteURL(writer, file);
-	xmlTextWriterEndElement(writer);
-	xmlTextWriterEndElement(writer);
+	if (textError) {
+		xmlTextWriterStartElementNS(writer, "x", "text-error", NULL);
+		xmlTextWriterStartElementNS(writer, "x", "href", NULL);
+		xmlTextWriterWriteURL(writer, file);
+		xmlTextWriterWriteElementString(writer, "x", "text", textError);
+		xmlTextWriterEndElement(writer);
+		xmlTextWriterEndElement(writer);
+	}
+
 	xmlTextWriterEndElement(writer);
 	xmlFreeTextWriter(writer);
 	return messageResult;
@@ -396,8 +401,8 @@ static ssize_t writeLockResponse(const char * fileName, LockRequest * request, c
 static ssize_t lockFile(Message * message) {
 	const char * file = messageParamToString(&message->params[RAP_PARAM_REQUEST_FILE]);
 	const char * lockToken = messageParamToString(&message->params[RAP_PARAM_REQUEST_LOCK]);
-	const char * depth = messageParamToString(&message->params[RAP_PARAM_REQUEST_DEPTH]);
-	if (depth == NULL) depth = "infinity";
+	//const char * depth = messageParamToString(&message->params[RAP_PARAM_REQUEST_DEPTH]);
+	//if (depth == NULL) depth = "infinity";
 	respond(RAP_RESPOND_CONTINUE);
 
 	LockRequest lockRequest;
@@ -410,37 +415,39 @@ static ssize_t lockFile(Message * message) {
 	if (lockRequest.isNewLock) {
 		if (lockToken) {
 			// Lock token must be empty but isn't
-			return writeErrorResponse(RAP_RESPOND_BAD_CLIENT_REQUEST, NULL, "lock-token-submitted", file);
+			stdLogError(0, "lock-token header provided for new lock");
+			return writeErrorResponse(RAP_RESPOND_BAD_CLIENT_REQUEST,
+					"lock-token header provided for new lock", "lock-token-submitted", file);
 		}
 
 		int openFlags = (lockRequest.type == LOCK_TYPE_EXCLUSIVE ? O_WRONLY | O_CREAT : O_RDONLY);
 		interimMessage.fd = open(file, openFlags, NEW_FILE_PERMISSIONS);
 		if (interimMessage.fd == -1) {
-			stdLogError(errno, "Could not open file for lock %s", file);
-			switch (errno) {
+			int e = errno;
+			stdLogError(e, "Could not open file for lock %s", file);
+			switch (e) {
 			case EACCES:
-				return writeErrorResponse(RAP_RESPOND_ACCESS_DENIED, EXTENSIONS_NAMESPACE, "access-denied",
-						file);
+				return writeErrorResponse(RAP_RESPOND_ACCESS_DENIED, strerror(e), NULL, file);
 			case ENOENT:
-				return writeErrorResponse(RAP_RESPOND_NOT_FOUND, EXTENSIONS_NAMESPACE, "not-found-for-read",
-						file);
+				return writeErrorResponse(RAP_RESPOND_NOT_FOUND, strerror(e), NULL, file);
 			default:
-				return writeErrorResponse(RAP_RESPOND_NOT_FOUND, EXTENSIONS_NAMESPACE,
-						"could-not-open-to-lock", file);
+				return writeErrorResponse(RAP_RESPOND_NOT_FOUND, strerror(e), NULL, file);
 			}
 		}
+
 		struct stat s;
 		fstat(interimMessage.fd, &s);
 		if ((s.st_mode & S_IFMT) != S_IFREG) {
 			stdLogError(0, "Refusing to lock non-regular file %s", file);
 			close(interimMessage.fd);
-			return respond(RAP_RESPOND_CONFLICT);
+			return writeErrorResponse(RAP_RESPOND_CONFLICT, "Refusing to non-regular file", NULL, file);
 		}
 
 		if (flock(interimMessage.fd, lockRequest.type) == -1) {
-			stdLogError(errno, "Could not lock file %s", file);
+			int e = errno;
+			stdLogError(e, "Could not lock file %s", file);
 			close(interimMessage.fd);
-			return writeErrorResponse(RAP_RESPOND_LOCKED, NULL, "no-conflicting-lock", file);
+			return writeErrorResponse(RAP_RESPOND_LOCKED, strerror(e), "no-conflicting-lock", file);
 		}
 
 		interimMessage.mID = RAP_INTERIM_RESPOND_LOCK;
@@ -451,7 +458,8 @@ static ssize_t lockFile(Message * message) {
 	} else {
 		if (!lockToken) {
 			// Lock token must not be empty
-			return writeErrorResponse(RAP_RESPOND_BAD_CLIENT_REQUEST, NULL, "lock-token-submitted", file);
+			return writeErrorResponse(RAP_RESPOND_BAD_CLIENT_REQUEST,
+					"No lock tokent submitted for refresh request", "lock-token-submitted", file);
 		}
 		interimMessage.mID = RAP_INTERIM_RESPOND_RELOCK;
 		interimMessage.fd = -1;
@@ -460,7 +468,8 @@ static ssize_t lockFile(Message * message) {
 		interimMessage.params[RAP_PARAM_LOCK_TOKEN] = stringToMessageParam(lockToken);
 	}
 
-	ioResponse = sendRecvMessage(RAP_CONTROL_SOCKET, &interimMessage, incomingBuffer, INCOMING_BUFFER_SIZE);
+	ioResponse = sendRecvMessage(RAP_CONTROL_SOCKET, &interimMessage, incomingBuffer,
+	INCOMING_BUFFER_SIZE);
 	if (ioResponse <= 0) return ioResponse;
 
 	if (interimMessage.mID == RAP_COMPLETE_REQUEST_LOCK) {
@@ -469,9 +478,9 @@ static ssize_t lockFile(Message * message) {
 		return writeLockResponse(file, &lockRequest, lockToken, timeout);
 	} else {
 		const char * reason = messageParamToString(&interimMessage.params[RAP_PARAM_ERROR_REASON]);
-		const char * errorNamespace = messageParamToString(&interimMessage.params[RAP_PARAM_ERROR_NAMESPACE]);
+		//const char * errorNamespace = messageParamToString(&interimMessage.params[RAP_PARAM_ERROR_NAMESPACE]);
 
-		return writeErrorResponse(interimMessage.mID, errorNamespace, reason, file);
+		return writeErrorResponse(interimMessage.mID, reason, NULL, file);
 	}
 
 }
@@ -775,8 +784,9 @@ static ssize_t propfind(Message * requestMessage) {
 		return respond(RAP_RESPOND_INTERNAL_ERROR);
 	}
 
-	char * depthString = messageParamToString(&requestMessage->params[RAP_PARAM_REQUEST_DEPTH]);
 	char * file = messageParamToString(&requestMessage->params[RAP_PARAM_REQUEST_FILE]);
+	char * depthString = messageParamToString(&requestMessage->params[RAP_PARAM_REQUEST_DEPTH]);
+	if (!depthString) depthString = "1";
 
 	PropertySet properties;
 	if (requestMessage->fd == -1) {
@@ -809,14 +819,20 @@ static ssize_t proppatch(Message * requestMessage) {
 		char buffer[BUFFER_SIZE];
 		ssize_t bytesRead;
 		while ((bytesRead = read(requestMessage->fd, buffer, sizeof(buffer))) > 0) {
-			ssize_t __attribute__ ((unused)) ignored = write(STDERR_FILENO, buffer, bytesRead);
+			//ssize_t __attribute__ ((unused)) ignored = write(STDERR_FILENO, buffer, bytesRead);
 		}
-		char c = '\n';
-		ssize_t __attribute__ ((unused)) ignored = write(STDOUT_FILENO, &c, 1);
-		close(requestMessage->fd);
 
+		//char c = '\n';
+		//ssize_t __attribute__ ((unused)) ignored = write(STDOUT_FILENO, &c, 1);
+		close(requestMessage->fd);
+		PropertySet p;
+		memset(&p,1, sizeof(p));
+		const char * file  = messageParamToString(&requestMessage->params[RAP_PARAM_REQUEST_FILE]);
+		return respondToPropFind(file, &p, 1);
+
+	} else {
+		return respond(RAP_RESPOND_BAD_CLIENT_REQUEST);
 	}
-	return respond(RAP_RESPOND_OK);
 }
 
 ///////////////////
@@ -836,21 +852,20 @@ static ssize_t mkcol(Message * requestMessage) {
 	const char * fileName = messageParamToString(&requestMessage->params[RAP_PARAM_REQUEST_FILE]);
 
 	if (mkdir(fileName, NEW_DIR_PREMISSIONS) == -1) {
-		stdLogError(errno, "MKCOL Can not create directory %s", fileName);
-		switch (errno) {
+		int e = errno;
+		stdLogError(e, "MKCOL Can not create directory %s", fileName);
+		switch (e) {
 		case EACCES:
-			return writeErrorResponse(RAP_RESPOND_ACCESS_DENIED, EXTENSIONS_NAMESPACE, "access-denied",
-					fileName);
+			return writeErrorResponse(RAP_RESPOND_ACCESS_DENIED, strerror(e), NULL, fileName);
 		case ENOSPC:
 		case EDQUOT:
-			return writeErrorResponse(RAP_RESPOND_INSUFFICIENT_STORAGE, EXTENSIONS_NAMESPACE,
-					"insufficient-storage", fileName);
+			return writeErrorResponse(RAP_RESPOND_INSUFFICIENT_STORAGE, strerror(e), NULL, fileName);
 		case ENOENT:
 		case EPERM:
 		case EEXIST:
 		case ENOTDIR:
 		default:
-			return writeErrorResponse(RAP_RESPOND_CONFLICT, EXTENSIONS_NAMESPACE, "not-directory", fileName);
+			return writeErrorResponse(RAP_RESPOND_CONFLICT, strerror(e), NULL, fileName);
 		}
 	}
 	return respond(RAP_RESPOND_CREATED);
@@ -859,6 +874,29 @@ static ssize_t mkcol(Message * requestMessage) {
 ///////////////
 // End MKCOL //
 ///////////////
+
+//////////
+// COPY //
+//////////
+
+static int _copyFile(const char * sourceFile, const char * targetFile) {
+	return -1;
+}
+
+static ssize_t copyFile(Message * requestMessage) {
+	// TODO implement this method
+	if (requestMessage->fd != -1) {
+		// stdLogError(0, "MKCOL request sent incoming data!");
+		close(requestMessage->fd);
+	}
+
+	return respond(RAP_RESPOND_INTERNAL_ERROR);
+
+}
+
+//////////////
+// End COPY //
+//////////////
 
 //////////
 // MOVE //
@@ -870,7 +908,40 @@ static ssize_t moveFile(Message * requestMessage) {
 		close(requestMessage->fd);
 	}
 
-	return respond(RAP_RESPOND_INTERNAL_ERROR);
+	const char * sourceFile = messageParamToString(&requestMessage->params[RAP_PARAM_REQUEST_FILE]);
+	const char * targetFile = messageParamToString(&requestMessage->params[RAP_PARAM_REQUEST_TARGET]);
+	if (!targetFile) {
+		stdLogError(0, "target not specified in MOVE request");
+		return writeErrorResponse(RAP_RESPOND_BAD_CLIENT_REQUEST, "Target not specified", NULL, sourceFile);
+	}
+
+	if (rename(sourceFile, targetFile) == -1) {
+		if (errno == EXDEV) {
+			if (_copyFile(sourceFile, targetFile) != -1) {
+				// TODO delete directories.
+				if (unlink(sourceFile) == -1) {
+					int e = errno;
+					stdLogError(e, "Could not move file %s to %s", sourceFile, targetFile);
+					return writeErrorResponse(RAP_RESPOND_INTERNAL_ERROR, strerror(e), NULL, sourceFile);
+				}
+			}
+		} else {
+			int e = errno;
+			stdLogError(e, "Could not move file %s to %s", sourceFile, targetFile);
+			switch (e) {
+			case EPERM:
+			case EACCES:
+				return writeErrorResponse(RAP_RESPOND_ACCESS_DENIED, strerror(e), NULL, sourceFile);
+			case EDQUOT:
+				return writeErrorResponse(RAP_RESPOND_INSUFFICIENT_STORAGE, strerror(e), NULL, sourceFile);
+			default:
+				return writeErrorResponse(RAP_RESPOND_CONFLICT, strerror(e), NULL, sourceFile);
+
+			}
+		}
+	}
+
+	return respond(RAP_RESPOND_OK_NO_CONTENT);
 
 }
 
@@ -960,7 +1031,7 @@ static ssize_t writeFile(Message * requestMessage) {
 
 	close(fd);
 	close(requestMessage->fd);
-	return respond(RAP_RESPOND_OK);
+	return respond(RAP_RESPOND_CREATED);
 }
 
 /////////////
@@ -1236,8 +1307,6 @@ static ssize_t authenticate(Message * message) {
 
 int main(int argCount, char * args[]) {
 	setlocale(LC_ALL, "");
-	ssize_t ioResult;
-	Message message;
 	char incomingBuffer[INCOMING_BUFFER_SIZE];
 	if (argCount > 1) {
 		pamService = args[1];
@@ -1251,6 +1320,8 @@ int main(int argCount, char * args[]) {
 		initializeMimeTypes("/etc/mime.types");
 	}
 
+	ssize_t ioResult;
+	Message message;
 	do {
 		ioResult = recvMessage(RAP_CONTROL_SOCKET, &message, incomingBuffer, INCOMING_BUFFER_SIZE);
 		if (ioResult <= 0) {
@@ -1289,6 +1360,9 @@ int main(int argCount, char * args[]) {
 			break;
 		case RAP_REQUEST_MOVE:
 			ioResult = moveFile(&message);
+			break;
+		case RAP_REQUEST_COPY:
+			ioResult = copyFile(&message);
 			break;
 		case RAP_REQUEST_PROPFIND:
 			ioResult = propfind(&message);

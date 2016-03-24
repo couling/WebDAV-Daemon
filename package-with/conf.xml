@@ -69,9 +69,9 @@
 
 		<!-- The location of the rap binary. DO NOT CHANGE UNLESS YOU KNOW WHAT 
 			YOU ARE DOING! This is primarily here for testing but on non-standard systems 
-			where binaries are not stored in /usr/sbin this will need to be changed to 
+			where binaries can not be stored in /usr/lib/webdav this will need to be changed to 
 			the location of "webdav-rap" -->
-		<rap-binary>/usr/sbin/webdav-rap</rap-binary>
+		<rap-binary>/usr/lib/webdav/webdav-worker</rap-binary>
 
 		<!-- If a RAP hangs the thread waiting on it will wait this long before 
 			giving up -->
