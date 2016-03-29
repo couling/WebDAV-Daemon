@@ -8,4 +8,4 @@ Suggests:
 Conflicts:
 Replaces:
 Maintainer: Philip Couling <couling@gmail.com>
-Description: File server using webdavd and PAM authentication 
+Description: Webdav based file server using PAM authentication 

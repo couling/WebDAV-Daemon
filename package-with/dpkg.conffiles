@@ -1,3 +1,3 @@
 /etc/webdavd
-/etc/logrotate.d/webdav
-/etc/pam.d/webdav
+/etc/logrotate.d/webdavd
+/etc/pam.d/webdavd

@@ -44,12 +44,12 @@ file:package-with/dpkg.conffiles:DEBIAN/conffiles:644
 file:package-with/dpkg.postinst:DEBIAN/postinst:555
 file:package-with/dpkg.prerm:DEBIAN/prerm:555
 
-file:package-with/pam.conf:etc/pam.d/webdav:644
+file:package-with/pam.conf:etc/pam.d/webdavd:644
 file:package-with/conf.xml:etc/webdavd:644
-file:package-with/share:usr/share/webdav:644
-file:package-with/systemd.service:lib/systemd/system/webdav.service:644
-file:package-with/logrotate.conf:etc/logrotate.d/webdav:644
+file:package-with/share:usr/share/webdavd:644
+file:package-with/systemd.service:lib/systemd/system/webdavd.service:644
+file:package-with/logrotate.conf:etc/logrotate.d/webdavd:644
 
 file:build/webdavd:usr/sbin/webdavd:755
-file:build/rap:usr/lib/webdav/webdav-worker:755
+file:build/rap:usr/lib/webdavd/webdav-worker:755
 

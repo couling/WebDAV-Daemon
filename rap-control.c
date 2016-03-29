@@ -1,5 +1,3 @@
-// TODO re-introduce rap pool for clients which do not keep connections alive.
-
 #include "rap-control.h"
 
 #include "shared.h"

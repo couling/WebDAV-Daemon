@@ -468,8 +468,7 @@ static ssize_t lockFile(Message * message) {
 		interimMessage.params[RAP_PARAM_LOCK_TOKEN] = stringToMessageParam(lockToken);
 	}
 
-	ioResponse = sendRecvMessage(RAP_CONTROL_SOCKET, &interimMessage, incomingBuffer,
-	INCOMING_BUFFER_SIZE);
+	ioResponse = sendRecvMessage(RAP_CONTROL_SOCKET, &interimMessage, incomingBuffer, INCOMING_BUFFER_SIZE);
 	if (ioResponse <= 0) return ioResponse;
 
 	if (interimMessage.mID == RAP_COMPLETE_REQUEST_LOCK) {
@@ -478,9 +477,10 @@ static ssize_t lockFile(Message * message) {
 		return writeLockResponse(file, &lockRequest, lockToken, timeout);
 	} else {
 		const char * reason = messageParamToString(&interimMessage.params[RAP_PARAM_ERROR_REASON]);
+		const char * davReason = messageParamToString(&interimMessage.params[RAP_PARAM_ERROR_DAV_REASON]);
 		//const char * errorNamespace = messageParamToString(&interimMessage.params[RAP_PARAM_ERROR_NAMESPACE]);
 
-		return writeErrorResponse(interimMessage.mID, reason, NULL, file);
+		return writeErrorResponse(interimMessage.mID, reason, davReason, file);
 	}
 
 }
@@ -826,8 +826,8 @@ static ssize_t proppatch(Message * requestMessage) {
 		//ssize_t __attribute__ ((unused)) ignored = write(STDOUT_FILENO, &c, 1);
 		close(requestMessage->fd);
 		PropertySet p;
-		memset(&p,1, sizeof(p));
-		const char * file  = messageParamToString(&requestMessage->params[RAP_PARAM_REQUEST_FILE]);
+		memset(&p, 1, sizeof(p));
+		const char * file = messageParamToString(&requestMessage->params[RAP_PARAM_REQUEST_FILE]);
 		return respondToPropFind(file, &p, 1);
 
 	} else {
@@ -879,18 +879,169 @@ static ssize_t mkcol(Message * requestMessage) {
 // COPY //
 //////////
 
-static int _copyFile(const char * sourceFile, const char * targetFile) {
-	return -1;
+typedef struct FileCopyData {
+	const char * source;
+	const char * target;
+	struct FileCopyData * next;
+	int type;
+
+} FileCopyData;
+
+static void deleteDestFiles(FileCopyData * files) {
+	while (files) {
+		if (files->type == S_IFDIR) rmdir(files->target);
+		else unlink(files->target);
+		FileCopyData * next = files->next;
+		freeSafe(files);
+		files = next;
+	}
+}
+
+static int copyFileRecusive(const char * sourceFile, const char * targetFile, FileCopyData ** copied) {
+	struct stat fileStat;
+	if (lstat(sourceFile, &fileStat) == -1) return 0;
+	int type = fileStat.st_mode & S_IFMT;
+	int mode = fileStat.st_mode & 0777;
+
+	size_t sourceFileLength = strlen(sourceFile) + 1;
+	size_t targetFileLength = strlen(targetFile) + 1;
+	char * buffer = mallocSafe(sizeof(FileCopyData) + sourceFileLength + targetFileLength);
+	FileCopyData * d = (FileCopyData *) buffer;
+	d->source = buffer + sizeof(FileCopyData);
+	d->target = d->source + sourceFileLength;
+	d->next = *copied;
+	d->type = type;
+	memcpy((char *) d->source, sourceFile, sourceFileLength);
+	memcpy((char *) d->target, targetFile, targetFileLength);
+
+	switch (type) {
+	case S_IFREG: {
+		int oldFd = open(sourceFile, O_RDONLY);
+		if (oldFd == -1) {
+			freeSafe(d);
+			return 0;
+		}
+		int newFd = open(targetFile, O_WRONLY | O_CREAT | O_EXCL, 0600);
+		if (newFd == -1) {
+			close(oldFd);
+			freeSafe(d);
+			return 0;
+		}
+		*copied = d;
+		char readBuffer[BUFFER_SIZE];
+		ssize_t bytesRead = 0;
+		ssize_t bytesWritten = 0;
+		while ((bytesRead == bytesWritten) && ((bytesRead = read(oldFd, readBuffer, BUFFER_SIZE)) > 0)) {
+			bytesWritten = write(newFd, readBuffer, bytesRead);
+		}
+		close(oldFd);
+		close(newFd);
+		if (bytesRead != 0) return 0;
+		break;
+	}
+
+	case S_IFDIR: {
+		if (mkdir(targetFile, 0700) == -1) {
+			freeSafe(d);
+			return 0;
+		} else {
+			*copied = d;
+			DIR * dir = opendir(sourceFile);
+			if (!dir) return 0;
+			char childSourceFile[sourceFileLength + 256];
+			char childTargetFile[targetFileLength + 256];
+			memcpy(childSourceFile, sourceFile, sourceFileLength);
+			memcpy(childTargetFile, targetFile, targetFileLength);
+			childSourceFile[sourceFileLength - 1] = '\0';
+			childTargetFile[targetFileLength - 1] = '\0';
+			for (struct dirent * entry = readdir(dir); entry; entry = readdir(dir)) {
+				strcpy(childSourceFile + sourceFileLength, entry->d_name);
+				strcpy(childTargetFile + targetFileLength, entry->d_name);
+				if (!copyFileRecusive(sourceFile, targetFile, copied)) {
+					closedir(dir);
+					return 0;
+				}
+			}
+			closedir(dir);
+			break;
+		}
+	}
+
+	case S_IFLNK: {
+		char linkTarget[4096];
+		if (readlink(sourceFile, linkTarget, sizeof(linkTarget)) == -1
+				|| symlink(targetFile, linkTarget) == -1) {
+			freeSafe(d);
+			return 0;
+		}
+		*copied = d;
+		break;
+	}
+
+	case S_IFIFO: {
+		if (mkfifo(targetFile, 0600) == -1) {
+			freeSafe(d);
+			return 0;
+		}
+		*copied = d;
+		break;
+	}
+
+	// TODO other file types
+	case S_IFBLK:
+	case S_IFCHR:
+	case S_IFSOCK:
+	default:
+		stdLogError(0, "Could not copy file type %d for file %s", type, sourceFile);
+		return 0;
+	}
+
+	chmod(targetFile, mode);
+	lchown(targetFile, fileStat.st_uid, fileStat.st_gid);
+	return 1;
+
 }
 
 static ssize_t copyFile(Message * requestMessage) {
-	// TODO implement this method
 	if (requestMessage->fd != -1) {
 		// stdLogError(0, "MKCOL request sent incoming data!");
 		close(requestMessage->fd);
 	}
 
-	return respond(RAP_RESPOND_INTERNAL_ERROR);
+	const char * source = messageParamToString(&requestMessage->params[RAP_PARAM_REQUEST_FILE]);
+	const char * target = messageParamToString(&requestMessage->params[RAP_PARAM_REQUEST_TARGET]);
+
+	if (!target) {
+		return writeErrorResponse(RAP_RESPOND_BAD_CLIENT_REQUEST, "No target header specified", NULL, source);
+	}
+
+	FileCopyData * copied = NULL;
+	if (copyFileRecusive(source, target, &copied)) {
+		while (copied) {
+			FileCopyData * next = copied->next;
+			freeSafe(copied);
+			copied = next;
+		}
+		return respond(RAP_RESPOND_CREATED);
+	}
+	else {
+		deleteDestFiles(copied);
+		int e = errno;
+		switch (e) {
+		case EPERM:
+		case EACCES:
+			return writeErrorResponse(RAP_RESPOND_ACCESS_DENIED, strerror(e), NULL, source);
+		case ENOSPC:
+		case EDQUOT:
+			return writeErrorResponse(RAP_RESPOND_INSUFFICIENT_STORAGE, strerror(e), NULL, source);
+		case ENOENT:
+		case ENOTDIR:
+			return writeErrorResponse(RAP_RESPOND_NOT_FOUND, strerror(e), NULL, source);
+		default:
+			return writeErrorResponse(RAP_RESPOND_CONFLICT, strerror(e), NULL, source);
+
+		}
+	}
 
 }
 
@@ -916,27 +1067,31 @@ static ssize_t moveFile(Message * requestMessage) {
 	}
 
 	if (rename(sourceFile, targetFile) == -1) {
-		if (errno == EXDEV) {
-			if (_copyFile(sourceFile, targetFile) != -1) {
-				// TODO delete directories.
-				if (unlink(sourceFile) == -1) {
-					int e = errno;
-					stdLogError(e, "Could not move file %s to %s", sourceFile, targetFile);
-					return writeErrorResponse(RAP_RESPOND_INTERNAL_ERROR, strerror(e), NULL, sourceFile);
-				}
+		FileCopyData * copiedFiles = NULL;
+		if (errno == EXDEV && copyFileRecusive(sourceFile, targetFile, &copiedFiles)) {
+			while (copiedFiles) {
+				if (copiedFiles->type == S_IFDIR) rmdir(copiedFiles->source);
+				else unlink(copiedFiles->source);
+				FileCopyData * next = copiedFiles->next;
+				freeSafe(copiedFiles);
+				copiedFiles = next;
 			}
 		} else {
+			if (copiedFiles) deleteDestFiles(copiedFiles);
 			int e = errno;
 			stdLogError(e, "Could not move file %s to %s", sourceFile, targetFile);
 			switch (e) {
 			case EPERM:
 			case EACCES:
 				return writeErrorResponse(RAP_RESPOND_ACCESS_DENIED, strerror(e), NULL, sourceFile);
+			case ENOSPC:
 			case EDQUOT:
 				return writeErrorResponse(RAP_RESPOND_INSUFFICIENT_STORAGE, strerror(e), NULL, sourceFile);
+			case ENOENT:
+			case ENOTDIR:
+				return writeErrorResponse(RAP_RESPOND_NOT_FOUND, strerror(e), NULL, sourceFile);
 			default:
 				return writeErrorResponse(RAP_RESPOND_CONFLICT, strerror(e), NULL, sourceFile);
-
 			}
 		}
 	}
@@ -965,16 +1120,16 @@ static ssize_t deleteFile(Message * requestMessage) {
 			|| ((fileStat.st_mode & S_IFMT) == S_IFDIR && rmdir(file) == -1)) {
 
 		stdLogError(errno, "Could not delete file %s", file);
-		// TODO write error responses
-		switch (errno) {
+		int e = errno;
+		switch (e) {
 		case EACCES:
 		case EPERM:
-			return respond(RAP_RESPOND_ACCESS_DENIED);
+			return writeErrorResponse(RAP_RESPOND_ACCESS_DENIED, strerror(e), NULL, file);
 		case ENOTDIR:
 		case ENOENT:
-			return respond(RAP_RESPOND_NOT_FOUND);
+			return writeErrorResponse(RAP_RESPOND_NOT_FOUND, strerror(e), NULL, file);
 		default:
-			return respond(RAP_RESPOND_INTERNAL_ERROR);
+			return writeErrorResponse(RAP_RESPOND_INTERNAL_ERROR, strerror(e), NULL, file);
 		}
 	}
 
@@ -997,7 +1152,6 @@ static ssize_t writeFile(Message * requestMessage) {
 	}
 
 	char * file = messageParamToString(&requestMessage->params[RAP_PARAM_REQUEST_FILE]);
-	// TODO change file mode
 	int fd = open(file, O_WRONLY | O_CREAT | O_TRUNC, NEW_FILE_PERMISSIONS);
 	if (fd == -1) {
 		int e = errno;
@@ -1374,8 +1528,15 @@ int main(int argCount, char * args[]) {
 			ioResult = lockFile(&message);
 			break;
 		default:
-			stdLogError(0, "Invalid request id %d on authenticated worker", message.mID);
-			ioResult = respond(RAP_RESPOND_INTERNAL_ERROR);
+			if (message.mID >= 400 && message.mID <= 499) {
+				const char * location = messageParamToString(&message.params[RAP_PARAM_ERROR_LOCATION]);
+				const char * reason = messageParamToString(&message.params[RAP_PARAM_ERROR_REASON]);
+				const char * davReason = messageParamToString(&message.params[RAP_PARAM_ERROR_DAV_REASON]);
+				ioResult = writeErrorResponse(message.mID, reason, davReason, location);
+			} else {
+				stdLogError(0, "Invalid request id %d on authenticated worker", message.mID);
+				ioResult = respond(RAP_RESPOND_INTERNAL_ERROR);
+			}
 		}
 	}
 

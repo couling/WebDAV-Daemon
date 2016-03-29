@@ -1,7 +1,5 @@
-// TODO auth modes other than basic?
 // TODO check into what happens when a connection is closed early during upload.
 // TODO prevent PUT clobbering files.
-// TODO catch interupt and clean shutdown
 // TODO accept suggested timeout values from clients during LOCK requests
 
 #include "shared.h"
@@ -81,7 +79,6 @@ static struct MHD_Daemon **daemons;
 
 #define HEADER_LOCK_TOKEN "Lock-Token"
 #define HEADER_DEPTH "Depth"
-// TODO find the target header
 #define HEADER_TARGET "Destination"
 
 /////////////
@@ -719,10 +716,11 @@ static int finishProcessingRequest(Request * request, RAP * processor, Response 
 		if (readResult <= 0) return RAP_RESPOND_INTERNAL_ERROR;
 		int statusCode = createResponseFromMessage(request, &message, response, processor->requestLockToken);
 		if (statusCode == 200) {
-			// TODO add timeout header here too
-			char tokenBuffer[LOCK_TOKEN_LENGTH];
+			char tokenBuffer[200];
 			sprintf(tokenBuffer, LOCK_TOKEN_PREFIX "%s" LOCK_TOKEN_SUFFIX, lockToken);
 			addHeader(*response, "Lock-Token", tokenBuffer);
+			sprintf(tokenBuffer, "Second-%d", (int) config.maxLockTime);
+			addHeader(*response, "Timeout", tokenBuffer);
 		}
 		return statusCode;
 
@@ -787,8 +785,17 @@ static int startProcessingRequest(Request * request, const char * url, const cha
 		if (releaseLock(lockToken, url, rapSession->user)) {
 			return RAP_RESPOND_OK_NO_CONTENT;
 		} else {
-			// TODO return correct error response here.
-			return RAP_RESPOND_INTERNAL_ERROR;
+			message.mID = RAP_RESPOND_CONFLICT;
+			message.paramCount = 3;
+			message.params[RAP_PARAM_ERROR_LOCATION] = stringToMessageParam(url);
+			message.params[RAP_PARAM_ERROR_REASON] = stringToMessageParam("Could not find lock");
+			message.params[RAP_PARAM_ERROR_DAV_REASON] = NULL_PARAM;
+
+			if (sendRecvMessage(rapSession->socketFd, &message, incomingBuffer, sizeof(incomingBuffer)) <= 0) {
+				return RAP_RESPOND_INTERNAL_ERROR;
+			}
+
+			return createResponseFromMessage(request, &message, response, rapSession->requestLockToken);
 		}
 	} else if (!strcmp("OPTIONS", method)) {
 		*response = createFileResponse(request, OPTIONS_PAGE, "text/html", rapSession->requestLockToken);
@@ -1230,8 +1237,6 @@ int main(int argCount, char ** args) {
 
 	for (int i = configCount - 1; i >= 0; i--) {
 		int pid;
-		// TODO fork on first
-
 		// This code deiberately doesn't fork for the first process
 		// and instead uses the main process for the first <server> in the config file.
 		if (!i || !(pid = fork())) {

@@ -74,7 +74,7 @@ typedef enum RapConstant {
 // Error responses
 #define RAP_PARAM_ERROR_LOCATION    0
 #define RAP_PARAM_ERROR_REASON      1
-#define RAP_PARAM_ERROR_NAMESPACE   2
+#define RAP_PARAM_ERROR_DAV_REASON  2
 
 #define PIPE_READ     0
 #define PIPE_WRITE    1

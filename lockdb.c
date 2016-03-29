@@ -1,4 +1,3 @@
-// TODO find a way to make this work with propfind and proppatch responses which to not return an handle to the file
 // TODO implement locking for methods other than LOCK and UNLOCK
 #include "lockdb.h"
 

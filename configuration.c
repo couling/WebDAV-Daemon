@@ -83,8 +83,9 @@ static int configListen(WebdavdConfiguration * config, xmlTextReaderPtr reader, 
 	int depth = xmlTextReaderDepth(reader) + 1;
 	int result = stepInto(reader);
 	while (result && xmlTextReaderDepth(reader) == depth) {
-		if (xmlTextReaderNodeType(reader) == XML_READER_TYPE_ELEMENT && !strcmp(xmlTextReaderConstNamespaceUri(reader),
-		CONFIG_NAMESPACE)) {
+		if (xmlTextReaderNodeType(reader) == XML_READER_TYPE_ELEMENT
+				&& !strcmp(xmlTextReaderConstNamespaceUri(reader),
+				CONFIG_NAMESPACE)) {
 			if (!strcmp(xmlTextReaderConstLocalName(reader), "port")) {
 				result = readConfigInt(reader, &config->daemons[index].port, configFile);
 			} else if (!strcmp(xmlTextReaderConstLocalName(reader), "host")) {
@@ -123,7 +124,8 @@ static int configListen(WebdavdConfiguration * config, xmlTextReaderPtr reader, 
 								} else if (!strcmp(encryptionString, "ssl")) {
 									config->daemons[index].forwardToIsEncrypted = 1;
 								} else {
-									stdLogError(0, "invalid encryption method %s in %s", encryptionString, configFile);
+									stdLogError(0, "invalid encryption method %s in %s", encryptionString,
+											configFile);
 									exit(1);
 								}
 								xmlFree((char *) encryptionString);
@@ -153,12 +155,14 @@ static int configListen(WebdavdConfiguration * config, xmlTextReaderPtr reader, 
 	return result;
 }
 
-static int configSessionTimeout(WebdavdConfiguration * config, xmlTextReaderPtr reader, const char * configFile) {
+static int configSessionTimeout(WebdavdConfiguration * config, xmlTextReaderPtr reader,
+		const char * configFile) {
 	//<session-timeout>5:00</session-timeout>
 	return readConfigTime(reader, &config->rapMaxSessionLife, configFile);
 }
 
-static int configMaxIpConnections(WebdavdConfiguration * config, xmlTextReaderPtr reader, const char * configFile) {
+static int configMaxIpConnections(WebdavdConfiguration * config, xmlTextReaderPtr reader,
+		const char * configFile) {
 	// <max-ip-connections>20</max-ip-connections>
 	return readConfigInt(reader, &config->maxConnectionsPerIp, configFile);
 }
@@ -202,7 +206,8 @@ static int configMaxLockTime(WebdavdConfiguration * config, xmlTextReaderPtr rea
 }
 
 //<ssl-cert>...</ssl-cert>
-static int configConfigSSLCert(WebdavdConfiguration * config, xmlTextReaderPtr reader, const char * configFile) {
+static int configConfigSSLCert(WebdavdConfiguration * config, xmlTextReaderPtr reader,
+		const char * configFile) {
 	int index = config->sslCertCount++;
 	config->sslCerts = reallocSafe(config->sslCerts, sizeof(*config->sslCerts) * config->sslCertCount);
 	config->sslCerts[index].certificateFile = NULL;
@@ -212,8 +217,9 @@ static int configConfigSSLCert(WebdavdConfiguration * config, xmlTextReaderPtr r
 	int depth = xmlTextReaderDepth(reader) + 1;
 	int result = stepInto(reader);
 	while (result && xmlTextReaderDepth(reader) == depth) {
-		if (xmlTextReaderNodeType(reader) == XML_READER_TYPE_ELEMENT && !strcmp(xmlTextReaderConstNamespaceUri(reader),
-		CONFIG_NAMESPACE)) {
+		if (xmlTextReaderNodeType(reader) == XML_READER_TYPE_ELEMENT
+				&& !strcmp(xmlTextReaderConstNamespaceUri(reader),
+				CONFIG_NAMESPACE)) {
 			if (!strcmp(xmlTextReaderConstLocalName(reader), "certificate")) {
 				result = readConfigString(reader, &config->sslCerts[index].certificateFile);
 			} else if (!strcmp(xmlTextReaderConstLocalName(reader), "key")) {
@@ -224,7 +230,8 @@ static int configConfigSSLCert(WebdavdConfiguration * config, xmlTextReaderPtr r
 				if (chainFile) {
 					int chainFileIndex = config->sslCerts[index].chainFileCount++;
 					config->sslCerts[index].chainFiles = reallocSafe(config->sslCerts[index].chainFiles,
-							config->sslCerts[index].chainFileCount * sizeof(*config->sslCerts[index].chainFiles));
+							config->sslCerts[index].chainFileCount
+									* sizeof(*config->sslCerts[index].chainFiles));
 					config->sslCerts[index].chainFiles[chainFileIndex] = chainFile;
 				}
 			} else {
@@ -271,15 +278,17 @@ typedef struct ConfigurationFunction {
 } ConfigurationFunction;
 
 static int compareConfigFunction(const void * a, const void * b) {
-	return strcmp(((const ConfigurationFunction *) a)->nodeName, ((const ConfigurationFunction *) b)->nodeName);
+	return strcmp(((const ConfigurationFunction *) a)->nodeName,
+			((const ConfigurationFunction *) b)->nodeName);
 }
 
 // This MUST be sorted in aplabetical order (for nodeName).  The array is binary-searched.
-static const ConfigurationFunction configFunctions[] = { { .nodeName = "access-log", .func = &configAccessLog }, //<access-log />
+static const ConfigurationFunction configFunctions[] = {
+		{ .nodeName = "access-log", .func = &configAccessLog }, //<access-log />
 		{ .nodeName = "error-log", .func = &configErrorLog },                  // <error-log />
 		{ .nodeName = "listen", .func = &configListen },                       // <listen />
 		{ .nodeName = "max-ip-connections", .func = &configMaxIpConnections }, // <max-ip-connections />
-		{ .nodeName = "max-lock-time", .func = &configMaxLockTime},            // <max-lock-time />
+		{ .nodeName = "max-lock-time", .func = &configMaxLockTime },            // <max-lock-time />
 		{ .nodeName = "mime-file", .func = &configMimeFile },                  // <mime-file />
 		{ .nodeName = "pam-service", .func = &configPamService },              // <pam-service />
 		{ .nodeName = "rap-binary", .func = &configRapBinary },                // <rap-binary />
@@ -299,8 +308,9 @@ static int configureServer(WebdavdConfiguration * config, xmlTextReaderPtr reade
 	int result = stepInto(reader);
 
 	while (result && xmlTextReaderDepth(reader) == depth) {
-		if (xmlTextReaderNodeType(reader) == XML_READER_TYPE_ELEMENT && !strcmp(xmlTextReaderConstNamespaceUri(reader),
-		CONFIG_NAMESPACE)) {
+		if (xmlTextReaderNodeType(reader) == XML_READER_TYPE_ELEMENT
+				&& !strcmp(xmlTextReaderConstNamespaceUri(reader),
+				CONFIG_NAMESPACE)) {
 
 			ConfigurationFunction node = { .nodeName = xmlTextReaderConstLocalName(reader) };
 			ConfigurationFunction * function = bsearch(&node, configFunctions, configFunctionCount,
@@ -328,16 +338,16 @@ static int configureServer(WebdavdConfiguration * config, xmlTextReaderPtr reade
 		config->rapTimeoutRead = 120;
 	}
 	if (!config->rapBinary) {
-		config->rapBinary = "/usr/lib/webdav/webdav-worker";
+		config->rapBinary = "/usr/lib/webdavd/webdav-worker";
 	}
 	if (!config->mimeTypesFile) {
 		config->mimeTypesFile = "/etc/mime.types";
 	}
 	if (!config->staticResponseDir) {
-		config->staticResponseDir = "/usr/share/webdav";
+		config->staticResponseDir = "/usr/share/webdavd";
 	}
 	if (!config->pamServiceName) {
-		config->pamServiceName = "webdav";
+		config->pamServiceName = "webdavd";
 	}
 	if (!config->maxLockTime) {
 		config->maxLockTime = 60;
@@ -382,15 +392,11 @@ void configure(WebdavdConfiguration ** config, int * configCount, const char * c
 }
 
 static void xmlFreeIfNotNull(const char * value) {
-	if (value) {
-		xmlFree((char *) value);
-	}
+	if (value) xmlFree((char *) value);
 }
 
 static void freeIfNotNull(void * value) {
-	if (value) {
-		freeSafe(value);
-	}
+	if (value) freeSafe(value);
 }
 
 void freeConfigurationData(WebdavdConfiguration * configData) {
