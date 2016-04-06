@@ -218,10 +218,9 @@ static ssize_t writeErrorResponse(RapConstant responseCode, const char * textErr
 	time_t fileTime;
 	time(&fileTime);
 	Message message = { .mID = responseCode, .fd = pipeEnds[PIPE_READ], .paramCount = 2 };
-	message.params[RAP_PARAM_RESPONSE_DATE].iov_base = &fileTime;
-	message.params[RAP_PARAM_RESPONSE_DATE].iov_len = sizeof(fileTime);
-	message.params[RAP_PARAM_RESPONSE_MIME].iov_base = (void *) XML_MIME_TYPE.type;
-	message.params[RAP_PARAM_RESPONSE_MIME].iov_len = XML_MIME_TYPE.typeStringSize;
+	message.params[RAP_PARAM_RESPONSE_DATE] = toMessageParam(fileTime);
+	message.params[RAP_PARAM_RESPONSE_MIME] = makeMessageParam(XML_MIME_TYPE.type,
+			XML_MIME_TYPE.typeStringSize);
 	message.params[RAP_PARAM_RESPONSE_LOCATION] = stringToMessageParam(file);
 
 	ssize_t messageResult = sendMessage(RAP_CONTROL_SOCKET, &message);
@@ -340,10 +339,9 @@ static ssize_t writeLockResponse(const char * fileName, LockRequest * request, c
 	time_t fileTime;
 	time(&fileTime);
 	Message message = { .mID = RAP_RESPOND_OK, .fd = pipeEnds[PIPE_READ], .paramCount = 2 };
-	message.params[RAP_PARAM_RESPONSE_DATE].iov_base = &fileTime;
-	message.params[RAP_PARAM_RESPONSE_DATE].iov_len = sizeof(fileTime);
-	message.params[RAP_PARAM_RESPONSE_MIME].iov_base = (void *) XML_MIME_TYPE.type;
-	message.params[RAP_PARAM_RESPONSE_MIME].iov_len = XML_MIME_TYPE.typeStringSize;
+	message.params[RAP_PARAM_RESPONSE_DATE] = toMessageParam(fileTime);
+	message.params[RAP_PARAM_RESPONSE_MIME] = makeMessageParam(XML_MIME_TYPE.type,
+			XML_MIME_TYPE.typeStringSize);
 	message.params[RAP_PARAM_RESPONSE_LOCATION] = stringToMessageParam(fileName);
 
 	ssize_t messageResult = sendMessage(RAP_CONTROL_SOCKET, &message);
@@ -400,7 +398,7 @@ static ssize_t writeLockResponse(const char * fileName, LockRequest * request, c
 
 static ssize_t lockFile(Message * message) {
 	const char * file = messageParamToString(&message->params[RAP_PARAM_REQUEST_FILE]);
-	const char * lockToken = messageParamToString(&message->params[RAP_PARAM_REQUEST_LOCK]);
+	LockProvisions providedLock = messageParamTo(LockProvisions, message->params[RAP_PARAM_REQUEST_LOCK]);
 	//const char * depth = messageParamToString(&message->params[RAP_PARAM_REQUEST_DEPTH]);
 	//if (depth == NULL) depth = "infinity";
 	respond(RAP_RESPOND_CONTINUE);
@@ -413,11 +411,11 @@ static ssize_t lockFile(Message * message) {
 	ssize_t ioResponse;
 
 	if (lockRequest.isNewLock) {
-		if (lockToken) {
+		if (providedLock.source) {
 			// Lock token must be empty but isn't
-			stdLogError(0, "lock-token header provided for new lock");
+			stdLogError(0, "lock token \"If\" header provided for new lock");
 			return writeErrorResponse(RAP_RESPOND_BAD_CLIENT_REQUEST,
-					"lock-token header provided for new lock", "lock-token-submitted", file);
+					"lock token \"If\" header provided for new lock", "lock-token-submitted", file);
 		}
 
 		int openFlags = (lockRequest.type == LOCK_TYPE_EXCLUSIVE ? O_WRONLY | O_CREAT : O_RDONLY);
@@ -443,7 +441,7 @@ static ssize_t lockFile(Message * message) {
 			return writeErrorResponse(RAP_RESPOND_CONFLICT, "Refusing to non-regular file", NULL, file);
 		}
 
-		if (flock(interimMessage.fd, lockRequest.type) == -1) {
+		if (flock(interimMessage.fd, lockRequest.type | LOCK_NB) == -1) {
 			int e = errno;
 			stdLogError(e, "Could not lock file %s", file);
 			close(interimMessage.fd);
@@ -453,27 +451,25 @@ static ssize_t lockFile(Message * message) {
 		interimMessage.mID = RAP_INTERIM_RESPOND_LOCK;
 		interimMessage.paramCount = 2;
 		interimMessage.params[RAP_PARAM_LOCK_LOCATION] = message->params[RAP_PARAM_REQUEST_FILE];
-		interimMessage.params[RAP_PARAM_LOCK_TYPE].iov_base = &lockRequest.type;
-		interimMessage.params[RAP_PARAM_LOCK_TYPE].iov_len = sizeof(lockRequest.type);
+		interimMessage.params[RAP_PARAM_LOCK_TYPE] = toMessageParam(lockRequest.type);
 	} else {
-		if (!lockToken) {
+		if (!providedLock.source) {
 			// Lock token must not be empty
 			return writeErrorResponse(RAP_RESPOND_BAD_CLIENT_REQUEST,
 					"No lock tokent submitted for refresh request", "lock-token-submitted", file);
 		}
 		interimMessage.mID = RAP_INTERIM_RESPOND_RELOCK;
 		interimMessage.fd = -1;
-		interimMessage.paramCount = 2;
+		interimMessage.paramCount = 1;
 		interimMessage.params[RAP_PARAM_LOCK_LOCATION] = message->params[RAP_PARAM_REQUEST_FILE];
-		interimMessage.params[RAP_PARAM_LOCK_TOKEN] = stringToMessageParam(lockToken);
 	}
 
 	ioResponse = sendRecvMessage(RAP_CONTROL_SOCKET, &interimMessage, incomingBuffer, INCOMING_BUFFER_SIZE);
 	if (ioResponse <= 0) return ioResponse;
 
 	if (interimMessage.mID == RAP_COMPLETE_REQUEST_LOCK) {
-		lockToken = messageParamToString(&interimMessage.params[RAP_PARAM_LOCK_TOKEN]);
-		time_t timeout = *((time_t *) interimMessage.params[RAP_PARAM_LOCK_TIMEOUT].iov_base);
+		const char * lockToken = messageParamToString(&interimMessage.params[RAP_PARAM_LOCK_TOKEN]);
+		time_t timeout = messageParamTo(time_t, interimMessage.params[RAP_PARAM_LOCK_TIMEOUT]);
 		return writeLockResponse(file, &lockRequest, lockToken, timeout);
 	} else {
 		const char * reason = messageParamToString(&interimMessage.params[RAP_PARAM_ERROR_REASON]);
@@ -723,12 +719,10 @@ static int respondToPropFind(const char * file, PropertySet * properties, int de
 	time_t fileTime;
 	time(&fileTime);
 	Message message = { .mID = RAP_RESPOND_MULTISTATUS, .fd = pipeEnds[PIPE_READ], .paramCount = 2 };
-	message.params[RAP_PARAM_RESPONSE_DATE].iov_base = &fileTime;
-	message.params[RAP_PARAM_RESPONSE_DATE].iov_len = sizeof(fileTime);
-	message.params[RAP_PARAM_RESPONSE_MIME].iov_base = (void *) XML_MIME_TYPE.type;
-	message.params[RAP_PARAM_RESPONSE_MIME].iov_len = XML_MIME_TYPE.typeStringSize;
-	message.params[RAP_PARAM_RESPONSE_LOCATION].iov_base = filePath;
-	message.params[RAP_PARAM_RESPONSE_LOCATION].iov_len = filePathSize + 1;
+	message.params[RAP_PARAM_RESPONSE_DATE] = toMessageParam(fileTime);
+	message.params[RAP_PARAM_RESPONSE_MIME] = makeMessageParam(XML_MIME_TYPE.type,
+			XML_MIME_TYPE.typeStringSize);
+	message.params[RAP_PARAM_RESPONSE_LOCATION] = makeMessageParam(filePath, filePathSize + 1);
 	ssize_t messageResult = sendMessage(RAP_CONTROL_SOCKET, &message);
 	if (messageResult <= 0) {
 		freeSafe(filePath);
@@ -987,7 +981,7 @@ static int copyFileRecusive(const char * sourceFile, const char * targetFile, Fi
 		break;
 	}
 
-	// TODO other file types
+		// TODO other file types
 	case S_IFBLK:
 	case S_IFCHR:
 	case S_IFSOCK:
@@ -1023,8 +1017,7 @@ static ssize_t copyFile(Message * requestMessage) {
 			copied = next;
 		}
 		return respond(RAP_RESPOND_CREATED);
-	}
-	else {
+	} else {
 		deleteDestFiles(copied);
 		int e = errno;
 		switch (e) {
@@ -1115,26 +1108,46 @@ static ssize_t deleteFile(Message * requestMessage) {
 	}
 
 	const char * file = messageParamToString(&requestMessage->params[RAP_PARAM_REQUEST_FILE]);
-	struct stat fileStat;
-	if (stat(file, &fileStat) == -1 || ((fileStat.st_mode & S_IFMT) != S_IFDIR && unlink(file) == -1)
-			|| ((fileStat.st_mode & S_IFMT) == S_IFDIR && rmdir(file) == -1)) {
+	int fd = open(file, O_WRONLY);
+	if (fd == -1) goto respond_error;
 
-		stdLogError(errno, "Could not delete file %s", file);
-		int e = errno;
-		switch (e) {
-		case EACCES:
-		case EPERM:
-			return writeErrorResponse(RAP_RESPOND_ACCESS_DENIED, strerror(e), NULL, file);
-		case ENOTDIR:
-		case ENOENT:
-			return writeErrorResponse(RAP_RESPOND_NOT_FOUND, strerror(e), NULL, file);
-		default:
-			return writeErrorResponse(RAP_RESPOND_INTERNAL_ERROR, strerror(e), NULL, file);
+	struct stat fileStat;
+	if (fstat(fd, &fileStat) == -1) goto respond_error;
+	if ((fileStat.st_mode & S_IFMT) != S_IFDIR) {
+		if (rmdir(file) == -1) goto respond_error;
+		close(fd);
+	} else {
+		// Check if we have the apropriate lock on this file.
+		LockProvisions locks = messageParamTo(LockProvisions, requestMessage->params[RAP_PARAM_REQUEST_LOCK]);
+		if (locks.source != LOCK_TYPE_EXCLUSIVE) {
+			// We have no lock but we need one so acquire it now.
+			if (flock(fd, LOCK_TYPE_EXCLUSIVE | LOCK_NB) == -1) {
+				close(fd);
+				int e = errno;
+				const char * etxt = strerror(e);
+				stdLogError(e, "Could not delete locked file %s", file);
+				return writeErrorResponse(RAP_RESPOND_LOCKED, etxt, "lock-token-submitted", file);
+			}
 		}
+		if (unlink(file) == -1) goto respond_error;
+		close(fd);
 	}
 
 	return respond(RAP_RESPOND_OK_NO_CONTENT);
 
+	respond_error: stdLogError(errno, "Could not delete file %s", file);
+	if (fd != -1) close(fd);
+	int e = errno;
+	switch (e) {
+	case EACCES:
+	case EPERM:
+		return writeErrorResponse(RAP_RESPOND_ACCESS_DENIED, strerror(e), NULL, file);
+	case ENOTDIR:
+	case ENOENT:
+		return writeErrorResponse(RAP_RESPOND_NOT_FOUND, strerror(e), NULL, file);
+	default:
+		return writeErrorResponse(RAP_RESPOND_INTERNAL_ERROR, strerror(e), NULL, file);
+	}
 }
 
 ////////////////
@@ -1158,11 +1171,23 @@ static ssize_t writeFile(Message * requestMessage) {
 		switch (e) {
 		case EACCES:
 			stdLogError(e, "PUT access denied %s %s", authenticatedUser, file);
-			return respond(RAP_RESPOND_ACCESS_DENIED);
+			return writeErrorResponse(RAP_RESPOND_ACCESS_DENIED, strerror(errno), NULL, file);
 		case ENOENT:
 		default:
 			stdLogError(e, "PUT not found %s %s", authenticatedUser, file);
-			return respond(RAP_RESPOND_CONFLICT);
+			return writeErrorResponse(RAP_RESPOND_NOT_FOUND, strerror(errno), NULL, file);
+		}
+	}
+	// Check if we have the apropriate lock on this file.
+	LockProvisions locks = messageParamTo(LockProvisions, requestMessage->params[RAP_PARAM_REQUEST_LOCK]);
+	if (locks.source != LOCK_TYPE_EXCLUSIVE) {
+		// We have no lock but we need one so acquire it now.
+		if (flock(fd, LOCK_TYPE_EXCLUSIVE | LOCK_NB) == -1) {
+			close(fd);
+			int e = errno;
+			const char * etxt = strerror(e);
+			stdLogError(e, "Could not write locked file %s", file);
+			return writeErrorResponse(RAP_RESPOND_LOCKED, etxt, "lock-token-submitted", file);
 		}
 	}
 	int ret = respond(RAP_RESPOND_CONTINUE);
@@ -1308,17 +1333,17 @@ static ssize_t readFile(Message * requestMessage) {
 		switch (e) {
 		case EACCES:
 			stdLogError(e, "GET access denied %s %s", authenticatedUser, file);
-			return respond(RAP_RESPOND_ACCESS_DENIED);
+			return writeErrorResponse(RAP_RESPOND_ACCESS_DENIED, strerror(errno), NULL, file);
 		case ENOENT:
 		default:
 			stdLogError(e, "GET not found %s %s", authenticatedUser, file);
-			return respond(RAP_RESPOND_NOT_FOUND);
+			return writeErrorResponse(RAP_RESPOND_NOT_FOUND, strerror(errno), NULL, file);
 		}
 	} else {
 		struct stat statinfo;
 		fstat(fd, &statinfo);
-
 		if ((statinfo.st_mode & S_IFMT) == S_IFDIR) {
+			// we cant't lock a directory so we don't try to acquire a lock here.
 			int pipeEnds[2];
 			if (pipe(pipeEnds)) {
 				stdLogError(errno, "Could not create pipe to write content");
@@ -1330,10 +1355,8 @@ static ssize_t readFile(Message * requestMessage) {
 			time(&fileTime);
 
 			Message message = { .mID = RAP_RESPOND_OK, .fd = pipeEnds[PIPE_READ], 3 };
-			message.params[RAP_PARAM_RESPONSE_DATE].iov_base = &fileTime;
-			message.params[RAP_PARAM_RESPONSE_DATE].iov_len = sizeof(fileTime);
-			message.params[RAP_PARAM_RESPONSE_MIME].iov_base = "text/html";
-			message.params[RAP_PARAM_RESPONSE_MIME].iov_len = sizeof("text/html");
+			message.params[RAP_PARAM_RESPONSE_DATE] = toMessageParam(fileTime);
+			message.params[RAP_PARAM_RESPONSE_MIME] = toMessageParam("text/html");
 			message.params[RAP_PARAM_RESPONSE_LOCATION] = requestMessage->params[RAP_PARAM_REQUEST_FILE];
 			ssize_t messageResult = sendMessage(RAP_CONTROL_SOCKET, &message);
 			if (messageResult <= 0) {
@@ -1345,12 +1368,24 @@ static ssize_t readFile(Message * requestMessage) {
 			listDir(file, fd, pipeEnds[PIPE_WRITE]);
 			return messageResult;
 		} else {
+			// Check if we have the apropriate lock on this file.
+			LockProvisions locks = messageParamTo(LockProvisions,
+					requestMessage->params[RAP_PARAM_REQUEST_LOCK]);
+			if (locks.source == LOCK_TYPE_NONE) {
+				// We have no lock but we need one so acquire it now.
+				if (flock(fd, LOCK_TYPE_SHARED | LOCK_NB) == -1) {
+					close(fd);
+					int e = errno;
+					const char * etxt = strerror(e);
+					stdLogError(e, "Could not read locked file %s", file);
+					return writeErrorResponse(RAP_RESPOND_LOCKED, etxt, "lock-token-submitted", file);
+				}
+			}
 			Message message = { .mID = RAP_RESPOND_OK, .fd = fd, .paramCount = 3 };
-			message.params[RAP_PARAM_RESPONSE_DATE].iov_base = &statinfo.st_mtime;
-			message.params[RAP_PARAM_RESPONSE_DATE].iov_len = sizeof(statinfo.st_mtime);
+			message.params[RAP_PARAM_RESPONSE_DATE] = toMessageParam(statinfo.st_mtime);
 			MimeType * mimeType = findMimeType(file);
-			message.params[RAP_PARAM_RESPONSE_MIME].iov_base = (char *) mimeType->type;
-			message.params[RAP_PARAM_RESPONSE_MIME].iov_len = mimeType->typeStringSize;
+			message.params[RAP_PARAM_RESPONSE_MIME] = makeMessageParam(mimeType->type,
+					mimeType->typeStringSize);
 			message.params[RAP_PARAM_RESPONSE_LOCATION] = requestMessage->params[RAP_PARAM_REQUEST_FILE];
 			return sendMessage(RAP_CONTROL_SOCKET, &message);
 		}
@@ -1512,16 +1547,16 @@ int main(int argCount, char * args[]) {
 		case RAP_REQUEST_DELETE:
 			ioResult = deleteFile(&message);
 			break;
-		case RAP_REQUEST_MOVE:
+		case RAP_REQUEST_MOVE: // TODO lock
 			ioResult = moveFile(&message);
 			break;
-		case RAP_REQUEST_COPY:
+		case RAP_REQUEST_COPY: // TODO lock
 			ioResult = copyFile(&message);
 			break;
-		case RAP_REQUEST_PROPFIND:
+		case RAP_REQUEST_PROPFIND: // TODO lock
 			ioResult = propfind(&message);
 			break;
-		case RAP_REQUEST_PROPPATCH:
+		case RAP_REQUEST_PROPPATCH: // TODO lock
 			ioResult = proppatch(&message);
 			break;
 		case RAP_REQUEST_LOCK:

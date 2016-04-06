@@ -100,6 +100,10 @@ void * reallocSafe(void * mem, size_t newSize) {
 	}
 }
 
+void freeSafe(void * mem) {
+	free(mem);
+}
+
 ssize_t sendMessage(int sock, Message * message) {
 	//stdLog("sendm %d", sock);
 	ssize_t size;

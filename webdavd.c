@@ -4,14 +4,14 @@
 
 #include "shared.h"
 #include "configuration.h"
-#include "rap-control.h"
-#include "lockdb.h"
 
 #include <errno.h>
 #include <fcntl.h>
 #include <gnutls/abstract.h>
 #include <microhttpd.h>
 #include <pthread.h>
+#include <search.h>
+#include <semaphore.h>
 #include <string.h>
 #include <stdio.h>
 #include <sys/stat.h>
@@ -20,10 +20,53 @@
 #include <netdb.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <uuid/uuid.h>
 
 ////////////////
 // Structures //
 ////////////////
+
+#define MAX_SESSION_LOCKS 10
+
+typedef char LockToken[37];
+
+typedef struct Lock {
+	const char * user;
+	const char * file;
+	time_t lockAcquired;
+	LockType type;
+	int fd;
+	int useCount;
+	int released;
+	LockToken lockToken;
+} Lock;
+
+typedef struct RAP {
+	// Managed by create / destroy RAP
+	int pid;
+	int socketFd;
+	const char * user;
+	const char * password;
+	const char * clientIp;
+
+	// Managed by RAP DB
+	time_t rapCreated;
+	struct RAP * next;
+	struct RAP ** prevPtr;
+
+	// Managed per request
+	// This is not really data about the rap at all but storing it here saves allocating an extra structure
+	int requestWriteDataFd; // Should be closed by uploadComplete()
+	int requestReadDataFd;  // Should be closed by processNewRequest() when sent to the RAP.
+	int requestResponseAlreadyGiven;
+	int requestLockCount;
+	Lock * requestLock[MAX_SESSION_LOCKS];
+
+} RAP;
+
+typedef struct RapList {
+	RAP * firstRapSession;
+} RapList;
 
 typedef struct Header {
 	const char * key;
@@ -42,18 +85,55 @@ typedef struct MHD_Response Response;
 
 typedef struct FDResponseData {
 	int fd;
-	const char * lockToken;
 	off_t pos;
 	off_t offset;
 	off_t size;
+	RAP * session;
 } FDResponseData;
 
 ////////////////////
 // End Structures //
 ////////////////////
 
+// Used as a place holder for failed auth requests which failed due to invalid credentials
+static const RAP AUTH_FAILED_RAP = {
+		.pid = 0,
+		.socketFd = -1,
+		.user = "<auth failed>",
+		.requestWriteDataFd = -1,
+		.requestReadDataFd = -1,
+		.requestResponseAlreadyGiven = 403,
+		.requestLockCount = 0,
+		.next = NULL,
+		.prevPtr = NULL };
+
+// Used as a place holder for failed auth requests which failed due to errors
+static const RAP AUTH_ERROR_RAP = {
+		.pid = 0,
+		.socketFd = -1,
+		.user = "<auth error>",
+		.requestWriteDataFd = -1,
+		.requestReadDataFd = -1,
+		.requestResponseAlreadyGiven = 500,
+		.requestLockCount = 0,
+		.next = NULL,
+		.prevPtr = NULL };
+
+static pthread_key_t rapDBThreadKey;
+static sem_t rapPoolLock;
+static RapList rapPool;
+
+#define AUTH_FAILED ( ( RAP *) &AUTH_FAILED_RAP )
+#define AUTH_ERROR ( ( RAP *) &AUTH_ERROR_RAP )
+
+#define AUTH_SUCCESS(rap) (rap != AUTH_FAILED && rap != AUTH_ERROR)
+
+static time_t lockExpiryTime;
+static int lockReadyForReleaseCount;
+static Lock ** readyForRelease;
+
 // TODO create shutdown routine
-int shuttingDown = 0;
+static int shuttingDown = 0;
 
 #define ACCEPT_HEADER "OPTIONS, GET, HEAD, DELETE, PROPFIND, PUT, PROPPATCH, COPY, MOVE, LOCK, UNLOCK"
 
@@ -62,16 +142,19 @@ static Response * UNAUTHORIZED_PAGE;
 static Response * METHOD_NOT_SUPPORTED_PAGE;
 static Response * NO_CONTENT_PAGE;
 
-const char * FORBIDDEN_PAGE;
-const char * NOT_FOUND_PAGE;
-const char * BAD_REQUEST_PAGE;
-const char * INSUFFICIENT_STORAGE_PAGE;
-const char * OPTIONS_PAGE;
-const char * CONFLICT_PAGE;
-const char * OK_PAGE;
+static const char * FORBIDDEN_PAGE;
+static const char * NOT_FOUND_PAGE;
+static const char * BAD_REQUEST_PAGE;
+static const char * INSUFFICIENT_STORAGE_PAGE;
+static const char * OPTIONS_PAGE;
+static const char * CONFLICT_PAGE;
+static const char * OK_PAGE;
 
 static int sslCertificateCount;
 static SSLCertificate * sslCertificates = NULL;
+
+static void * rootNode = NULL;
+static sem_t lockDBLock;
 
 // All Daemons
 // Not sure why we keep these, they're not used for anything
@@ -218,19 +301,351 @@ static int requestHasData(Request *request) {
 	}
 }
 
-static const char * getFilePathFromUrl(const char * url) {
-	if (!url) return NULL;
-	int count = 0;
-	do {
-		url++;
-		if (*url == '/') count++;
-	} while (*url != '\0' && count < 3);
-	return url;
+static void parseHeaderFilePath(char * resultBuffer, size_t urlLength, const char * url) {
+	if (url[0] != '/') {
+		// Find the start of the path (after the http://domain.tld/)
+		int count = 0;
+		size_t start = 1;
+		while (start < urlLength && (url[start] == '/' ? ++count : count) < 3) {
+			start++;
+		}
+		url += start;
+		urlLength -= start;
+	}
+
+	// Decode the % encoded characters
+	size_t read = 0;
+	size_t write = 0;
+	while (read < urlLength) {
+		if (url[read] != '%' || read >= urlLength - 2) {
+			resultBuffer[write++] = url[read++];
+		} else {
+			unsigned char c;
+			unsigned char c1 = url[read + 1];
+			if (c1 >= '0' && c1 <= '9') c = ((c1 - '0') << 4);
+			else if (c1 >= 'a' && c1 <= 'f') c = ((c1 - 'a' + 10) << 4);
+			else if (c1 >= 'A' && c1 <= 'F') c = ((c1 - 'A' + 10) << 4);
+			else {
+				resultBuffer[write++] = url[read++];
+				continue;
+			}
+
+			c1 = url[read + 2];
+			if (c1 >= '0' && c1 <= '9') c |= c1 - '0';
+			else if (c1 >= 'a' && c1 <= 'f') c |= c1 - 'a' + 10;
+			else if (c1 >= 'A' && c1 <= 'F') c |= c1 - 'A' + 10;
+			else {
+				resultBuffer[write++] = url[read++];
+				continue;
+			}
+
+			resultBuffer[write++] = c;
+			read += 3;
+		}
+	}
+	resultBuffer[write] = '\0';
 }
 
 /////////////////
 // End Utility //
 /////////////////
+
+////////////////////
+// RAP Processing //
+////////////////////
+
+static time_t getExpiryTime() {
+	time_t expires;
+	time(&expires);
+	expires -= config.rapMaxSessionLife;
+	return expires;
+}
+
+static int forkRapProcess(const char * path, int * newSockFd) {
+	// Create unix domain socket for
+	int sockFd[2];
+	int result = socketpair(PF_LOCAL, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, sockFd);
+	if (result != 0) {
+		stdLogError(errno, "Could not create socket pair");
+		return 0;
+	}
+
+	// We set this timeout so that a hung RAP will eventually clean itself up
+	struct timeval timeout;
+	timeout.tv_sec = config.rapTimeoutRead;
+	timeout.tv_usec = 0;
+	if (setsockopt(sockFd[PARENT_SOCKET], SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) < 0) {
+		stdLogError(errno, "Could not set timeout");
+		close(sockFd[PARENT_SOCKET]);
+		close(sockFd[CHILD_SOCKET]);
+		return 0;
+	}
+
+	result = fork();
+	if (result) {
+
+		// parent
+		close(sockFd[CHILD_SOCKET]);
+		if (result != -1) {
+			*newSockFd = sockFd[PARENT_SOCKET];
+			//stdLog("New RAP %d on %d", result, sockFd[0]);
+			return result;
+		} else {
+			// fork failed so close parent pipes and return non-zero
+			close(sockFd[PARENT_SOCKET]);
+			stdLogError(errno, "Could not fork");
+			return 0;
+		}
+	} else {
+
+		// child
+		close(sockFd[PARENT_SOCKET]);
+		if (sockFd[CHILD_SOCKET] == RAP_CONTROL_SOCKET) {
+			// If by some chance this socket has opened as pre-defined RAP_CONTROL_SOCKET we
+			// won't dup2 but we do need to remove the close-on-exec flag
+			int flags = fcntl(sockFd[CHILD_SOCKET], F_GETFD);
+			if (fcntl(sockFd[CHILD_SOCKET], F_SETFD, flags & ~FD_CLOEXEC) == -1) {
+				stdLogError(errno, "Could not clear close-on-exec for control socket", sockFd[CHILD_SOCKET],
+						(int) RAP_CONTROL_SOCKET);
+				exit(255);
+			}
+		} else {
+			// Assign the control socket to the correct FD so the RAP can use it
+			// This previously abused STD_IN and STD_OUT for this but instead we now
+			// reserve a different FD (3) AKA RAP_CONTROL_SOCKET
+			if (dup2(sockFd[CHILD_SOCKET], RAP_CONTROL_SOCKET) == -1) {
+				stdLogError(errno, "Could not assign new socket (%d) to %d", newSockFd[1],
+						(int) RAP_CONTROL_SOCKET);
+				exit(255);
+			}
+		}
+
+		char * argv[] = {
+				(char *) config.rapBinary,
+				(char *) config.pamServiceName,
+				(char *) config.mimeTypesFile,
+				NULL };
+		execv(path, argv);
+
+		stdLogError(errno, "Could not start rap: %s", path);
+		exit(255);
+	}
+}
+
+static void removeRapFromList(RAP * rapSession) {
+	*(rapSession->prevPtr) = rapSession->next;
+	if (rapSession->next != NULL) {
+		rapSession->next->prevPtr = rapSession->prevPtr;
+	}
+}
+
+static void addRapToList(RapList * list, RAP * rapSession) {
+	rapSession->next = list->firstRapSession;
+	list->firstRapSession = rapSession;
+	rapSession->prevPtr = &list->firstRapSession;
+	if (rapSession->next) {
+		rapSession->next->prevPtr = &rapSession->next;
+	}
+}
+
+static void destroyRap(RAP * rapSession) {
+	if (!AUTH_SUCCESS(rapSession)) {
+		return;
+	}
+	close(rapSession->socketFd);
+	if (rapSession->requestReadDataFd != -1) {
+		stdLogError(0, "readDataFd was not properly closed before destroying rap");
+		close(rapSession->requestReadDataFd);
+	}
+	if (rapSession->requestWriteDataFd != -1) {
+		stdLogError(0, "writeDataFd was not properly closed before destroying rap");
+		close(rapSession->requestWriteDataFd);
+	}
+
+	freeSafe((void *) rapSession->user);
+	freeSafe((void *) rapSession->password);
+	freeSafe((void *) rapSession->clientIp);
+	removeRapFromList(rapSession);
+	freeSafe(rapSession);
+}
+
+static RAP * createRap(RapList * db, const char * user, const char * password, const char * rhost) {
+	int socketFd;
+	int pid = forkRapProcess(config.rapBinary, &socketFd);
+	if (!pid) {
+		return AUTH_ERROR;
+	}
+
+	// Send Auth Request
+	Message message;
+	message.mID = RAP_REQUEST_AUTHENTICATE;
+	message.fd = -1;
+	message.paramCount = 3;
+	message.params[RAP_PARAM_AUTH_USER] = stringToMessageParam(user);
+	message.params[RAP_PARAM_AUTH_PASSWORD] = stringToMessageParam(password);
+	message.params[RAP_PARAM_AUTH_RHOST] = stringToMessageParam(rhost);
+	if (sendMessage(socketFd, &message) <= 0) {
+		close(socketFd);
+		return AUTH_ERROR;
+	}
+
+	// Read Auth Result
+	char incomingBuffer[INCOMING_BUFFER_SIZE];
+	ssize_t readResult = recvMessage(socketFd, &message, incomingBuffer, INCOMING_BUFFER_SIZE);
+	if (readResult <= 0 || message.mID != RAP_RESPOND_OK) {
+		close(socketFd);
+		if (readResult < 0) {
+			stdLogError(0, "Could not read result from RAP ");
+			return AUTH_ERROR;
+		} else if (readResult == 0) {
+			stdLogError(0, "RAP closed socket unexpectedly");
+			return AUTH_ERROR;
+		} else {
+			stdLogError(0, "Access denied for user %s", user);
+			return AUTH_FAILED;
+		}
+	}
+
+	// If successfully authenticated then populate the RAP structure and add it to the DB
+	RAP * newRap = mallocSafe(sizeof(*newRap));
+	newRap->pid = pid;
+	newRap->socketFd = socketFd;
+	newRap->user = copyString(user);
+	newRap->password = copyString(password);
+	newRap->clientIp = copyString(rhost);
+	time(&newRap->rapCreated);
+	newRap->requestWriteDataFd = -1;
+	newRap->requestReadDataFd = -1;
+	addRapToList(db, newRap);
+	// newRap->responseAlreadyGiven // this is set elsewhere
+	return newRap;
+}
+
+// void releaseRap(RAP * processor) {}
+
+static RAP * acquireRap(const char * user, const char * password, const char * clientIp) {
+	if (user && password) {
+		RAP * rap;
+		time_t expires = getExpiryTime();
+		RapList * threadRapList = pthread_getspecific(rapDBThreadKey);
+		if (!threadRapList) {
+			threadRapList = mallocSafe(sizeof(*threadRapList));
+			memset(threadRapList, 0, sizeof(*threadRapList));
+			pthread_setspecific(rapDBThreadKey, threadRapList);
+		} else {
+			// Get a rap from this thread's own list
+			rap = threadRapList->firstRapSession;
+			while (rap) {
+				if (rap->rapCreated < expires) {
+					RAP * raptmp = rap->next;
+					destroyRap(rap);
+					rap = raptmp;
+				} else if (!strcmp(user, rap->user)
+						&& !strcmp(password, rap->password) /*&& !strcmp(clientIp, rap->clientIp)*/) {
+					// all requests here will come from the same ip so we don't check it in the above.
+					return rap;
+				} else {
+					rap = rap->next;
+				}
+			}
+		}
+		// Get a rap from the central pool.
+		if (sem_wait(&rapPoolLock) == -1) {
+			stdLogError(errno, "Could not wait for rap pool lock while acquiring rap");
+			return AUTH_ERROR;
+		} else {
+			rap = rapPool.firstRapSession;
+			while (rap) {
+				if (rap->rapCreated < expires) {
+					RAP * raptmp = rap->next;
+					destroyRap(rap);
+					rap = raptmp;
+				} else if (!strcmp(user, rap->user) && !strcmp(password, rap->password)
+						&& !strcmp(clientIp, rap->clientIp)) {
+					// We will only re-use sessions in the pool if they are from the same ip
+					removeRapFromList(rap);
+					addRapToList(threadRapList, rap);
+					sem_post(&rapPoolLock);
+					return rap;
+				} else {
+					rap = rap->next;
+				}
+			}
+			sem_post(&rapPoolLock);
+		}
+		return createRap(threadRapList, user, password, clientIp);
+	} else {
+		stdLogError(0, "Rejecting request without auth");
+		return AUTH_FAILED;
+	}
+}
+
+#define releaseRap(processor)
+
+static void cleanupAfterRap(int sig, siginfo_t *siginfo, void *context) {
+	int status;
+	waitpid(siginfo->si_pid, &status, 0);
+	if (status == 139) {
+		stdLogError(0, "RAP %d failed with segmentation fault", siginfo->si_pid);
+	}
+	//stdLog("Child finished PID: %d staus: %d", siginfo->si_pid, status);
+}
+
+static void deInitializeRapDatabase(void * data) {
+	RapList * threadRapList = data;
+	if (threadRapList) {
+		if (threadRapList->firstRapSession) {
+			if (sem_wait(&rapPoolLock) == -1) {
+				stdLogError(errno, "Could not wait for rap pool lock cleaning up thread");
+				do {
+					destroyRap(threadRapList->firstRapSession);
+				} while (threadRapList->firstRapSession != NULL);
+			} else {
+				do {
+					RAP * rap = threadRapList->firstRapSession;
+					removeRapFromList(rap);
+					addRapToList(&rapPool, rap);
+				} while (threadRapList->firstRapSession != NULL);
+				sem_post(&rapPoolLock);
+			}
+		}
+		freeSafe(threadRapList);
+	}
+}
+
+static void runCleanRapPool() {
+	time_t expires = getExpiryTime();
+	if (sem_wait(&rapPoolLock) == -1) {
+		stdLogError(errno, "Could not wait for rap pool lock while cleaning pool");
+		return;
+	} else {
+		RAP * rap = rapPool.firstRapSession;
+		while (rap != NULL) {
+			RAP * next = rap->next;
+			if (rap->rapCreated < expires) {
+				destroyRap(rap);
+			}
+			rap = next;
+		}
+		sem_post(&rapPoolLock);
+	}
+}
+
+static void initializeRapDatabase() {
+	struct sigaction childCleanup = { .sa_sigaction = &cleanupAfterRap, .sa_flags = SA_SIGINFO };
+	if (sigaction(SIGCHLD, &childCleanup, NULL) < 0) {
+		stdLogError(errno, "Could not set handler method for finished child threads");
+		exit(255);
+	}
+
+	memset(&rapPool, 0, sizeof(rapPool));
+	sem_init(&rapPoolLock, 0, 1);
+	pthread_key_create(&rapDBThreadKey, &deInitializeRapDatabase);
+}
+
+////////////////////////
+// End RAP Processing //
+////////////////////////
 
 /////////
 // SSL //
@@ -430,6 +845,298 @@ static void initializeSSL() {
 // End SSL //
 /////////////
 
+///////////
+// Locks //
+///////////
+
+static int compareLockToken(const void * a, const void * b) {
+	const Lock * lhs = a;
+	const Lock * rhs = b;
+	return strcasecmp(lhs->lockToken, rhs->lockToken);
+}
+
+static Lock * findLock(Lock * lockToken) {
+	Lock ** result = tfind(lockToken, &rootNode, &compareLockToken);
+	return result ? *result : NULL;
+}
+
+static Lock * acquireLock(const char * user, const char * file, LockType lockType, int fd) {
+	if (lockType != LOCK_TYPE_SHARED && lockType != LOCK_TYPE_EXCLUSIVE) {
+		stdLogError(0, "acquireLock called with invalid lockType %d", (int) lockType);
+		return NULL;
+	}
+	size_t userSize = strlen(user) + 1;
+	size_t fileSize = strlen(file) + 1;
+	size_t bufferSize = sizeof(Lock) + userSize + fileSize;
+
+	char * buffer = mallocSafe(bufferSize);
+	Lock * newLock = (Lock *) buffer;
+	newLock->user = buffer + sizeof(Lock);
+	newLock->file = newLock->user + userSize;
+
+	uuid_t uuid;
+	uuid_generate(uuid);
+	uuid_unparse_lower(uuid, newLock->lockToken);
+	memcpy((char *) newLock->user, user, userSize);
+	memcpy((char *) newLock->file, file, fileSize);
+	time(&newLock->lockAcquired);
+	newLock->type = lockType;
+	newLock->fd = fd;
+	newLock->useCount = 1;
+	newLock->released = 0;
+
+	if (sem_wait(&lockDBLock) == -1) {
+		stdLogError(errno, "Could not wait for access to lock db");
+		close(fd);
+		freeSafe(newLock);
+		return NULL;
+	} else {
+		// Adds the lock to the DB.  Despite its odd name tsearch adds the item if it doesnt already exist.
+		Lock * inDB = *((Lock **) tsearch(newLock, &rootNode, &compareLockToken));
+		sem_post(&lockDBLock);
+		if (inDB != newLock) {
+			// This should never happen, but "should" isn't a term we want to play with.
+			stdLogError(0, "UUID collision in lock database %s", newLock->lockToken);
+			close(newLock->fd);
+			freeSafe(newLock);
+			return acquireLock(user, file, lockType, fd);
+		} else {
+			return newLock;
+		}
+	}
+}
+
+static int refreshLock(Lock * lock) {
+	if (sem_wait(&lockDBLock) == -1) {
+		stdLogError(errno, "Could not wait for access to lock db");
+		return 0;
+	}
+	Lock * foundLock = findLock(lock);
+	if (foundLock && !foundLock->released) {
+		time(&foundLock->lockAcquired);
+		sem_post(&lockDBLock);
+		return 1;
+	} else {
+		sem_post(&lockDBLock);
+		stdLogError(0, "Could not find lock %s for user %s on file %s", lock->lockToken, lock->user,
+				lock->file);
+		return 0;
+	}
+
+}
+
+static void releaseUnusedLock(Lock * lock) {
+	lock->useCount--;
+	if (lock->useCount == 0) {
+		tdelete(lock, &rootNode, &compareLockToken);
+		close(lock->fd);
+		freeSafe(lock);
+	}
+}
+
+static Lock * useLock(const char * lockToken, const char * file, const char * user) {
+	if (strncmp(lockToken, LOCK_TOKEN_PREFIX, LOCK_TOKEN_PREFIX_LENGTH)) {
+		stdLogError(0, "Could not find lock %s for user %s on file %s", lockToken, user, file);
+		return NULL;
+	}
+	Lock toFind;
+	strncpy((char *) toFind.lockToken, lockToken + LOCK_TOKEN_PREFIX_LENGTH, sizeof(toFind.lockToken) - 1);
+	toFind.lockToken[sizeof(toFind.lockToken) - 1] = '\0';
+
+	if (sem_wait(&lockDBLock) == -1) {
+		stdLogError(errno, "Could not wait for access to lock db");
+		return NULL;
+	}
+	Lock * foundLock = findLock(&toFind);
+	if (foundLock != NULL && !strcmp(foundLock->user, user) && !strcmp(foundLock->file, file)
+			&& !foundLock->released) {
+		foundLock->useCount++;
+		sem_post(&lockDBLock);
+		return foundLock;
+	} else {
+		sem_post(&lockDBLock);
+		stdLogError(0, "Could not find lock %s for user %s on file %s", lockToken, user, file);
+		return NULL;
+	}
+}
+
+static void unuseLock(Lock * lockToken) {
+	if (sem_wait(&lockDBLock) == -1) {
+		stdLogError(errno, "Could not wait for access to lock db lock will left in DB after unsuseLock()");
+	} else {
+		Lock * foundLock = findLock(lockToken);
+		if (foundLock) {
+			releaseUnusedLock(foundLock);
+		}
+		sem_post(&lockDBLock);
+	}
+}
+
+static int releaseLock(const char * lockToken, const char * file, const char * user) {
+	if (strncmp(lockToken, LOCK_TOKEN_PREFIX, LOCK_TOKEN_PREFIX_LENGTH)) {
+		stdLogError(0, "Could not find lock %s for user %s on file %s", lockToken, user, file);
+		return 0;
+	}
+	Lock toFind;
+	strncpy((char *) toFind.lockToken, lockToken + LOCK_TOKEN_PREFIX_LENGTH, sizeof(toFind.lockToken) - 1);
+	toFind.lockToken[sizeof(toFind.lockToken) - 1] = '\0';
+
+	// TODO better return values to distinguish between internal error and non-existant lock
+	if (sem_wait(&lockDBLock) == -1) {
+		stdLogError(errno, "Could not wait for access to lock db");
+		return 0;
+	}
+	Lock * foundLock = findLock(&toFind);
+	if (foundLock != NULL && !strcmp(foundLock->user, user) && !strcmp(foundLock->file, file)
+			&& !foundLock->released) {
+		foundLock->released = 1;
+		releaseUnusedLock(foundLock);
+		sem_post(&lockDBLock);
+		return 1;
+	} else {
+		sem_post(&lockDBLock);
+		stdLogError(0, "Could not find lock %s for user %s on file %s", lockToken, user, file);
+		return 0;
+	}
+}
+
+static void cleanAction(const void *nodep, const VISIT which, const int depth) {
+	switch (which) {
+	case postorder:
+	case leaf: {
+		Lock * lock = *((Lock **) nodep);
+		if (lock && lock->lockAcquired < lockExpiryTime && !lock->released) {
+			int index = lockReadyForReleaseCount++;
+			if (!(index & 0xF)) {
+				readyForRelease = reallocSafe(readyForRelease,
+						(lockReadyForReleaseCount | 0xF) * sizeof(*readyForRelease));
+			}
+			readyForRelease[index] = lock;
+		}
+		break;
+	}
+
+	default:
+		break;
+	}
+}
+
+static void runCleanLocks() {
+	if (sem_wait(&lockDBLock) == -1) {
+		stdLogError(errno, "Could not wait for access to lock db");
+	} else {
+		if (rootNode) {
+			time(&lockExpiryTime);
+			lockExpiryTime -= config.maxLockTime;
+			lockReadyForReleaseCount = 0;
+			readyForRelease = NULL;
+			twalk(rootNode, &cleanAction);
+
+			if (lockReadyForReleaseCount > 0) {
+				int i = 0;
+				do {
+					readyForRelease[i]->released = 1;
+					releaseUnusedLock(readyForRelease[i]);
+					i++;
+				} while (i < lockReadyForReleaseCount);
+				freeSafe(readyForRelease);
+			}
+		}
+
+		sem_post(&lockDBLock);
+	}
+}
+
+static void initializeLockDB() {
+	if (sem_init(&lockDBLock, 0, 1) == -1) {
+		stdLogError(errno, "Could not create lock for lockdb");
+		exit(255);
+	}
+}
+
+static void unuseSessionLocks(RAP * session) {
+	if (session && session->requestLockCount) {
+		for (int i = 0; i < session->requestLockCount; i++) {
+			unuseLock(session->requestLock[i]);
+		}
+		session->requestLockCount = 0;
+	}
+}
+
+// have capitalized this because the fact it is a macro needs emphasizing
+#define SKIP_WHITE_SPACE(ptr) while (*ptr == ' ' || *ptr == '\t') {ptr++;}
+
+// Parses the If header and checks all specified locks, assigning them to the session.
+static int useSessionLocks(RAP * rapSession, Request * request, const char * url) {
+	const char * cptr = getHeader(request, "If");
+	if (!cptr) return 1;
+
+	char * resource = (char *) url;
+	SKIP_WHITE_SPACE(cptr);
+	while (*cptr != '\0') {
+		// TODO handle NOT condition
+		if (*cptr == '<') {
+			cptr++;
+			size_t i = 0;
+			while (cptr[i] != '>' && cptr[i] != '\0') {
+				i++;
+			}
+			if (i == 0 || cptr[i] == '\0') goto return_0;
+			if (resource != url) freeSafe(resource);
+			resource = mallocSafe(i + 1);
+			parseHeaderFilePath(resource, i, cptr);
+			cptr += i + 1;
+			SKIP_WHITE_SPACE(cptr);
+		} else if (*cptr == '(') {
+			cptr++;
+			SKIP_WHITE_SPACE(cptr);
+			while (*cptr != ')') {
+				if (*cptr == '<') {
+					size_t i = 1;
+					while (cptr[i] != '\0' && cptr[i] != '>') {
+						i++;
+					}
+					i++;
+
+					char token[i + 1];
+					memcpy(token, cptr, i);
+					token[i] = '\0';
+					cptr += i;
+
+					Lock * lock = useLock(token, resource, rapSession->user);
+					if (!lock) goto return_0;
+
+					int lockIndex = rapSession->requestLockCount++;
+					if (rapSession->requestLockCount > MAX_SESSION_LOCKS) {
+						rapSession->requestLockCount--;
+						unuseLock(lock);
+						goto return_0;
+					}
+					rapSession->requestLock[lockIndex] = lock;
+
+				} else if (*cptr == '[') {
+					// TODO parse etag
+					goto return_0;
+				} else goto return_0;
+				SKIP_WHITE_SPACE(cptr);
+			}
+			cptr++;
+			SKIP_WHITE_SPACE(cptr);
+		} else goto return_0;
+	}
+
+	if (resource != url) freeSafe(resource);
+	return 1;
+
+	return_0: unuseSessionLocks(rapSession);
+	if (resource != url) freeSafe(resource);
+	return 0;
+}
+
+///////////////
+// End Locks //
+///////////////
+
 ///////////////////////
 // Response Creation //
 ///////////////////////
@@ -484,21 +1191,19 @@ static ssize_t fdContentReader(void *cls, uint64_t pos, char *buf, size_t max) {
 static void fdContentReaderCleanup(void *cls) {
 	FDResponseData * fdResponseData = cls;
 	close(fdResponseData->fd);
-	if (fdResponseData->lockToken) {
-		unuseLock(fdResponseData->lockToken);
-	}
+	unuseSessionLocks(fdResponseData->session);
 	freeSafe(fdResponseData);
 }
 
 static Response * createFdResponse(int fd, uint64_t offset, uint64_t size, const char * mimeType, time_t date,
-		const char * lockToken) {
+		RAP * rapSession) {
 
 	FDResponseData * fdResponseData = mallocSafe(sizeof(*fdResponseData));
 	fdResponseData->fd = fd;
 	fdResponseData->pos = 0;
 	fdResponseData->offset = offset;
 	fdResponseData->size = size;
-	fdResponseData->lockToken = lockToken;
+	fdResponseData->session = rapSession;
 	Response * response = MHD_create_response_from_callback(size, 40960, &fdContentReader, fdResponseData,
 			&fdContentReaderCleanup);
 	if (!response) {
@@ -519,7 +1224,7 @@ static Response * createFdResponse(int fd, uint64_t offset, uint64_t size, const
 }
 
 static Response * createFileResponse(Request *request, const char * fileName, const char * mimeType,
-		const char * lockToken) {
+		RAP * session) {
 
 	int fd = open(fileName, O_RDONLY | O_CLOEXEC);
 	if (fd == -1) {
@@ -529,7 +1234,7 @@ static Response * createFileResponse(Request *request, const char * fileName, co
 
 	struct stat statBuffer;
 	fstat(fd, &statBuffer);
-	return createFdResponse(fd, 0, statBuffer.st_size, mimeType, statBuffer.st_mtime, lockToken);
+	return createFdResponse(fd, 0, statBuffer.st_size, mimeType, statBuffer.st_mtime, session);
 }
 
 static int processRangeHeader(off_t * offset, size_t * fileSize, const char *range) {
@@ -580,7 +1285,7 @@ static int processRangeHeader(off_t * offset, size_t * fileSize, const char *ran
 }
 
 static int createResponseFromMessage(Request *request, struct Message * message, Response ** response,
-		const char * lockToken) {
+		RAP * session) {
 	// Queue the response
 	switch (message->mID) {
 	case RAP_RESPOND_CONTINUE:
@@ -597,13 +1302,13 @@ static int createResponseFromMessage(Request *request, struct Message * message,
 	case RAP_RESPOND_MULTISTATUS:
 	case RAP_RESPOND_LOCKED: {
 		const char * mimeType = messageParamToString(&message->params[RAP_PARAM_REQUEST_FILE]);
-		time_t date = *((time_t *) message->params[RAP_PARAM_RESPONSE_DATE].iov_base);
+		time_t date = messageParamTo(time_t, message->params[RAP_PARAM_RESPONSE_DATE]);
 
 		if (message->fd == -1) {
 			return MHD_HTTP_INTERNAL_SERVER_ERROR;
 		}
 
-		*response = createFdResponse(message->fd, 0, -1, mimeType, date, lockToken);
+		*response = createFdResponse(message->fd, 0, -1, mimeType, date, session);
 		return message->mID;
 	}
 
@@ -615,7 +1320,7 @@ static int createResponseFromMessage(Request *request, struct Message * message,
 		int statusCode = message->mID;
 		// Get Mime type and date
 		const char * mimeType = messageParamToString(&message->params[RAP_PARAM_REQUEST_FILE]);
-		time_t date = *((time_t *) message->params[RAP_PARAM_RESPONSE_DATE].iov_base);
+		time_t date = messageParamTo(time_t, message->params[RAP_PARAM_RESPONSE_DATE]);
 
 		struct stat stat;
 		fstat(message->fd, &stat);
@@ -626,7 +1331,7 @@ static int createResponseFromMessage(Request *request, struct Message * message,
 			if (rangeHeader && processRangeHeader(&offset, &fileSize, rangeHeader)) {
 				statusCode = MHD_HTTP_PARTIAL_CONTENT;
 			}
-			*response = createFdResponse(message->fd, offset, fileSize, mimeType, date, lockToken);
+			*response = createFdResponse(message->fd, offset, fileSize, mimeType, date, session);
 
 			char contentRangeHeader[200];
 			snprintf(contentRangeHeader, sizeof(contentRangeHeader), "bytes %lld-%lld/%lld",
@@ -634,7 +1339,7 @@ static int createResponseFromMessage(Request *request, struct Message * message,
 
 			addHeader(*response, "Content-Range", contentRangeHeader);
 		} else {
-			*response = createFdResponse(message->fd, 0, -1, mimeType, date, lockToken);
+			*response = createFdResponse(message->fd, 0, -1, mimeType, date, session);
 		}
 
 		if (message->paramCount > RAP_PARAM_RESPONSE_LOCATION) {
@@ -646,23 +1351,23 @@ static int createResponseFromMessage(Request *request, struct Message * message,
 	}
 
 	case RAP_RESPOND_ACCESS_DENIED:
-		*response = createFileResponse(request, FORBIDDEN_PAGE, "text/html", lockToken);
+		*response = createFileResponse(request, FORBIDDEN_PAGE, "text/html", session);
 		return RAP_RESPOND_ACCESS_DENIED;
 
 	case RAP_RESPOND_NOT_FOUND:
-		*response = createFileResponse(request, NOT_FOUND_PAGE, "text/html", lockToken);
+		*response = createFileResponse(request, NOT_FOUND_PAGE, "text/html", session);
 		return RAP_RESPOND_NOT_FOUND;
 
 	case RAP_RESPOND_BAD_CLIENT_REQUEST:
-		*response = createFileResponse(request, BAD_REQUEST_PAGE, "text/html", lockToken);
+		*response = createFileResponse(request, BAD_REQUEST_PAGE, "text/html", session);
 		return RAP_RESPOND_BAD_CLIENT_REQUEST;
 
 	case RAP_RESPOND_INSUFFICIENT_STORAGE:
-		*response = createFileResponse(request, INSUFFICIENT_STORAGE_PAGE, "text/html", lockToken);
+		*response = createFileResponse(request, INSUFFICIENT_STORAGE_PAGE, "text/html", session);
 		return RAP_RESPOND_INSUFFICIENT_STORAGE;
 
 	case RAP_RESPOND_CONFLICT:
-		*response = createFileResponse(request, CONFLICT_PAGE, "text/html", lockToken);
+		*response = createFileResponse(request, CONFLICT_PAGE, "text/html", session);
 		return RAP_RESPOND_CONFLICT;
 
 	default:
@@ -691,43 +1396,44 @@ static int finishProcessingRequest(Request * request, RAP * processor, Response 
 		return RAP_RESPOND_INTERNAL_ERROR;
 	}
 
+	const char * location;
+	Lock * lock;
 	switch (message.mID) {
-	case RAP_INTERIM_RESPOND_LOCK:
-	case RAP_INTERIM_RESPOND_RELOCK: {
-		const char * location = messageParamToString(&message.params[RAP_PARAM_LOCK_LOCATION]);
-		const char * lockToken;
-		if (message.mID == RAP_INTERIM_RESPOND_LOCK) {
-			LockType lockType = *((LockType *) message.params[RAP_PARAM_LOCK_TYPE].iov_base);
-			if (!acquireLock(&lockToken, processor->user, location, lockType, message.fd))
-				return RAP_RESPOND_INTERNAL_ERROR;
-		} else /* if (message.mID == RAP_INTERIM_RESPOND_RELOCK) */{
-			lockToken = messageParamToString(&message.params[RAP_PARAM_LOCK_TOKEN]);
-			if (!refreshLock(lockToken, processor->user, location)) return RAP_RESPOND_INTERNAL_ERROR;
+	case RAP_INTERIM_RESPOND_LOCK: {
+		location = messageParamToString(&message.params[RAP_PARAM_LOCK_LOCATION]);
+		LockType lockType = messageParamTo(LockType, message.params[RAP_PARAM_LOCK_TYPE]);
+		lock = acquireLock(processor->user, location, lockType, message.fd);
+		if (!lock) return RAP_RESPOND_INTERNAL_ERROR;
+		goto COMPLETE_LOCK;
+	}
+	case RAP_INTERIM_RESPOND_RELOCK:
+		location = messageParamToString(&message.params[RAP_PARAM_LOCK_LOCATION]);
+		// A relock request must have a lock token specified, there WILL be a lock in processor->requestLock[0].
+		lock = processor->requestLock[0];
+		for (int i = 0; i < processor->requestLockCount; i++) {
+			if (!refreshLock(processor->requestLock[i])) return RAP_RESPOND_INTERNAL_ERROR;
 		}
 
-		message.mID = RAP_COMPLETE_REQUEST_LOCK;
+		COMPLETE_LOCK: message.mID = RAP_COMPLETE_REQUEST_LOCK;
 		message.fd = -1;
 		message.paramCount = 3;
 		// message.params[RAP_PARAM_LOCK_LOCATION] = leave this unchanged
-		message.params[RAP_PARAM_LOCK_TOKEN] = stringToMessageParam(lockToken);
-		message.params[RAP_PARAM_LOCK_TIMEOUT].iov_base = &config.maxLockTime;
-		message.params[RAP_PARAM_LOCK_TIMEOUT].iov_len = sizeof(config.maxLockTime);
+		message.params[RAP_PARAM_LOCK_TOKEN] = stringToMessageParam(lock->lockToken);
+		message.params[RAP_PARAM_LOCK_TIMEOUT] = toMessageParam(config.maxLockTime);
 		readResult = sendRecvMessage(processor->socketFd, &message, incomingBuffer, INCOMING_BUFFER_SIZE);
 		if (readResult <= 0) return RAP_RESPOND_INTERNAL_ERROR;
-		int statusCode = createResponseFromMessage(request, &message, response, processor->requestLockToken);
-		if (statusCode == 200) {
+		int statusCode = createResponseFromMessage(request, &message, response, processor);
+		if (statusCode == RAP_RESPOND_OK) {
 			char tokenBuffer[200];
-			sprintf(tokenBuffer, LOCK_TOKEN_PREFIX "%s" LOCK_TOKEN_SUFFIX, lockToken);
+			sprintf(tokenBuffer, LOCK_TOKEN_PREFIX "%s" LOCK_TOKEN_SUFFIX, lock->lockToken);
 			addHeader(*response, "Lock-Token", tokenBuffer);
 			sprintf(tokenBuffer, "Second-%d", (int) config.maxLockTime);
 			addHeader(*response, "Timeout", tokenBuffer);
 		}
 		return statusCode;
 
-	}
-
 	default:
-		return createResponseFromMessage(request, &message, response, processor->requestLockToken);
+		return createResponseFromMessage(request, &message, response, processor);
 	}
 
 }
@@ -737,8 +1443,18 @@ static int startProcessingRequest(Request * request, const char * url, const cha
 
 	char incomingBuffer[INCOMING_BUFFER_SIZE];
 
-	// TODO processing IF <lock> header
-	rapSession->requestLockToken = NULL;
+	rapSession->requestLockCount = 0;
+	LockProvisions requestLocks = { .source = LOCK_TYPE_NONE, .target = LOCK_TYPE_NONE };
+	if (!useSessionLocks(rapSession, request, url)) {
+		// TODO correct error response (conflict?)
+		return RAP_RESPOND_INTERNAL_ERROR;
+	}
+
+	for (int i = 0; i < rapSession->requestLockCount; i++) {
+		if (rapSession->requestLock[i]->file == url || !strcmp(rapSession->requestLock[i]->file, url)) {
+			requestLocks.source |= rapSession->requestLock[i]->type;
+		}
+	}
 
 	// Interpret the method
 	//stdLog("%s %s data", method, writeHandle ? "with" : "without");
@@ -769,17 +1485,60 @@ static int startProcessingRequest(Request * request, const char * url, const cha
 		message.mID = RAP_REQUEST_LOCK;
 		message.paramCount = 3;
 		message.params[RAP_PARAM_REQUEST_DEPTH] = stringToMessageParam(getHeader(request, HEADER_DEPTH));
+		// These methods are handled in a very different way
 	} else if (!strcmp("MOVE", method)) {
+		const char * unparsedTarget = getHeader(request, HEADER_TARGET);
+		size_t size = unparsedTarget ? strlen(unparsedTarget) : 0;
+		char target[size + 1];
+		if (size > 0) parseHeaderFilePath(target, size, unparsedTarget);
+		else target[0] = '\0';
+
 		message.mID = RAP_REQUEST_MOVE;
 		message.paramCount = 3;
-		message.params[RAP_PARAM_REQUEST_TARGET] = stringToMessageParam(
-				getFilePathFromUrl(getHeader(request, HEADER_TARGET)));
+		message.fd = rapSession->requestReadDataFd;
+		rapSession->requestReadDataFd = -1; // sendMessage takes ownership of this even on failure
+		message.params[RAP_PARAM_REQUEST_LOCK] = toMessageParam(requestLocks);
+		message.params[RAP_PARAM_REQUEST_FILE] = stringToMessageParam(url);
+		message.params[RAP_PARAM_REQUEST_TARGET] = stringToMessageParam(target);
+		for (int i = 0; i < rapSession->requestLockCount; i++) {
+			if (!strcmp(rapSession->requestLock[i]->file, target)) {
+				requestLocks.target |= rapSession->requestLock[i]->type;
+			}
+		}
+
+		if (sendRecvMessage(rapSession->socketFd, &message, incomingBuffer, sizeof(incomingBuffer)) <= 0) {
+			return RAP_RESPOND_INTERNAL_ERROR;
+		}
+
+		return createResponseFromMessage(request, &message, response, rapSession);
+
 	} else if (!strcmp("COPY", method)) {
+		const char * unparsedTarget = getHeader(request, HEADER_TARGET);
+		size_t size = unparsedTarget ? strlen(unparsedTarget) : 0;
+		if (size > MAX_VARABLY_DEFINED_ARRAY) return RAP_RESPOND_HEADER_TOO_LARGE;
+		char target[size + 1];
+		if (size > 0) parseHeaderFilePath(target, size, unparsedTarget);
+		else target[0] = '\0';
+
 		message.mID = RAP_REQUEST_COPY;
 		message.paramCount = 3;
-		message.params[RAP_PARAM_REQUEST_TARGET] = stringToMessageParam(
-				getFilePathFromUrl(getHeader(request, HEADER_TARGET)));
-		// These methods are handled in a very different way
+		message.fd = rapSession->requestReadDataFd;
+		rapSession->requestReadDataFd = -1; // sendMessage takes ownership of this even on failure
+		message.params[RAP_PARAM_REQUEST_LOCK] = toMessageParam(requestLocks);
+		message.params[RAP_PARAM_REQUEST_FILE] = stringToMessageParam(url);
+		message.params[RAP_PARAM_REQUEST_TARGET] = stringToMessageParam(target);
+		for (int i = 0; i < rapSession->requestLockCount; i++) {
+			if (!strcmp(rapSession->requestLock[i]->file, target)) {
+				requestLocks.target |= rapSession->requestLock[i]->type;
+			}
+		}
+
+		if (sendRecvMessage(rapSession->socketFd, &message, incomingBuffer, sizeof(incomingBuffer)) <= 0) {
+			return RAP_RESPOND_INTERNAL_ERROR;
+		}
+
+		return createResponseFromMessage(request, &message, response, rapSession);
+
 	} else if (!strcmp("UNLOCK", method)) {
 		const char * lockToken = getHeader(request, HEADER_LOCK_TOKEN);
 		if (releaseLock(lockToken, url, rapSession->user)) {
@@ -791,14 +1550,15 @@ static int startProcessingRequest(Request * request, const char * url, const cha
 			message.params[RAP_PARAM_ERROR_REASON] = stringToMessageParam("Could not find lock");
 			message.params[RAP_PARAM_ERROR_DAV_REASON] = NULL_PARAM;
 
-			if (sendRecvMessage(rapSession->socketFd, &message, incomingBuffer, sizeof(incomingBuffer)) <= 0) {
+			if (sendRecvMessage(rapSession->socketFd, &message, incomingBuffer, sizeof(incomingBuffer))
+					<= 0) {
 				return RAP_RESPOND_INTERNAL_ERROR;
 			}
 
-			return createResponseFromMessage(request, &message, response, rapSession->requestLockToken);
+			return createResponseFromMessage(request, &message, response, rapSession);
 		}
 	} else if (!strcmp("OPTIONS", method)) {
-		*response = createFileResponse(request, OPTIONS_PAGE, "text/html", rapSession->requestLockToken);
+		*response = createFileResponse(request, OPTIONS_PAGE, "text/html", rapSession);
 		addHeader(*response, "Accept", ACCEPT_HEADER);
 		return RAP_RESPOND_OK;
 
@@ -811,14 +1571,14 @@ static int startProcessingRequest(Request * request, const char * url, const cha
 
 	message.fd = rapSession->requestReadDataFd;
 	rapSession->requestReadDataFd = -1; // sendMessage takes ownership of this even on failure
-	message.params[RAP_PARAM_REQUEST_LOCK] = stringToMessageParam(rapSession->requestLockToken);
+	message.params[RAP_PARAM_REQUEST_LOCK] = toMessageParam(requestLocks);
 	message.params[RAP_PARAM_REQUEST_FILE] = stringToMessageParam(url);
 
 	if (sendRecvMessage(rapSession->socketFd, &message, incomingBuffer, sizeof(incomingBuffer)) <= 0) {
 		return RAP_RESPOND_INTERNAL_ERROR;
 	}
 
-	return createResponseFromMessage(request, &message, response, rapSession->requestLockToken);
+	return createResponseFromMessage(request, &message, response, rapSession);
 
 }
 
@@ -826,9 +1586,9 @@ static int startProcessingRequest(Request * request, const char * url, const cha
 // END Main Handler Methods //
 //////////////////////////////
 
-///////////////////////////////////////
-// Low Level HTTP handling (Signpost //
-///////////////////////////////////////
+////////////////////////////////////////
+// Low Level HTTP handling (Signpost) //
+////////////////////////////////////////
 
 static int sendResponse(Request * request, int statusCode, Response * response, RAP * rapSession) {
 	if (response) {
@@ -866,7 +1626,7 @@ static int sendResponse(Request * request, int statusCode, Response * response, 
 		 * As it happens we know that the lock is no longer needed at the point we know we're sending a static
 		 * response becase locks don't apply to static responses... so we release it here.
 		 * It's counter-intuitive to put it here, but it works and I havn't found a better place to put it. */
-		if (rapSession->requestLockToken) unuseLock(rapSession->requestLockToken);
+		unuseSessionLocks(rapSession);
 
 		return MHD_queue_response(request, statusCode, response);
 	}
@@ -1048,7 +1808,8 @@ static int answerForwardToRequest(void *cls, Request *request, const char *url, 
 	}
 
 	size_t bufferSize = strlen(host) + strlen(url) + 10;
-	char * buffer = mallocSafe(bufferSize);
+	if (bufferSize > MAX_VARABLY_DEFINED_ARRAY) return RAP_RESPOND_URI_TOO_LARGE;
+	char buffer[bufferSize];
 	if ((daemon->forwardToIsEncrypted && daemon->forwardToPort == 443)
 			|| (!daemon->forwardToIsEncrypted && daemon->forwardToPort == 80)) {
 		// default ports
@@ -1064,9 +1825,9 @@ static int answerForwardToRequest(void *cls, Request *request, const char *url, 
 	return result;
 }
 
-///////////////////////////////////////////
-// End Low Level HTTP handling (Signpost //
-///////////////////////////////////////////
+////////////////////////////////////////////
+// End Low Level HTTP handling (Signpost) //
+////////////////////////////////////////////
 
 ////////////////////
 // Initialisation //

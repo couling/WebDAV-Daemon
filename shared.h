@@ -10,6 +10,7 @@
 #define RAP_CONTROL_SOCKET 3
 
 #define BUFFER_SIZE 40960
+#define MAX_VARABLY_DEFINED_ARRAY 40960
 
 typedef enum RapConstant {
 	RAP_REQUEST_AUTHENTICATE = 1,
@@ -43,7 +44,9 @@ typedef enum RapConstant {
 	RAP_RESPOND_ACCESS_DENIED = 403,
 	RAP_RESPOND_NOT_FOUND = 404,
 	RAP_RESPOND_CONFLICT = 409,
+	RAP_RESPOND_URI_TOO_LARGE = 414,
 	RAP_RESPOND_LOCKED = 423,
+	RAP_RESPOND_HEADER_TOO_LARGE = 431,
 	RAP_RESPOND_INTERNAL_ERROR = 500,
 	RAP_RESPOND_INSUFFICIENT_STORAGE = 507
 
@@ -82,8 +85,6 @@ typedef enum RapConstant {
 #define PARENT_SOCKET 0
 #define CHILD_SOCKET  1
 
-typedef char LockToken[37];
-
 #define LOCK_TOKEN_URN_PREFIX "urn:uuid:"
 #define LOCK_TOKEN_PREFIX "<urn:uuid:"
 #define LOCK_TOKEN_PREFIX_LENGTH (sizeof(LOCK_TOKEN_PREFIX) - 1)
@@ -91,9 +92,15 @@ typedef char LockToken[37];
 #define LOCK_TOKEN_LENGTH (LOCK_TOKEN_PREFIX_LENGTH + sizeof(LockToken) + sizeof(LOCK_TOKEN_SUFFIX))
 
 typedef enum LockType {
-	LOCK_TYPE_SHARED = LOCK_SH | LOCK_NB,
-	LOCK_TYPE_EXCLUSIVE = LOCK_EX | LOCK_NB
+	LOCK_TYPE_NONE = 0,
+	LOCK_TYPE_SHARED = LOCK_SH,
+	LOCK_TYPE_EXCLUSIVE = LOCK_EX
 } LockType;
+
+typedef struct LockProvisions {
+	LockType source;
+	LockType target;
+} LockProvisions;
 
 /*
  * #define QUOTE(name) #name
@@ -103,7 +110,8 @@ typedef enum LockType {
 
 void * mallocSafe(size_t size);
 void * reallocSafe(void * mem, size_t newSize);
-#define freeSafe(foo) /*stdLog("%p free(%s)", foo, QUOTE(foo) );*/ free(foo)
+//#define freeSafe(foo) /*stdLog("%p free(%s)", foo, QUOTE(foo) );*/ free(foo)
+void freeSafe(void * mem);
 char * copyString(const char * string);
 
 size_t timeNow(char * buf, size_t bufSize);
@@ -129,6 +137,9 @@ ssize_t sendMessage(int sock, Message * message);
 ssize_t recvMessage(int sock, Message * message, char * incomingBuffer, size_t incomingBufferSize);
 ssize_t sendRecvMessage(int sock, Message * message, char * incomingBuffer, size_t incomingBufferSize);
 
+#define makeMessageParam(primative,size) ((MessageParam) { .iov_base = (void *) primative, .iov_len = size })
+#define toMessageParam(primative) makeMessageParam(&(primative), sizeof(primative))
+#define messageParamTo(type,param) (*((type *) (param).iov_base))
 char * messageParamToString(MessageParam * iovec);
 MessageParam stringToMessageParam(const char * string);
 
