@@ -53,15 +53,13 @@ static ssize_t respond(RapConstant result) {
 	return sendMessage(RAP_CONTROL_SOCKET, &message);
 }
 
-static char * normalizeDirName(const char * file, size_t * filePathSize, int isDir) {
-	char * filePath = mallocSafe(*filePathSize + 2);
-	memcpy(filePath, file, *filePathSize + 1);
+static void normalizeDirName(char * buffer, const char * file, size_t * filePathSize, int isDir) {
+	memcpy(buffer, file, *filePathSize + 1);
 	if (isDir && file[*filePathSize - 1] != '/') {
-		filePath[*filePathSize] = '/';
-		filePath[*filePathSize + 1] = '\0';
+		buffer[*filePathSize] = '/';
+		buffer[*filePathSize + 1] = '\0';
 		(*filePathSize)++;
 	}
-	return filePath;
 }
 
 static size_t formatFileSize(char * buffer, size_t bufferSize, off_t size) {
@@ -636,9 +634,9 @@ static void writePropFindResponsePart(const char * fileName, const char * displa
 	//	xmlTextWriterWriteElementString(writer, PROPFIND_DISPLAY_NAME, displayName);
 	//}
 	if ((fileStat->st_mode & S_IFMT) == S_IFDIR) {
-		if (properties->availableBytes) {
-			struct statvfs fsStat;
-			if (!statvfs(fileName, &fsStat)) {
+		struct statvfs fsStat;
+		if ((properties->availableBytes || properties->usedBytes) && statvfs(fileName, &fsStat) != -1) {
+			if (properties->availableBytes) {
 				char buffer[100];
 				unsigned long long size = fsStat.f_bavail * fsStat.f_bsize;
 				snprintf(buffer, sizeof(buffer), "%llu", size);
@@ -649,15 +647,16 @@ static void writePropFindResponsePart(const char * fileName, const char * displa
 					xmlTextWriterWriteElementString(writer, "d", PROPFIND_USED_BYTES, buffer);
 				}
 			}
-		}
-		if (properties->usedBytes) {
-			struct statvfs fsStat;
-			if (!statvfs(fileName, &fsStat)) {
+			if (properties->usedBytes) {
 				char buffer[100];
 				unsigned long long size = (fsStat.f_blocks - fsStat.f_bfree) * fsStat.f_bsize;
 				snprintf(buffer, sizeof(buffer), "%llu", size);
 				xmlTextWriterWriteElementString(writer, "d", PROPFIND_USED_BYTES, buffer);
 			}
+			// When listing directories we only list this FS space in the directory not its children.
+			// It's not technically standards compliant but is is not likely to cause a problem in practice.
+			properties->availableBytes = 0;
+			properties->usedBytes = 0;
 		}
 		if (properties->windowsHidden) {
 			xmlTextWriterWriteElementString(writer, "z", PROPFIND_WINDOWS_ATTRIBUTES,
@@ -685,30 +684,43 @@ static void writePropFindResponsePart(const char * fileName, const char * displa
 
 }
 
-static int respondToPropFind(const char * file, PropertySet * properties, int depth) {
+static int respondToPropFind(const char * file, LockType lockProvided, PropertySet * properties, int depth) {
+	size_t fileNameSize = strlen(file);
+	size_t filePathSize = fileNameSize;
+	if (fileNameSize > MAX_VARABLY_DEFINED_ARRAY) {
+		stdLogError(0, "URI was too large to process %zd", fileNameSize);
+		return writeErrorResponse(RAP_RESPOND_URI_TOO_LARGE, "URI was too large to process", NULL, file);
+	}
+
 	struct stat fileStat;
-	if (stat(file, &fileStat)) {
+	int fd = open(file, O_RDONLY);
+	if (fd == -1 || fstat(fd, &fileStat) == -1
+			|| (lockProvided == LOCK_TYPE_NONE && flock(fd, LOCK_TYPE_SHARED) == -1)) {
+		if (fd != -1) close(fd);
 		int e = errno;
 		switch (e) {
 		case EACCES:
 			stdLogError(e, "PROPFIND access denied %s %s", authenticatedUser, file);
-			return respond(RAP_RESPOND_ACCESS_DENIED);
+			return writeErrorResponse(RAP_RESPOND_ACCESS_DENIED, strerror(e), NULL, file);
+		case EWOULDBLOCK:
+			stdLogError(e, "PROPFIND file locked %s %s", authenticatedUser, file);
+			return writeErrorResponse(RAP_RESPOND_LOCKED, strerror(e), NULL, file);
 		case ENOENT:
 		default:
 			stdLogError(e, "PROPFIND not found %s %s", authenticatedUser, file);
-			return respond(RAP_RESPOND_NOT_FOUND);
+			return writeErrorResponse(RAP_RESPOND_NOT_FOUND, strerror(e), NULL, file);
 		}
 	}
 
+	char filePath[fileNameSize];
+	normalizeDirName(filePath, file, &filePathSize, (fileStat.st_mode & S_IFMT) == S_IFDIR);
+
 	int pipeEnds[2];
 	if (pipe(pipeEnds)) {
+		close(fd);
 		stdLogError(errno, "Could not create pipe to write content");
 		return respond(RAP_RESPOND_INTERNAL_ERROR);
 	}
-
-	size_t fileNameSize = strlen(file);
-	size_t filePathSize = fileNameSize;
-	char * filePath = normalizeDirName(file, &filePathSize, (fileStat.st_mode & S_IFMT) == S_IFDIR);
 
 	const char * displayName = &file[fileNameSize - 2];
 	while (displayName >= file && *displayName != '/') {
@@ -727,6 +739,7 @@ static int respondToPropFind(const char * file, PropertySet * properties, int de
 	if (messageResult <= 0) {
 		freeSafe(filePath);
 		close(pipeEnds[PIPE_WRITE]);
+		close(fd);
 		return messageResult;
 	}
 
@@ -737,11 +750,11 @@ static int respondToPropFind(const char * file, PropertySet * properties, int de
 	xmlTextWriterStartElementNS(writer, "d", "multistatus", WEBDAV_NAMESPACE);
 	xmlTextWriterWriteAttribute(writer, "xmlns:z", MICROSOFT_NAMESPACE);
 	writePropFindResponsePart(filePath, displayName, properties, &fileStat, writer);
-	if (depth > 1 && (fileStat.st_mode & S_IFMT) == S_IFDIR && (dir = opendir(filePath))) {
+	if (depth > 1 && (fileStat.st_mode & S_IFMT) == S_IFDIR && (dir = fdopendir(fd))) {
 		struct dirent * dp;
 		char * childFileName = mallocSafe(filePathSize + 257);
 		size_t maxSize = 255;
-		strcpy(childFileName, filePath);
+		memcpy(childFileName, filePath, filePathSize);
 		while ((dp = readdir(dir)) != NULL) {
 			if (dp->d_name[0] != '.' || (dp->d_name[1] != '\0' && dp->d_name[1] != '.')
 					|| dp->d_name[2] != '\0') {
@@ -763,9 +776,11 @@ static int respondToPropFind(const char * file, PropertySet * properties, int de
 		closedir(dir);
 		freeSafe(childFileName);
 	}
+	else {
+		close(fd);
+	}
 	xmlTextWriterEndElement(writer);
 	xmlFreeTextWriter(writer);
-	freeSafe(filePath);
 	return messageResult;
 
 }
@@ -780,6 +795,7 @@ static ssize_t propfind(Message * requestMessage) {
 
 	char * file = messageParamToString(&requestMessage->params[RAP_PARAM_REQUEST_FILE]);
 	char * depthString = messageParamToString(&requestMessage->params[RAP_PARAM_REQUEST_DEPTH]);
+	LockProvisions lockProvisions = messageParamTo(LockProvisions, requestMessage->params[RAP_PARAM_REQUEST_LOCK]);
 	if (!depthString) depthString = "1";
 
 	PropertySet properties;
@@ -795,7 +811,7 @@ static ssize_t propfind(Message * requestMessage) {
 		}
 	}
 
-	return respondToPropFind(file, &properties, (strcmp("0", depthString) ? 2 : 1));
+	return respondToPropFind(file, lockProvisions.source, &properties, (strcmp("0", depthString) ? 2 : 1));
 }
 
 //////////////////
@@ -822,7 +838,7 @@ static ssize_t proppatch(Message * requestMessage) {
 		PropertySet p;
 		memset(&p, 1, sizeof(p));
 		const char * file = messageParamToString(&requestMessage->params[RAP_PARAM_REQUEST_FILE]);
-		return respondToPropFind(file, &p, 1);
+		return respondToPropFind(file, LOCK_TYPE_SHARED, &p, 1);
 
 	} else {
 		return respond(RAP_RESPOND_BAD_CLIENT_REQUEST);
@@ -1231,12 +1247,9 @@ static int compareDirent(const void * a, const void * b) {
 	return strcmp(lhs->d_name, rhs->d_name);
 }
 
-static void listDir(const char * file, int dirFd, int writeFd) {
+static void listDir(const char * fileName, int dirFd, int writeFd) {
 	DIR * dir = fdopendir(dirFd);
 	xmlTextWriterPtr writer = xmlNewFdTextWriter(writeFd);
-
-	size_t fileSize = strlen(file);
-	char * filePath = normalizeDirName(file, &fileSize, 1);
 
 	size_t entryCount = 0;
 	struct dirent ** directoryEntries = NULL;
@@ -1253,10 +1266,10 @@ static void listDir(const char * file, int dirFd, int writeFd) {
 
 	xmlTextWriterStartElement(writer, "html");
 	xmlTextWriterStartElement(writer, "head");
-	xmlTextWriterWriteElementString(writer, NULL, "title", filePath);
+	xmlTextWriterWriteElementString(writer, NULL, "title", fileName);
 	xmlTextWriterEndElement(writer);
 	xmlTextWriterStartElement(writer, "body");
-	xmlTextWriterWriteElementString(writer, NULL, "h1", filePath);
+	xmlTextWriterWriteElementString(writer, NULL, "h1", fileName);
 	xmlTextWriterStartElement(writer, "table");
 	xmlTextWriterWriteAttribute(writer, "cellpadding", "5");
 	xmlTextWriterWriteAttribute(writer, "cellspacing", "5");
@@ -1282,7 +1295,7 @@ static void listDir(const char * file, int dirFd, int writeFd) {
 			xmlTextWriterStartElement(writer, "td");
 			xmlTextWriterStartElement(writer, "a");
 			xmlTextWriterStartAttribute(writer, "href");
-			xmlTextWriterWriteURL(writer, filePath);
+			xmlTextWriterWriteURL(writer, fileName);
 			xmlTextWriterWriteURL(writer, dp->d_name);
 			if (dp->d_type == DT_DIR) xmlTextWriterWriteString(writer, "/");
 			xmlTextWriterEndAttribute(writer);
@@ -1314,7 +1327,6 @@ static void listDir(const char * file, int dirFd, int writeFd) {
 	xmlTextWriterEndElement(writer);
 	xmlTextWriterEndElement(writer);
 
-	freeSafe(filePath);
 	xmlFreeTextWriter(writer);
 	closedir(dir);
 	freeSafe(directoryEntries);
@@ -1343,6 +1355,15 @@ static ssize_t readFile(Message * requestMessage) {
 		struct stat statinfo;
 		fstat(fd, &statinfo);
 		if ((statinfo.st_mode & S_IFMT) == S_IFDIR) {
+			size_t fileNameSize = strlen(file);
+			if (fileNameSize > MAX_VARABLY_DEFINED_ARRAY) {
+				stdLogError(0, "URI was too large to process %zd", fileNameSize);
+				return writeErrorResponse(RAP_RESPOND_URI_TOO_LARGE, "URI was too large to process", NULL,
+						file);
+			}
+			char fileName[fileNameSize];
+			normalizeDirName(fileName, file, &fileNameSize, 1);
+
 			// we cant't lock a directory so we don't try to acquire a lock here.
 			int pipeEnds[2];
 			if (pipe(pipeEnds)) {
@@ -1365,7 +1386,7 @@ static ssize_t readFile(Message * requestMessage) {
 				return messageResult;
 			}
 
-			listDir(file, fd, pipeEnds[PIPE_WRITE]);
+			listDir(fileName, fd, pipeEnds[PIPE_WRITE]);
 			return messageResult;
 		} else {
 			// Check if we have the apropriate lock on this file.
@@ -1553,7 +1574,7 @@ int main(int argCount, char * args[]) {
 		case RAP_REQUEST_COPY: // TODO lock
 			ioResult = copyFile(&message);
 			break;
-		case RAP_REQUEST_PROPFIND: // TODO lock
+		case RAP_REQUEST_PROPFIND:
 			ioResult = propfind(&message);
 			break;
 		case RAP_REQUEST_PROPPATCH: // TODO lock

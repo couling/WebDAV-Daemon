@@ -18,16 +18,14 @@ size_t getWebDate(time_t rawtime, char * buf, size_t bufSize) {
 }
 
 size_t getLocalDate(time_t rawtime, char * buf, size_t bufSize) {
-	struct tm * timeinfo = gmtime(&rawtime);
-	return strftime(buf, bufSize, "%a %b %d %H:%M:%S %Y", timeinfo);
+	struct tm * timeinfo = localtime(&rawtime);
+	return strftime(buf, bufSize, "%b %d %Y %H:%M:%S", timeinfo);
 }
 
 size_t timeNow(char * buf, size_t bufSize) {
 	time_t rawtime;
 	time(&rawtime);
-	struct tm * timeinfo;
-	timeinfo = localtime(&rawtime);
-	return strftime(buf, bufSize, "%a %b %d %H:%M:%S %Y", timeinfo);
+	return getLocalDate(rawtime, buf, bufSize);
 }
 
 void stdLog(const char * str, ...) {

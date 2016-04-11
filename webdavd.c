@@ -1,5 +1,3 @@
-// TODO check into what happens when a connection is closed early during upload.
-// TODO prevent PUT clobbering files.
 // TODO accept suggested timeout values from clients during LOCK requests
 
 #include "shared.h"
@@ -981,10 +979,9 @@ static int releaseLock(const char * lockToken, const char * file, const char * u
 	strncpy((char *) toFind.lockToken, lockToken + LOCK_TOKEN_PREFIX_LENGTH, sizeof(toFind.lockToken) - 1);
 	toFind.lockToken[sizeof(toFind.lockToken) - 1] = '\0';
 
-	// TODO better return values to distinguish between internal error and non-existant lock
 	if (sem_wait(&lockDBLock) == -1) {
 		stdLogError(errno, "Could not wait for access to lock db");
-		return 0;
+		return -1;
 	}
 	Lock * foundLock = findLock(&toFind);
 	if (foundLock != NULL && !strcmp(foundLock->user, user) && !strcmp(foundLock->file, file)
@@ -1223,9 +1220,7 @@ static Response * createFdResponse(int fd, uint64_t offset, uint64_t size, const
 	return response;
 }
 
-static Response * createFileResponse(Request *request, const char * fileName, const char * mimeType,
-		RAP * session) {
-
+static Response * createFileResponse(const char * fileName, const char * mimeType, RAP * session) {
 	int fd = open(fileName, O_RDONLY | O_CLOEXEC);
 	if (fd == -1) {
 		stdLogError(errno, "Could not open file for response", fileName);
@@ -1284,40 +1279,45 @@ static int processRangeHeader(off_t * offset, size_t * fileSize, const char *ran
 	return 1;
 }
 
-static int createResponseFromMessage(Request *request, struct Message * message, Response ** response,
+static int createResponseFromMessage(Request * request, Message * message, Response ** response,
 		RAP * session) {
-	// Queue the response
-	switch (message->mID) {
-	case RAP_RESPOND_CONTINUE:
-	case RAP_RESPOND_OK_NO_CONTENT:
-	case RAP_RESPOND_CREATED:
-	case RAP_RESPOND_INTERNAL_ERROR:
-		// There is no response body to set for these codes
-		// They will be handled elswehere.
-		if (message->fd != -1) {
-			close(message->fd);
-		}
-		return message->mID;
+	int statusCode = message->mID;
 
-	case RAP_RESPOND_MULTISTATUS:
-	case RAP_RESPOND_LOCKED: {
-		const char * mimeType = messageParamToString(&message->params[RAP_PARAM_REQUEST_FILE]);
-		time_t date = messageParamTo(time_t, message->params[RAP_PARAM_RESPONSE_DATE]);
+	if (statusCode == RAP_RESPOND_CONTINUE) return RAP_RESPOND_CONTINUE;
 
-		if (message->fd == -1) {
-			return MHD_HTTP_INTERNAL_SERVER_ERROR;
-		}
-
-		*response = createFdResponse(message->fd, 0, -1, mimeType, date, session);
-		return message->mID;
+	if (statusCode < RAP_RESPOND_CONTINUE || statusCode >= 600) {
+		if (message->fd != -1) close(message->fd);
+		stdLogError(0, "Response from RAP %d", (int) message->mID);
+		return RAP_RESPOND_INTERNAL_ERROR;
 	}
 
-	case RAP_RESPOND_OK: {
-		if (message->fd == -1) {
-			return RAP_RESPOND_OK_NO_CONTENT;
-		}
+	if (message->fd == -1) {
+		switch (statusCode) {
+		case RAP_RESPOND_OK:
+			statusCode = RAP_RESPOND_OK_NO_CONTENT;
+			break;
 
-		int statusCode = message->mID;
+		case RAP_RESPOND_ACCESS_DENIED:
+			*response = createFileResponse(FORBIDDEN_PAGE, "text/html", session);
+			break;
+
+		case RAP_RESPOND_NOT_FOUND:
+			*response = createFileResponse(NOT_FOUND_PAGE, "text/html", session);
+			break;
+
+		case RAP_RESPOND_BAD_CLIENT_REQUEST:
+			*response = createFileResponse(BAD_REQUEST_PAGE, "text/html", session);
+			break;
+
+		case RAP_RESPOND_INSUFFICIENT_STORAGE:
+			*response = createFileResponse(INSUFFICIENT_STORAGE_PAGE, "text/html", session);
+			break;
+
+		case RAP_RESPOND_CONFLICT:
+			*response = createFileResponse(CONFLICT_PAGE, "text/html", session);
+			break;
+		}
+	} else {
 		// Get Mime type and date
 		const char * mimeType = messageParamToString(&message->params[RAP_PARAM_REQUEST_FILE]);
 		time_t date = messageParamTo(time_t, message->params[RAP_PARAM_RESPONSE_DATE]);
@@ -1325,56 +1325,44 @@ static int createResponseFromMessage(Request *request, struct Message * message,
 		struct stat stat;
 		fstat(message->fd, &stat);
 		if ((stat.st_mode & S_IFMT) == S_IFREG) {
-			off_t offset = 0;
-			size_t fileSize = stat.st_size;
-			const char * rangeHeader = getHeader(request, "Range");
-			if (rangeHeader && processRangeHeader(&offset, &fileSize, rangeHeader)) {
-				statusCode = MHD_HTTP_PARTIAL_CONTENT;
+			if (statusCode == 200) {
+				off_t offset = 0;
+				size_t fileSize = stat.st_size;
+				if (request) {
+					const char * rangeHeader = getHeader(request, "Range");
+					if (rangeHeader && processRangeHeader(&offset, &fileSize, rangeHeader)) {
+						statusCode = MHD_HTTP_PARTIAL_CONTENT;
+					}
+				}
+				*response = createFdResponse(message->fd, offset, fileSize, mimeType, date, session);
+
+				char contentRangeHeader[200];
+				snprintf(contentRangeHeader, sizeof(contentRangeHeader), "bytes %lld-%lld/%lld",
+						(long long) offset, (long long) (fileSize + offset), (long long) stat.st_size);
+
+				addHeader(*response, "Content-Range", contentRangeHeader);
+			} else {
+				*response = createFdResponse(message->fd, 0, stat.st_size, mimeType, date, session);
 			}
-			*response = createFdResponse(message->fd, offset, fileSize, mimeType, date, session);
-
-			char contentRangeHeader[200];
-			snprintf(contentRangeHeader, sizeof(contentRangeHeader), "bytes %lld-%lld/%lld",
-					(long long) offset, (long long) (fileSize + offset), (long long) stat.st_size);
-
-			addHeader(*response, "Content-Range", contentRangeHeader);
 		} else {
 			*response = createFdResponse(message->fd, 0, -1, mimeType, date, session);
 		}
-
-		if (message->paramCount > RAP_PARAM_RESPONSE_LOCATION) {
-			addHeader(*response, "Location",
-					messageParamToString(&message->params[RAP_PARAM_RESPONSE_LOCATION]));
-		}
-
-		return statusCode;
 	}
+	return statusCode;
+}
 
-	case RAP_RESPOND_ACCESS_DENIED:
-		*response = createFileResponse(request, FORBIDDEN_PAGE, "text/html", session);
-		return RAP_RESPOND_ACCESS_DENIED;
-
-	case RAP_RESPOND_NOT_FOUND:
-		*response = createFileResponse(request, NOT_FOUND_PAGE, "text/html", session);
-		return RAP_RESPOND_NOT_FOUND;
-
-	case RAP_RESPOND_BAD_CLIENT_REQUEST:
-		*response = createFileResponse(request, BAD_REQUEST_PAGE, "text/html", session);
-		return RAP_RESPOND_BAD_CLIENT_REQUEST;
-
-	case RAP_RESPOND_INSUFFICIENT_STORAGE:
-		*response = createFileResponse(request, INSUFFICIENT_STORAGE_PAGE, "text/html", session);
-		return RAP_RESPOND_INSUFFICIENT_STORAGE;
-
-	case RAP_RESPOND_CONFLICT:
-		*response = createFileResponse(request, CONFLICT_PAGE, "text/html", session);
-		return RAP_RESPOND_CONFLICT;
-
-	default:
-		stdLogError(0, "Response from RAP %d", (int) message->mID);
+static RapConstant writeErrorResponse(RapConstant responseCode, const char * textError, const char * error,
+		const char * file, RAP * session, Response ** response) {
+	Message message = { .mID = responseCode, .fd = -1, .paramCount = 2 };
+	message.params[RAP_PARAM_ERROR_LOCATION] = stringToMessageParam(file);
+	message.params[RAP_PARAM_ERROR_DAV_REASON] = stringToMessageParam(error);
+	message.params[RAP_PARAM_ERROR_REASON] = stringToMessageParam(textError);
+	char buffer[BUFFER_SIZE];
+	if (sendRecvMessage(session->socketFd, &message, buffer, BUFFER_SIZE) <= 0) {
 		return RAP_RESPOND_INTERNAL_ERROR;
+	} else {
+		return createResponseFromMessage(NULL, &message, response, session);
 	}
-
 }
 
 ///////////////////////////
@@ -1404,6 +1392,7 @@ static int finishProcessingRequest(Request * request, RAP * processor, Response 
 		LockType lockType = messageParamTo(LockType, message.params[RAP_PARAM_LOCK_TYPE]);
 		lock = acquireLock(processor->user, location, lockType, message.fd);
 		if (!lock) return RAP_RESPOND_INTERNAL_ERROR;
+
 		goto COMPLETE_LOCK;
 	}
 	case RAP_INTERIM_RESPOND_RELOCK:
@@ -1446,8 +1435,8 @@ static int startProcessingRequest(Request * request, const char * url, const cha
 	rapSession->requestLockCount = 0;
 	LockProvisions requestLocks = { .source = LOCK_TYPE_NONE, .target = LOCK_TYPE_NONE };
 	if (!useSessionLocks(rapSession, request, url)) {
-		// TODO correct error response (conflict?)
-		return RAP_RESPOND_INTERNAL_ERROR;
+		return writeErrorResponse(RAP_RESPOND_CONFLICT, "Lock token not found", NULL, url, rapSession,
+				response);
 	}
 
 	for (int i = 0; i < rapSession->requestLockCount; i++) {
@@ -1541,9 +1530,10 @@ static int startProcessingRequest(Request * request, const char * url, const cha
 
 	} else if (!strcmp("UNLOCK", method)) {
 		const char * lockToken = getHeader(request, HEADER_LOCK_TOKEN);
-		if (releaseLock(lockToken, url, rapSession->user)) {
+		int result = releaseLock(lockToken, url, rapSession->user);
+		if (result == 1) {
 			return RAP_RESPOND_OK_NO_CONTENT;
-		} else {
+		} else if (result == 0) {
 			message.mID = RAP_RESPOND_CONFLICT;
 			message.paramCount = 3;
 			message.params[RAP_PARAM_ERROR_LOCATION] = stringToMessageParam(url);
@@ -1556,9 +1546,11 @@ static int startProcessingRequest(Request * request, const char * url, const cha
 			}
 
 			return createResponseFromMessage(request, &message, response, rapSession);
+		} else {
+			return RAP_RESPOND_INTERNAL_ERROR;
 		}
 	} else if (!strcmp("OPTIONS", method)) {
-		*response = createFileResponse(request, OPTIONS_PAGE, "text/html", rapSession);
+		*response = createFileResponse(OPTIONS_PAGE, "text/html", rapSession);
 		addHeader(*response, "Accept", ACCEPT_HEADER);
 		return RAP_RESPOND_OK;
 
