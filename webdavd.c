@@ -1926,6 +1926,10 @@ void cleaner() {
 }
 
 static void runServer() {
+	if (!lockToUser(config.restrictedUser)) {
+		exit(1);
+	}
+
 	initializeLogs();
 	initializeStaticResponses();
 	initializeRapDatabase();

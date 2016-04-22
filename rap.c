@@ -20,6 +20,8 @@
 #define NEW_FILE_PERMISSIONS 0666
 #define NEW_DIR_PREMISSIONS  0777
 
+#define IS_DIR_CHILD(name) ((name)[0] != '.' || ((name)[1] != '\0' && ((name)[1] != '.' || (name)[2] != '\0')))
+
 typedef struct MimeType {
 	const char * fileExtension;
 	const char * type;
@@ -755,8 +757,7 @@ static int respondToPropFind(const char * file, LockType lockProvided, PropertyS
 		size_t maxSize = 255;
 		memcpy(childFileName, filePath, filePathSize);
 		while ((dp = readdir(dir)) != NULL) {
-			if (dp->d_name[0] != '.' || (dp->d_name[1] != '\0' && dp->d_name[1] != '.')
-					|| dp->d_name[2] != '\0') {
+			if (IS_DIR_CHILD(dp->d_name)) {
 				size_t nameSize = strlen(dp->d_name);
 				if (nameSize > maxSize) {
 					childFileName = reallocSafe(childFileName, filePathSize + nameSize + 2);
@@ -822,7 +823,6 @@ static ssize_t propfind(Message * requestMessage) {
 ///////////////
 
 static ssize_t proppatch(Message * requestMessage) {
-	// TODO Need to actually implement something here
 	if (requestMessage->fd != -1) {
 		respond(RAP_RESPOND_CONTINUE);
 		char buffer[BUFFER_SIZE];
@@ -889,43 +889,17 @@ static ssize_t mkcol(Message * requestMessage) {
 //////////
 
 typedef struct FileCopyData {
+	struct FileCopyData * next;
 	const char * source;
 	const char * target;
 	size_t sourceNameLength;
 	size_t targetNameLength;
-	struct FileCopyData * next;
 	int type;
-
 } FileCopyData;
 
-static void pushFileCopyDataChild(const FileCopyData * toCopy, const char * child, FileCopyData ** copied) {
-	size_t childNameLength = strlen(child);
-	FileCopyData * childToCopy = mallocSafe(
-			sizeof(FileCopyData) + toCopy->sourceNameLength + childNameLength + toCopy->targetNameLength
-					+ childNameLength + 2);
-
-	// store the source right after the structure
-	size_t size = toCopy->sourceNameLength + childNameLength + 1;
-	char * ptr = (char *) (childToCopy + 1);
-	memcpy(ptr, toCopy->source, toCopy->sourceNameLength);
-	ptr[toCopy->sourceNameLength - 1] = '/';
-	memcpy(ptr + toCopy->sourceNameLength, child, childNameLength + 1);
-	childToCopy->source = ptr;
-	childToCopy->sourceNameLength = size;
-
-	size = toCopy->targetNameLength + childNameLength + 1;
-	ptr += childToCopy->sourceNameLength;
-	memcpy(ptr, toCopy->target, toCopy->targetNameLength);
-	ptr[toCopy->targetNameLength - 1] = '/';
-	memcpy(ptr + toCopy->targetNameLength, child, childNameLength + 1);
-	childToCopy->target = ptr;
-	childToCopy->targetNameLength = size;
-
-	childToCopy->next = *copied;
-	*copied = childToCopy;
-}
-
-static void deleteDestFiles(FileCopyData * files) {
+static ssize_t copyErrorCleanup(FileCopyData * files, const char * action, const char * source,
+		const char * target) {
+	int e = errno;
 	while (files) {
 		if (files->type == S_IFDIR) rmdir(files->target);
 		else unlink(files->target);
@@ -933,13 +907,29 @@ static void deleteDestFiles(FileCopyData * files) {
 		freeSafe(files);
 		files = next;
 	}
+
+	stdLogError(e, "Could not %s file %s to %s", action, source, target);
+	switch (e) {
+	case EPERM:
+	case EACCES:
+		return writeErrorResponse(RAP_RESPOND_ACCESS_DENIED, strerror(e), NULL, source);
+	case ENOSPC:
+	case EDQUOT:
+		return writeErrorResponse(RAP_RESPOND_INSUFFICIENT_STORAGE, strerror(e), NULL, source);
+	case ENOENT:
+	case ENOTDIR:
+		return writeErrorResponse(RAP_RESPOND_NOT_FOUND, strerror(e), NULL, source);
+	default:
+		return writeErrorResponse(RAP_RESPOND_CONFLICT, strerror(e), NULL, source);
+
+	}
 }
 
 // Copies the head of the copied list and pushes more onto this is a direcory.
 // If the copy fails the item is popped of the head of the list
 // If the copy succeeds and is a file then the list is unchanged except that ->type will be set.
 // If the copy succeeds and is a directory then copied child members are added to the head.
-static int copyFileRecusive(FileCopyData ** copied) {
+static int copyFileRecursive(FileCopyData ** copied) {
 // We are given the file to copy at the head of the "copied" list.
 	FileCopyData * toCopy = *copied;
 	struct stat fileStat;
@@ -965,6 +955,7 @@ static int copyFileRecusive(FileCopyData ** copied) {
 		close(oldFd);
 		close(newFd);
 		if (bytesRead != 0) return 0;
+		chmod(toCopy->target, mode);
 		break;
 	}
 
@@ -975,16 +966,40 @@ static int copyFileRecusive(FileCopyData ** copied) {
 			DIR * dir = opendir(toCopy->source);
 			if (!dir) return 0;
 			for (struct dirent * entry = readdir(dir); entry; entry = readdir(dir)) {
-				if (entry->d_name[0] == '.'
-						&& (entry->d_name[1] == '\0' || (entry->d_name[1] == '.' || entry->d_name[2] == '\0')))
-					continue;
-				pushFileCopyDataChild(toCopy, entry->d_name, copied);
-				if (!copyFileRecusive(copied)) {
+				if (!IS_DIR_CHILD(entry->d_name)) continue;
+
+				size_t childNameLength = strlen(entry->d_name);
+				FileCopyData * childToCopy = mallocSafe(
+						sizeof(FileCopyData) + toCopy->sourceNameLength + childNameLength
+								+ toCopy->targetNameLength + childNameLength + 2);
+
+				// store the source right after the structure
+				size_t size = toCopy->sourceNameLength + childNameLength + 1;
+				char * ptr = (char *) (childToCopy + 1);
+				memcpy(ptr, toCopy->source, toCopy->sourceNameLength);
+				ptr[toCopy->sourceNameLength - 1] = '/';
+				memcpy(ptr + toCopy->sourceNameLength, entry->d_name, childNameLength + 1);
+				childToCopy->source = ptr;
+				childToCopy->sourceNameLength = size;
+
+				size = toCopy->targetNameLength + childNameLength + 1;
+				ptr += childToCopy->sourceNameLength;
+				memcpy(ptr, toCopy->target, toCopy->targetNameLength);
+				ptr[toCopy->targetNameLength - 1] = '/';
+				memcpy(ptr + toCopy->targetNameLength, entry->d_name, childNameLength + 1);
+				childToCopy->target = ptr;
+				childToCopy->targetNameLength = size;
+
+				childToCopy->next = *copied;
+				*copied = childToCopy;
+
+				if (!copyFileRecursive(copied)) {
 					closedir(dir);
 					return 0;
 				}
 			}
 			closedir(dir);
+			chmod(toCopy->target, mode);
 			break;
 		}
 	}
@@ -1002,6 +1017,7 @@ static int copyFileRecusive(FileCopyData ** copied) {
 		if (mkfifo(toCopy->target, 0600) == -1) {
 			goto error_exit;
 		}
+		chmod(toCopy->target, mode);
 		break;
 	}
 
@@ -1010,11 +1026,10 @@ static int copyFileRecusive(FileCopyData ** copied) {
 	case S_IFCHR:
 	case S_IFSOCK:
 	default:
-		stdLogError(0, "Could not copy file type %d for file %s", toCopy->type, toCopy->source);
+		errno = ENOTSUP;
 		goto error_exit;
 	}
 
-	chmod(toCopy->target, mode); // TODO skip this for links
 	lchown(toCopy->target, fileStat.st_uid, fileStat.st_gid);
 	return 1;
 
@@ -1039,10 +1054,10 @@ static ssize_t copyFile(Message * requestMessage) {
 	FileCopyData * copied = mallocSafe(sizeof(FileCopyData));
 	copied->source = source;
 	copied->target = target;
-	copied->sourceNameLength = requestMessage->params[RAP_PARAM_REQUEST_FILE].iov_len;
-	copied->targetNameLength = requestMessage->params[RAP_PARAM_REQUEST_TARGET].iov_len;
+	copied->sourceNameLength = messageParamSize(requestMessage->params[RAP_PARAM_REQUEST_FILE]);
+	copied->targetNameLength = messageParamSize(requestMessage->params[RAP_PARAM_REQUEST_TARGET]);
 	copied->next = NULL;
-	if (copyFileRecusive(&copied)) {
+	if (copyFileRecursive(&copied)) {
 		while (copied) {
 			FileCopyData * next = copied->next;
 			freeSafe(copied);
@@ -1050,22 +1065,7 @@ static ssize_t copyFile(Message * requestMessage) {
 		}
 		return respond(RAP_RESPOND_CREATED);
 	} else {
-		deleteDestFiles(copied);
-		int e = errno;
-		switch (e) {
-		case EPERM:
-		case EACCES:
-			return writeErrorResponse(RAP_RESPOND_ACCESS_DENIED, strerror(e), NULL, source);
-		case ENOSPC:
-		case EDQUOT:
-			return writeErrorResponse(RAP_RESPOND_INSUFFICIENT_STORAGE, strerror(e), NULL, source);
-		case ENOENT:
-		case ENOTDIR:
-			return writeErrorResponse(RAP_RESPOND_NOT_FOUND, strerror(e), NULL, source);
-		default:
-			return writeErrorResponse(RAP_RESPOND_CONFLICT, strerror(e), NULL, source);
-
-		}
+		return copyErrorCleanup(copied, "copy", source, target);
 	}
 
 }
@@ -1097,10 +1097,13 @@ static ssize_t moveFile(Message * requestMessage) {
 			FileCopyData * copiedFiles = mallocSafe(sizeof(FileCopyData));
 			copiedFiles->source = sourceFile;
 			copiedFiles->target = targetFile;
-			copiedFiles->sourceNameLength = requestMessage->params[RAP_PARAM_REQUEST_FILE].iov_len;
-			copiedFiles->targetNameLength = requestMessage->params[RAP_PARAM_REQUEST_TARGET].iov_len;
+			copiedFiles->sourceNameLength = messageParamSize(requestMessage->params[RAP_PARAM_REQUEST_FILE]);
+			copiedFiles->targetNameLength = messageParamSize(
+					requestMessage->params[RAP_PARAM_REQUEST_TARGET]);
 			copiedFiles->next = NULL;
-			if (!copyFileRecusive(&copiedFiles)) goto error_exit;
+			if (!copyFileRecursive(&copiedFiles)) {
+				return copyErrorCleanup(copiedFiles, "move", sourceFile, targetFile);
+			}
 			while (copiedFiles) {
 				if (copiedFiles->type == S_IFDIR) rmdir(copiedFiles->source);
 				else unlink(copiedFiles->source);
@@ -1109,30 +1112,11 @@ static ssize_t moveFile(Message * requestMessage) {
 				copiedFiles = next;
 			}
 		} else {
-			goto error_exit;
+			return copyErrorCleanup(copiedFiles, "move", sourceFile, targetFile);
 		}
 	}
 
 	return respond(RAP_RESPOND_OK_NO_CONTENT);
-
-	error_exit: {
-		if (copiedFiles) deleteDestFiles(copiedFiles);
-		int e = errno;
-		stdLogError(e, "Could not move file %s to %s", sourceFile, targetFile);
-		switch (e) {
-		case EPERM:
-		case EACCES:
-			return writeErrorResponse(RAP_RESPOND_ACCESS_DENIED, strerror(e), NULL, sourceFile);
-		case ENOSPC:
-		case EDQUOT:
-			return writeErrorResponse(RAP_RESPOND_INSUFFICIENT_STORAGE, strerror(e), NULL, sourceFile);
-		case ENOENT:
-		case ENOTDIR:
-			return writeErrorResponse(RAP_RESPOND_NOT_FOUND, strerror(e), NULL, sourceFile);
-		default:
-			return writeErrorResponse(RAP_RESPOND_CONFLICT, strerror(e), NULL, sourceFile);
-		}
-	}
 
 }
 
@@ -1144,8 +1128,47 @@ static ssize_t moveFile(Message * requestMessage) {
 // DELETE //
 ////////////
 
+static ssize_t deleteFileRecursive(int fd, const char * file) {
+	DIR * dir = fdopendir(fd);
+	struct dirent * dp;
+	while ((dp = readdir(dir)) != NULL) {
+		if (IS_DIR_CHILD(dp->d_name)) {
+			int childFd = openat(fd, dp->d_name, O_RDONLY);
+			if (childFd == -1) goto respond_error;
+			struct stat fileStat;
+			fstat(childFd, &fileStat);
+			// TODO lock
+			if ((fileStat.st_mode & S_IFMT) == S_IFDIR) {
+				deleteFileRecursive(childFd, file);
+			} else {
+				close(childFd);
+			}
+			if (!unlinkat(fd, dp->d_name, AT_REMOVEDIR)) goto respond_error;
+		}
+	}
+	closedir(dir);
+
+	return 0;
+
+	respond_error: {
+		int e = errno;
+		closedir(dir);
+		stdLogError(e, "Could not delete file %s", file);
+		if (fd != -1) close(fd);
+		switch (e) {
+		case EACCES:
+		case EPERM:
+			return writeErrorResponse(RAP_RESPOND_ACCESS_DENIED, strerror(e), NULL, file);
+		case ENOTDIR:
+		case ENOENT:
+			return writeErrorResponse(RAP_RESPOND_NOT_FOUND, strerror(e), NULL, file);
+		default:
+			return writeErrorResponse(RAP_RESPOND_INTERNAL_ERROR, strerror(e), NULL, file);
+		}
+	}
+}
+
 static ssize_t deleteFile(Message * requestMessage) {
-	// TODO allow deleting directories
 	if (requestMessage->fd != -1) {
 		// stdLogError(0, "MKCOL request sent incoming data!");
 		close(requestMessage->fd);
@@ -1153,14 +1176,15 @@ static ssize_t deleteFile(Message * requestMessage) {
 
 	const char * file = messageParamToString(&requestMessage->params[RAP_PARAM_REQUEST_FILE]);
 
-	int fd = open(file, O_WRONLY);
+	int fd = open(file, O_RDONLY);
 	if (fd == -1) goto respond_error;
 
 	struct stat fileStat;
 	if (fstat(fd, &fileStat) == -1) goto respond_error;
-	if ((fileStat.st_mode & S_IFMT) != S_IFDIR) {
-		if (rmdir(file) == -1) goto respond_error;
-		close(fd);
+	if ((fileStat.st_mode & S_IFMT) == S_IFDIR) {
+		ssize_t result = deleteFileRecursive(fd, file);
+		fd = -1;
+		if (result != 0 || rmdir(file) == -1) goto respond_error;
 	} else {
 		// Check if we have the apropriate lock on this file.
 		LockProvisions locks = messageParamTo(LockProvisions, requestMessage->params[RAP_PARAM_REQUEST_LOCK]);
@@ -1169,9 +1193,8 @@ static ssize_t deleteFile(Message * requestMessage) {
 			if (flock(fd, LOCK_TYPE_EXCLUSIVE | LOCK_NB) == -1) {
 				close(fd);
 				int e = errno;
-				const char * etxt = strerror(e);
 				stdLogError(e, "Could not delete locked file %s", file);
-				return writeErrorResponse(RAP_RESPOND_LOCKED, etxt, "lock-token-submitted", file);
+				return writeErrorResponse(RAP_RESPOND_LOCKED, strerror(e), "lock-token-submitted", file);
 			}
 		}
 		if (unlink(file) == -1) goto respond_error;

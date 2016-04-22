@@ -25,7 +25,6 @@ typedef struct SSLConfig {
 } SSLConfig;
 
 typedef struct WebdavdConfiguration {
-	// TODO restrict to user
 	const char * restrictedUser;
 
 	// Daemons

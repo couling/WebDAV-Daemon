@@ -352,6 +352,9 @@ static int configureServer(WebdavdConfiguration * config, xmlTextReaderPtr reade
 	if (!config->maxLockTime) {
 		config->maxLockTime = 60;
 	}
+	if (!config->restrictedUser) {
+		config->restrictedUser = "root";
+	}
 
 	return result;
 }

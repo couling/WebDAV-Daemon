@@ -142,6 +142,7 @@ ssize_t sendRecvMessage(int sock, Message * message, char * incomingBuffer, size
 #define messageParamTo(type,param) (*((type *) (param).iov_base))
 char * messageParamToString(MessageParam * iovec);
 MessageParam stringToMessageParam(const char * string);
+#define messageParamSize(param) ((param).iov_len)
 
 int lockToUser(const char * user);
 
