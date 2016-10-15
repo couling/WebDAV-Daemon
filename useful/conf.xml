@@ -2,7 +2,7 @@
 <server-config xmlns="http://couling.me/webdavd">
 	<server>
 		<listen>
-			<port>80</port>
+			<port>8080</port>
 			<encryption>none</encryption>
 		</listen>
 		<listen>

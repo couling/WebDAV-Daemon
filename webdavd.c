@@ -39,6 +39,9 @@ typedef struct Lock {
 	LockToken lockToken;
 } Lock;
 
+typedef struct MHD_Connection Request;
+typedef struct MHD_Response Response;
+
 typedef struct RAP {
 	// Managed by create / destroy RAP
 	int pid;
@@ -57,6 +60,7 @@ typedef struct RAP {
 	int requestWriteDataFd; // Should be closed by uploadComplete()
 	int requestReadDataFd;  // Should be closed by processNewRequest() when sent to the RAP.
 	int requestResponseAlreadyGiven;
+	Response * requestResponseObjectAlreadyGiven;
 	int requestLockCount;
 	Lock * requestLock[MAX_SESSION_LOCKS];
 
@@ -78,9 +82,6 @@ typedef struct SSLCertificate {
 	gnutls_privkey_t key;
 } SSLCertificate;
 
-typedef struct MHD_Connection Request;
-typedef struct MHD_Response Response;
-
 typedef struct FDResponseData {
 	int fd;
 	off_t pos;
@@ -100,7 +101,7 @@ static const RAP AUTH_FAILED_RAP = {
 		.user = "<auth failed>",
 		.requestWriteDataFd = -1,
 		.requestReadDataFd = -1,
-		.requestResponseAlreadyGiven = 403,
+		.requestResponseAlreadyGiven = 401,
 		.requestLockCount = 0,
 		.next = NULL,
 		.prevPtr = NULL };
@@ -1672,27 +1673,23 @@ static int answerToRequest(void *cls, Request *request, const char *url, const c
 				close(rapSession->requestWriteDataFd);
 				rapSession->requestWriteDataFd = -1;
 			}
+			Response * response;
+			int statusCode;
+
 			if (rapSession->requestResponseAlreadyGiven) {
-				if (rapSession->requestResponseAlreadyGiven == RAP_RESPOND_INTERNAL_ERROR) {
-					// internal errors can screw with RAPs or mean the RAP is already screwed.
-					// Get rid of it just in case
-					destroyRap(rapSession);
-				} else {
-					releaseRap(rapSession);
-				}
-				return MHD_YES;
+				statusCode = rapSession->requestResponseAlreadyGiven;
+				response = rapSession->requestResponseObjectAlreadyGiven;
 			} else {
-				Response * response;
-				int statusCode = finishProcessingRequest(request, rapSession, &response);
+				statusCode = finishProcessingRequest(request, rapSession, &response);
 				logAccess(statusCode, method, rapSession->user, url, rapSession->clientIp);
-				int result = sendResponse(request, statusCode, response, rapSession);
-				if (statusCode == RAP_RESPOND_INTERNAL_ERROR) {
-					destroyRap(rapSession);
-				} else if (AUTH_SUCCESS(rapSession)) {
-					releaseRap(rapSession);
-				}
-				return result;
 			}
+			int result = sendResponse(request, statusCode, response, rapSession);
+			if (statusCode == RAP_RESPOND_INTERNAL_ERROR) {
+				destroyRap(rapSession);
+			} else if (AUTH_SUCCESS(rapSession)) {
+				releaseRap(rapSession);
+			}
+			return result;
 		}
 	} else {
 		// All requests must be Authenticated
@@ -1710,9 +1707,10 @@ static int answerToRequest(void *cls, Request *request, const char *url, const c
 				int pipeEnds[2];
 				if (socketpair(PF_LOCAL, SOCK_STREAM | SOCK_CLOEXEC, 0, pipeEnds)) {
 					stdLogError(errno, "Could not create write pipe");
-					logAccess(RAP_RESPOND_INTERNAL_ERROR, method, rapSession->user, url,
-							rapSession->clientIp);
-					return sendResponse(request, RAP_RESPOND_INTERNAL_ERROR, NULL, rapSession);
+					rapSession->requestResponseAlreadyGiven = RAP_RESPOND_INTERNAL_ERROR;
+					rapSession->requestResponseObjectAlreadyGiven = NULL;
+					logAccess(RAP_RESPOND_INTERNAL_ERROR, method, rapSession->user, url, clientIp);
+					return MHD_YES;
 				}
 				rapSession->requestReadDataFd = pipeEnds[CHILD_SOCKET];
 				rapSession->requestWriteDataFd = pipeEnds[PARENT_SOCKET];
@@ -1736,8 +1734,9 @@ static int answerToRequest(void *cls, Request *request, const char *url, const c
 						rapSession->requestWriteDataFd = -1;
 					}
 					rapSession->requestResponseAlreadyGiven = statusCode;
-					logAccess(statusCode, method, rapSession->user, url, rapSession->clientIp);
-					return sendResponse(request, statusCode, response, rapSession);
+					rapSession->requestResponseObjectAlreadyGiven = response;
+					logAccess(RAP_RESPOND_INTERNAL_ERROR, method, rapSession->user, url, clientIp);
+					return MHD_YES;
 				}
 			} else {
 				rapSession->requestReadDataFd = -1;
@@ -1769,10 +1768,18 @@ static int answerToRequest(void *cls, Request *request, const char *url, const c
 			}
 		} else if (rapSession == AUTH_FAILED) {
 			logAccess(RAP_RESPOND_AUTH_FAILLED, method, rapSession->user, url, clientIp);
-			return sendResponse(request, RAP_RESPOND_AUTH_FAILLED, NULL, rapSession);
+			if (requestHasData(request)) {
+				return MHD_YES;
+			} else {
+				return sendResponse(request, RAP_RESPOND_AUTH_FAILLED, NULL, rapSession);
+			}
 		} else /*if (*rapSession == AUTH_ERROR)*/{
 			logAccess(RAP_RESPOND_INTERNAL_ERROR, method, rapSession->user, url, clientIp);
-			return sendResponse(request, RAP_RESPOND_INTERNAL_ERROR, NULL, rapSession);
+			if (requestHasData(request)) {
+				return MHD_YES;
+			} else {
+				return sendResponse(request, RAP_RESPOND_INTERNAL_ERROR, NULL, rapSession);
+			}
 		}
 	}
 }
