@@ -1030,6 +1030,7 @@ static int copyFileRecursive(FileCopyData ** copied) {
 		goto error_exit;
 	}
 
+
 	lchown(toCopy->target, fileStat.st_uid, fileStat.st_gid);
 	return 1;
 

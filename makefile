@@ -1,5 +1,5 @@
 CFLAGS=-O3 -s
-STATIC_FLAGS=-Werror -Wall -Wno-pointer-sign -std=gnu99 -pthread
+STATIC_FLAGS=-Werror -Wall -Wno-pointer-sign  -Wno-unused-result -std=gnu99 -pthread
 
 all: build/rap build/webdavd
 	ls -lh $^
