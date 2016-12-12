@@ -97,7 +97,7 @@ static size_t formatFileSize(char * buffer, size_t bufferSize, off_t size) {
 //////////
 
 static int compareExt(const void * a, const void * b) {
-	return strcmp(((MimeType *) a)->fileExtension, ((MimeType *) b)->fileExtension);
+	return strcasecmp(((MimeType *) a)->fileExtension, ((MimeType *) b)->fileExtension);
 }
 
 static MimeType * findMimeType(const char * file) {
