@@ -59,9 +59,10 @@ static void normalizeDirName(char * buffer, const char * file, size_t * filePath
 	memcpy(buffer, file, *filePathSize + 1);
 	if (isDir && file[*filePathSize - 1] != '/') {
 		buffer[*filePathSize] = '/';
-		buffer[*filePathSize + 1] = '\0';
 		(*filePathSize)++;
+		buffer[*filePathSize] = '\0';
 	}
+	stdLog("%d",  (int)buffer[*filePathSize]);
 }
 
 static size_t formatFileSize(char * buffer, size_t bufferSize, off_t size) {
@@ -713,7 +714,7 @@ static int respondToPropFind(const char * file, LockType lockProvided, PropertyS
 		}
 	}
 
-	char filePath[fileNameSize];
+	char filePath[filePathSize + 2];
 	normalizeDirName(filePath, file, &filePathSize, (fileStat.st_mode & S_IFMT) == S_IFDIR);
 
 	int pipeEnds[2];
@@ -1416,7 +1417,7 @@ static ssize_t readFile(Message * requestMessage) {
 				return writeErrorResponse(RAP_RESPOND_URI_TOO_LARGE, "URI was too large to process", NULL,
 						file);
 			}
-			char fileName[fileNameSize];
+			char fileName[fileNameSize + 2];
 			normalizeDirName(fileName, file, &fileNameSize, 1);
 
 			// we cant't lock a directory so we don't try to acquire a lock here.
