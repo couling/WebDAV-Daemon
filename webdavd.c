@@ -1282,7 +1282,7 @@ static int processRangeHeader(off_t * offset, size_t * fileSize, const char *ran
 
 static int createResponseFromMessage(Request * request, Message * message, Response ** response,
 		RAP * session) {
-	int statusCode = message->mID;
+	RapConstant statusCode = message->mID;
 
 	if (statusCode == RAP_RESPOND_CONTINUE) return RAP_RESPOND_CONTINUE;
 
@@ -1317,6 +1317,9 @@ static int createResponseFromMessage(Request * request, Message * message, Respo
 		case RAP_RESPOND_CONFLICT:
 			*response = createFileResponse(CONFLICT_PAGE, "text/html", session);
 			break;
+
+		default:
+			*response = 0;
 		}
 	} else {
 		// Get Mime type and date
