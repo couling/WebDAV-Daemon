@@ -62,7 +62,6 @@ static void normalizeDirName(char * buffer, const char * file, size_t * filePath
 		(*filePathSize)++;
 		buffer[*filePathSize] = '\0';
 	}
-	stdLog("%d",  (int)buffer[*filePathSize]);
 }
 
 static size_t formatFileSize(char * buffer, size_t bufferSize, off_t size) {
