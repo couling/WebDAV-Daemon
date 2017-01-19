@@ -9,6 +9,11 @@ webdavd is a WebDAV server designed to be a replace for SMBA providing access to
  - The daemon operates without any prior knowledge of the files it's serving.  
  - The daemon does NOT take ownership of the files it modifies and serves. It does not take ownership of any files in any way.  Even locking operations are implemented using the native OS `flock()` function.
 
+# Licence
+
+(c) Copyright Philip Couling 2013-2017
+
+Unless otherwise all source code files for webdavd may be used under the [Creative Commons Attribution 4.0](CCBY.md) licence. For more information please see [https://creativecommons.org/licenses/](https://creativecommons.org/licenses/)
 #  Starting the server
 
 If properly installed the server can be started with:
