@@ -45,7 +45,7 @@ See [Configuration](Configuration.md) for details of the config file.
 
 ### Packaging into a dpkg
 
-To assemble everything into a DPKG you can either read one of the manifest files [`package-control/manifest.ubuntu`](package-control/manifest.ubuntu) or [`package-control/manifest.rpi`](`package-control/manifest.rpi`)
+To assemble everything into a DPKG you can either read one of the manifest files [`package-control/manifest.ubuntu`](package-control/manifest.ubuntu) or [`package-control/manifest.rpi`](package-control/manifest.rpi)
 
 Or you can use my [`package-project` script](https://github.com/couling/DpkgBuildTools).  For example:
 
