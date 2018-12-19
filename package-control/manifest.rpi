@@ -47,7 +47,7 @@ file        share                      /usr/share/webdavd                  644
 file        systemd.service            /lib/systemd/system/webdavd.service 644
 file        logrotate.conf             /etc/logrotate.d/webdavd            644
 
-source      ../..
+source      ../build
 file        webdavd                    /usr/sbin/webdavd                   755
 file        rap                        /usr/lib/webdavd/webdav-worker      755
 

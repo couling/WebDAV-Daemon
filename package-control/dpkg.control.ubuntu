@@ -1,7 +1,7 @@
 Package: couling-webdavd
 Section: devel
 Priority: optional
-Architecture: armhf
+Architecture: amd64
 Depends: libc6, libmicrohttpd10, libpam0g, libxml2, libgnutls30, libuuid1
 Suggests:
 Conflicts:
