@@ -18,7 +18,7 @@ Unless otherwise all source code files for webdavd may be used under the [Creati
 
 If properly installed the server can be started with:
 
-	service webdavd start
+    service webdavd start
 
 The server can be started manually by calling:
 

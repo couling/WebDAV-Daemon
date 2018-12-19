@@ -33,20 +33,21 @@
 #            creates a symbolic link on the target system. Source is relative to the target link
 #
 
-# Action    Source                     Target                               File Mode
-source      package-with
-control     dpkg.control               DEBIAN/control                      644
+# Action    Source                     Target                              File Mode
+source      .
+control     dpkg.control.rpi           DEBIAN/control                      644
 file        dpkg.conffiles             DEBIAN/conffiles                    644
 file        dpkg.postinst              DEBIAN/postinst                     555
 file        dpkg.prerm                 DEBIAN/prerm                        555
 
+source      ../package-with
 file        pam.conf                   /etc/pam.d/webdavd                  644
 file        conf.xml                   /etc/webdavd                        644
 file        share                      /usr/share/webdavd                  644
 file        systemd.service            /lib/systemd/system/webdavd.service 644
 file        logrotate.conf             /etc/logrotate.d/webdavd            644
 
-source      build
+source      ../..
 file        webdavd                    /usr/sbin/webdavd                   755
 file        rap                        /usr/lib/webdavd/webdav-worker      755
 

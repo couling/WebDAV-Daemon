@@ -1,0 +1,10 @@
+Package: couling-webdavd
+Section: devel
+Priority: optional
+Architecture: armhf
+Depends: libc6, libmicrohttpd12 | libmicrohttpd12, libpam0g, libxml2, libgnutls-deb0-28, libuuid1
+Suggests:
+Conflicts:
+Replaces:
+Maintainer: Philip Couling <couling@gmail.com>
+Description: Webdav based file server using PAM authentication 
