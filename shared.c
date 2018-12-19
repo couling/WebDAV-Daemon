@@ -252,11 +252,18 @@ MessageParam stringToMessageParam(const char * string) {
 	}
 }
 
-int lockToUser(const char * user) {
+int lockToUser(const char * user, const char * chrootDir) {
 	struct passwd * pwd = getpwnam(user);
 	if (!pwd) {
 		stdLogError(errno, "Could not find user %s", user);
 		return 0;
+	}
+	if (chrootDir) {
+		const char * actualChrootDir = ( strcmp("~", chrootDir ) ? chrootDir : pwd->pw_dir );
+		if (chdir(actualChrootDir) || chroot(actualChrootDir)) {
+			stdLogError(errno, "Could not chroot to user (%s) home directory (%s)", user, actualChrootDir);
+			return 0;
+		}
 	}
 	if (initgroups(user, pwd->pw_gid) || setgid(pwd->pw_gid) || setuid(pwd->pw_uid)) {
 		stdLogError(errno, "Could not lock down to user %s", user);

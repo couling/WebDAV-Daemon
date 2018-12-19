@@ -420,7 +420,7 @@ static int forkRapProcess(const char * path, int * newSockFd) {
 		}
 
 		char * argv[] = {
-				(char *) config.rapBinary,
+				(char *) path,
 				(char *) config.pamServiceName,
 				(char *) config.mimeTypesFile,
 				NULL };
@@ -1936,7 +1936,7 @@ void cleaner() {
 }
 
 static void runServer() {
-	if (!lockToUser(config.restrictedUser)) {
+	if (!lockToUser(config.restrictedUser, NULL)) {
 		exit(1);
 	}
 

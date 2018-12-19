@@ -1532,7 +1532,7 @@ static int pamAuthenticate(const char * user, const char * password, const char 
 	}
 	freeSafe(envList);
 
-	if (!lockToUser(user)) {
+	if (!lockToUser(user, "~")) {
 		stdLogError(errno, "Could not set uid or gid");
 		pam_close_session(pamh, 0);
 		pam_end(pamh, pamResult);

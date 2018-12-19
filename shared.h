@@ -144,7 +144,7 @@ char * messageParamToString(MessageParam * iovec);
 MessageParam stringToMessageParam(const char * string);
 #define messageParamSize(param) ((param).iov_len)
 
-int lockToUser(const char * user);
+int lockToUser(const char * user, const char * chrootDir);
 
 char * loadFileToBuffer(const char * file, size_t * size);
 
