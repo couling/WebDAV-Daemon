@@ -30,3 +30,23 @@ See [Configuration](Configuration.md) for details of the config file.
 
  - Locking file is limited and it is currently not possible to lock a directory
  - PAM sessions are of a fixed length and their length is not affected by user activity.
+ 
+# Building from source
+
+### Under Ubuntu
+
+    sudo apt-get install gcc libmicrohttpd-dev libpam0g-dev libxml2-dev libgnutls28-dev libgnutls30 uuid-dev
+    make
+
+### Under Raspbian
+
+    sudo apt-get install gcc libmicrohttpd-dev libpam0g-dev libxml2-dev libgnutls28-dev uuid-dev
+    make
+
+### Packaging into a dpkg
+
+To assemble everything into a DPKG you can either read one of the manifest files [`packaging/manifest.ubuntu`](packaging/manifest.ubuntu) or [`packaging/manifest.rpi`](`packaging/manifest.rpi`)
+
+Or you can use my [`package-project` script](https://github.com/couling/DpkgBuildTools).  For example:
+
+    package-project packaging/manifest.ubuntu
