@@ -12,6 +12,7 @@
 #include <dirent.h>
 #include <locale.h>
 #include <security/pam_appl.h>
+#include <stdlib.h>
 
 #define WEBDAV_NAMESPACE "DAV:"
 #define EXTENSIONS_NAMESPACE "urn:couling-webdav:"
@@ -32,6 +33,7 @@ typedef struct MimeType {
 static int authenticated = 0;
 static const char * authenticatedUser;
 static const char * pamService;
+static const char * chrootPath;
 static pam_handle_t *pamh;
 
 // Mime Database.
@@ -1532,7 +1534,7 @@ static int pamAuthenticate(const char * user, const char * password, const char 
 	}
 	freeSafe(envList);
 
-	if (!lockToUser(user, "~")) {
+	if (!lockToUser(user, chrootPath)) {
 		stdLogError(errno, "Could not set uid or gid");
 		pam_close_session(pamh, 0);
 		pam_end(pamh, pamResult);
@@ -1573,17 +1575,15 @@ static ssize_t authenticate(Message * message) {
 int main(int argCount, char * args[]) {
 	setlocale(LC_ALL, "");
 	char incomingBuffer[INCOMING_BUFFER_SIZE];
-	if (argCount > 1) {
-		pamService = args[1];
-	} else {
-		pamService = "webdav";
-	}
 
-	if (argCount > 2) {
-		initializeMimeTypes(args[2]);
-	} else {
-		initializeMimeTypes("/etc/mime.types");
-	}
+	pamService = getenv("WEBDAVD_PAM_SERVICE");
+	if (!pamService) pamService = "webdav";
+
+	const char * mimeFile = getenv("WEBDAVD_MIME_FILE");
+	initializeMimeTypes(mimeFile ? mimeFile : "/etc/mime.types");
+
+	chrootPath = getenv("WEBDAVD_CHROOT_PATH");
+	if (chrootPath && !strcmp("", chrootPath)) chrootPath = NULL;
 
 	ssize_t ioResult;
 	Message message;

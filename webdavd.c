@@ -421,8 +421,6 @@ static int forkRapProcess(const char * path, int * newSockFd) {
 
 		char * argv[] = {
 				(char *) path,
-				(char *) config.pamServiceName,
-				(char *) config.mimeTypesFile,
 				NULL };
 		execv(path, argv);
 
@@ -1891,6 +1889,13 @@ static void initializeStaticResponses() {
 	OK_PAGE = createStaticFileName("HTTP_OK.html");
 }
 
+static void initializeEnvVariables() {
+	setenv("WEBDAVD_PAM_SERVICE", config.pamServiceName, 1);
+	setenv("WEBDAVD_MIME_FILE", config.mimeTypesFile, 1);
+	if (config.chrootPath) setenv("WEBDAVD_CHROOT_PATH", config.chrootPath, 1);
+	else unsetenv("WEBDAVD_CHROOT_PATH");
+}
+
 ////////////////////////
 // End Initialisation //
 ////////////////////////
@@ -1945,6 +1950,7 @@ static void runServer() {
 	initializeRapDatabase();
 	initializeLockDB();
 	initializeSSL();
+	initializeEnvVariables();
 
 	// Start up the daemons
 	daemons = mallocSafe(sizeof(*daemons) * config.daemonCount);

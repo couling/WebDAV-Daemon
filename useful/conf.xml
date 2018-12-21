@@ -15,6 +15,7 @@
 			<certificate>/etc/ssl/certs/local/server.crt</certificate>
 			<key>/etc/ssl/private/server.key</key>
 		</ssl-cert>
+		<chroot-path/>
 	</server>
 </server-config>
 

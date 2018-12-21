@@ -205,6 +205,11 @@ static int configMaxLockTime(WebdavdConfiguration * config, xmlTextReaderPtr rea
 	return readConfigTime(reader, &config->maxLockTime, configFile);
 }
 
+static int configChroot(WebdavdConfiguration * config, xmlTextReaderPtr reader, const char * configFile) {
+	// <chroot-path>~</chroot-path>
+	return readConfigString(reader, &config->chrootPath);
+}
+
 //<ssl-cert>...</ssl-cert>
 static int configConfigSSLCert(WebdavdConfiguration * config, xmlTextReaderPtr reader,
 		const char * configFile) {
@@ -284,11 +289,12 @@ static int compareConfigFunction(const void * a, const void * b) {
 
 // This MUST be sorted in aplabetical order (for nodeName).  The array is binary-searched.
 static const ConfigurationFunction configFunctions[] = {
-		{ .nodeName = "access-log", .func = &configAccessLog }, //<access-log />
+		{ .nodeName = "access-log", .func = &configAccessLog },                // <access-log />
+		{ .nodeName = "chroot-path", .func = &configChroot },                  // <chroot />
 		{ .nodeName = "error-log", .func = &configErrorLog },                  // <error-log />
 		{ .nodeName = "listen", .func = &configListen },                       // <listen />
 		{ .nodeName = "max-ip-connections", .func = &configMaxIpConnections }, // <max-ip-connections />
-		{ .nodeName = "max-lock-time", .func = &configMaxLockTime },            // <max-lock-time />
+		{ .nodeName = "max-lock-time", .func = &configMaxLockTime },           // <max-lock-time />
 		{ .nodeName = "mime-file", .func = &configMimeFile },                  // <mime-file />
 		{ .nodeName = "pam-service", .func = &configPamService },              // <pam-service />
 		{ .nodeName = "rap-binary", .func = &configRapBinary },                // <rap-binary />

@@ -26,6 +26,7 @@ typedef struct SSLConfig {
 
 typedef struct WebdavdConfiguration {
 	const char * restrictedUser;
+	const char * chrootPath;
 
 	// Daemons
 	int daemonCount;

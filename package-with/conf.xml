@@ -60,6 +60,11 @@
 			Supports format: [[[hours:]minutes:]seconds] -->
 		<session-timeout>5:00</session-timeout>
 
+		<!-- Chroot the server before serving requests.  This can be set to ~ forcing the
+			 server to chroot to the home directory per request.  Alternativly a static path
+			 can be specified.
+		<chroot-path>~</chroot-path> -->
+
 		<!-- Not yet supported until multiple servers is implemeted (see <server> 
 			above). Planned to setup a lockdown on the main session -->
 		<restricted>nobody</restricted>
