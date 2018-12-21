@@ -65,10 +65,6 @@
 			 can be specified. -->
 		<chroot-path>~</chroot-path>
 
-		<!-- Not yet supported until multiple servers is implemeted (see <server> 
-			above). Planned to setup a lockdown on the main session -->
-		<restricted>nobody</restricted>
-
 		<!-- mime.types file default /etc/mime.types -->
 		<mime-file>/etc/mime.types</mime-file>
 
@@ -76,7 +72,7 @@
 			YOU ARE DOING! This is primarily here for testing but on non-standard systems 
 			where binaries can not be stored in /usr/lib/webdav this will need to be changed to 
 			the location of "webdav-rap" -->
-		<rap-binary>/usr/lib/webdav/webdav-worker</rap-binary>
+		<!-- <rap-binary>/usr/lib/webdavd/webdav-worker</rap-binary> -->
 
 		<!-- If a RAP hangs the thread waiting on it will wait this long before 
 			giving up -->
@@ -89,7 +85,7 @@
 		<!-- Directory containing static error responses default /usr/share/webdavd. 
 			Again this should only be changed on non-standard sytems or for testing when 
 			the files can not be placed in /usr/share/webdavd -->
-		<static-response-dir>/usr/share/webdav</static-response-dir>
+		<!-- <static-response-dir>/usr/share/webdavd</static-response-dir> -->
 		
 		<!-- The maximum amount of time before a lock expires automatically -->
 		<max-lock-time>2:00</max-lock-time>
@@ -109,7 +105,7 @@
 		<ssl-cert>
 
 			<!-- The PEM encoded certificate file -->
-			<certificate>/etc/ssl/certs/local/server.crt</certificate>
+			<certificate>/etc/ssl/certs/ssl-cert-snakeoil.pem</certificate>
 
 			<!-- If the certificate requires intermediary ca certificates then add 
 				as many <chain> nodes as required. These must be added in order starting 
@@ -118,7 +114,7 @@
 			<!-- <chain>/etc/ssl/certs/local/chain_server.crt</chain> -->
 
 			<!-- The key for <certificate> -->
-			<key>/etc/ssl/private/server.key</key>
+			<key>/etc/ssl/private/ssl-cert-snakeoil.key</key>
 		</ssl-cert>
 
 		<!-- As required.... -->
