@@ -2,7 +2,7 @@
 
 # About
 
-webdavd is a WebDAV server designed to be a replace for SMBA providing access to a system's files without taking ownership of them.  It aims to differ from most WebDAV servers on a number of points:
+webdavd is a WebDAV server designed to be a replace for SAMBA providing access to a system's files without taking ownership of them.  It aims to differ from most WebDAV servers on a number of points:
 
  - Users are authenticated through PAM and are *always* operating system users.
  - The webserver switches OS user to match the authenticated user before accessing any files.
@@ -50,3 +50,11 @@ To assemble everything into a DPKG you can either read one of the manifest files
 Or you can use my [`package-project` script](https://github.com/couling/DpkgBuildTools).  For example:
 
     package-project package-control/manifest.ubuntu
+
+### Packaging into an rpm on RHEL8
+
+Use the included SPEC file to build the rpm file. [`package-control/webdavd.spec`](package-control/webdavd.spec). It is sufficient to only download the SPEC file and run the below commands.
+
+    sudo dnf builddep webdavd.spec
+    rpmbuild --undefine=_disable_source_fetch -ba webdavd.spec
+

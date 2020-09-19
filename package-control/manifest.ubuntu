@@ -11,7 +11,7 @@
 # Multiple tabs between two fields is allowable.
 #
 # action    [source]  [target]  [file-mode]
-# Acttions:
+# Actions:
 #       source <source>
 #            Changes the current source directory. This is very helpful when the manifest exists in a
 #            subdirectory of the project.  The path is always relative to the manifest file.
