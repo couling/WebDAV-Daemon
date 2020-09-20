@@ -1771,6 +1771,15 @@ static int answerToRequest(void *cls, Request *request, const char *url, const c
 			logAccess(RAP_RESPOND_AUTH_FAILLED, method, rapSession->user, url, clientIp);
 			if (requestHasData(request)) {
 				return MHD_YES;
+
+			// If configured, OPTIONS should be returned even if authentication fails
+			} else if ( !strcmp("OPTIONS", method) && config.unprotectOptions ) {
+				Response * response = NULL;
+				response = createFileResponse(OPTIONS_PAGE, "text/html", rapSession);
+				addHeader(response, "Accept", ACCEPT_HEADER);
+
+				return sendResponse(request, RAP_RESPOND_OK, response, rapSession);
+
 			} else {
 				return sendResponse(request, RAP_RESPOND_AUTH_FAILLED, NULL, rapSession);
 			}

@@ -200,7 +200,6 @@ Example
     </server-config>
 
 ## `<ssl-cert>`
-
 Specifies a certificate to use for ssl server identification.  You can specify as many certificates as you need and the server will automatically pick the correct one for the domain name being requested.
 
 Contains
@@ -223,6 +222,18 @@ Example
 				<key>/etc/ssl/private/server.key</key>
 			</ssl-cert>
         </server>
+    </server-config>
+
+## `<unprotect-options>`
+Set `<unprotect-options>` to true if you would like to make OPTIONS requests available without previous authentication. This might be required for your CORS setup.
+
+Note that this exposes the features of the server to everyone requesting them.
+
+Example
+
+    <server-config xmlns="http://couling.me/webdavd">
+        <unprotect-options>true</unprotect-options>
+        <server><listen><port>80</port></listen></server>
     </server-config>
 
 ## Time Format
