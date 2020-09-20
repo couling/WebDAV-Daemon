@@ -53,7 +53,7 @@
 		</listen>
 
 
-		<!-- The authenticated session life span (has secirity implications). Sessions 
+		<!-- The authenticated session life span (has security implications). Sessions 
 			will stay open for this length of time and user/passwords matching the session 
 			may not be checked with PAM. For this reason it is best to leave this open 
 			only for a few minutes incase the system password changes. default: 5:00 
@@ -119,5 +119,14 @@
 
 		<!-- As required.... -->
 		<!-- <ssl-cert> ... </ssl-cert> -->
+
+
+		<!-- Add custom reply headers here. This can for example be useful if you need
+		     to configure Cross Origin Resource Sharing (CORS). -->
+
+		<!-- <add-header name="Access-Control-Allow-Origin">'https://www.example.com'</add-header> -->
+		<!-- <add-header name="Access-Control-Allow-Headers">'cache-control'</add-header> -->
+
+
 	</server>
 </server-config>

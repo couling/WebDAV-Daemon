@@ -16,6 +16,11 @@ typedef struct DaemonConfig {
 	const char * forwardToHost;
 } DaemonConfig;
 
+typedef struct AddHeaders {
+	const char * name;
+	const char * value;
+} AddHeaders;
+
 typedef struct SSLConfig {
 	int chainFileCount;
 	const char * keyFile;
@@ -51,6 +56,10 @@ typedef struct WebdavdConfiguration {
 	// SSL
 	int sslCertCount;
 	SSLConfig * sslCerts;
+
+	// Additional Headers
+	int addHeadersCount;
+	AddHeaders * addHeaders;
 } WebdavdConfiguration;
 
 extern WebdavdConfiguration config;
