@@ -1216,6 +1216,11 @@ static Response * createFdResponse(int fd, uint64_t offset, uint64_t size, const
 	addHeader(response, "Expires", "Thu, 19 Nov 1980 00:00:00 GMT");
 	addHeader(response, "Cache-Control", "no-store, no-cache, must-revalidate, post-check=0, pre-check=0");
 	addHeader(response, "Pragma", "no-cache");
+        // Adding additional headers from the config file
+        for (int i = 0; i < config.addHeadersCount; i++) {
+            addHeader(response, config.addHeaders[i].name, config.addHeaders[i].value);
+        }
+
 	return response;
 }
 
