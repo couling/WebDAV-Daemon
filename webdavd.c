@@ -413,7 +413,7 @@ static int forkRapProcess(const char * path, int * newSockFd) {
 			// This previously abused STD_IN and STD_OUT for this but instead we now
 			// reserve a different FD (3) AKA RAP_CONTROL_SOCKET
 			if (dup2(sockFd[CHILD_SOCKET], RAP_CONTROL_SOCKET) == -1) {
-				stdLogError(errno, "Could not assign new socket (%d) to %d", newSockFd[1],
+				stdLogError(errno, "Could not assign new socket (%d) to %d", sockFd[CHILD_SOCKET],
 						(int) RAP_CONTROL_SOCKET);
 				exit(255);
 			}
@@ -1959,9 +1959,9 @@ static void runServer() {
 		if (getBindAddress(&address, &config.daemons[i])) {
 			MHD_AccessHandlerCallback callback;
 			if (config.daemons[i].forwardToPort) {
-				callback = &answerForwardToRequest;
+				callback = (MHD_AccessHandlerCallback) &answerForwardToRequest;
 			} else {
-				callback = &answerToRequest;
+				callback = (MHD_AccessHandlerCallback) &answerToRequest;
 			}
 
 			if (config.daemons[i].sslEnabled) {
