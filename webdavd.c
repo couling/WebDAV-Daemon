@@ -1959,9 +1959,9 @@ static void runServer() {
 		if (getBindAddress(&address, &config.daemons[i])) {
 			MHD_AccessHandlerCallback callback;
 			if (config.daemons[i].forwardToPort) {
-				callback = &answerForwardToRequest;
+				callback = (MHD_AccessHandlerCallback) &answerForwardToRequest;
 			} else {
-				callback = &answerToRequest;
+				callback = (MHD_AccessHandlerCallback) &answerToRequest;
 			}
 
 			if (config.daemons[i].sslEnabled) {
