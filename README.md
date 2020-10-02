@@ -13,7 +13,7 @@ webdavd is a WebDAV server designed to be a replace for SMBA providing access to
 
 (c) Copyright Philip Couling 2013-2017
 
-Unless otherwise all source code files for webdavd may be used under the [Creative Commons Attribution 4.0](CCBY.md) licence. For more information please see [https://creativecommons.org/licenses/](https://creativecommons.org/licenses/)
+This code may be used under an MIT Licence.  Please see [LICENCE.md](LICENCE.md) for details.
 #  Starting the server
 
 If properly installed the server can be started with:
