@@ -269,6 +269,19 @@ static int configResponseDir(WebdavdConfiguration * config, xmlTextReaderPtr rea
 	return result;
 }
 
+static int configUnprotectOptions(WebdavdConfiguration * config, xmlTextReaderPtr reader, const char * configFile) {
+        // <unprotect-options>~</unprotect-options>
+	const char * valueString;
+	int result = stepOverText(reader, &valueString);
+	if ( valueString && !strcmp(valueString, "true") ) {
+		xmlFree((char *) valueString);
+                config->unprotectOptions = 1;
+        } else { 
+		config->unprotectOptions = 0;
+	}	
+	return result;
+}
+
 ///////////////////////////
 // End Handler Functions //
 ///////////////////////////
@@ -302,7 +315,8 @@ static const ConfigurationFunction configFunctions[] = {
 		{ .nodeName = "restricted", .func = &configRestricted },               // <restricted />
 		{ .nodeName = "session-timeout", .func = &configSessionTimeout },      // <session-timeout />
 		{ .nodeName = "ssl-cert", .func = &configConfigSSLCert },              // <ssl-cert />
-		{ .nodeName = "static-response-dir", .func = &configResponseDir }      // <static-response-dir />
+		{ .nodeName = "static-response-dir", .func = &configResponseDir },      // <static-response-dir />
+		{ .nodeName = "unprotect-options", .func = &configUnprotectOptions }   // <unprotect-options />
 };
 
 static int configFunctionCount = sizeof(configFunctions) / sizeof(*configFunctions);
