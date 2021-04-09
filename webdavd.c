@@ -1208,10 +1208,10 @@ static Response * createFdResponse(int fd, uint64_t offset, uint64_t size, const
 	}
 	char dateBuf[100];
 	getWebDate(date, dateBuf, 100);
-	addHeader(response, "Date", dateBuf);
 	addHeader(response, "Content-Type", mimeType);
 	addHeader(response, "DAV", "1");
 	addHeader(response, "Accept-Ranges", "bytes");
+	addHeader(response, "Last-Modified", dateBuf);
 	addHeader(response, "Server", "couling-webdavd");
 	addHeader(response, "Expires", "Thu, 19 Nov 1980 00:00:00 GMT");
 	addHeader(response, "Cache-Control", "no-store, no-cache, must-revalidate, post-check=0, pre-check=0");
@@ -1651,6 +1651,12 @@ static int sendResponse(Request * request, int statusCode, Response * response, 
 static int answerToRequest(void *cls, Request *request, const char *url, const char *method,
 		const char *version, const char *upload_data, size_t *upload_data_size, void ** s) {
 
+	// Store the request creation time to include as a request header later
+	time_t rawtime;
+	time(&rawtime);
+        char responseDate[100];
+        getWebDate(rawtime, responseDate, sizeof(responseDate));
+
 	RAP * rapSession = *((RAP **) s);
 
 	if (rapSession) {
@@ -1756,6 +1762,7 @@ static int answerToRequest(void *cls, Request *request, const char *url, const c
 
 				if (statusCode == RAP_RESPOND_CONTINUE) {
 					statusCode = finishProcessingRequest(request, rapSession, &response);
+					addHeader(response, "Date", responseDate);
 				}
 				logAccess(statusCode, method, rapSession->user, url, rapSession->clientIp);
 				int ret = sendResponse(request, statusCode, response, rapSession);
