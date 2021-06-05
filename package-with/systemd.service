@@ -5,10 +5,8 @@ After=network.target
 
 [Service]
 Type=simple
-#Environment=statedir=/var/cache/foo
-#iExecStartPre=/usr/bin/mkdir -p ${statedir}
 ExecStart=/usr/sbin/webdavd /etc/webdavd
+LogsDirectory=webdavd
 
 [Install]
 WantedBy=multi-user.target
-
