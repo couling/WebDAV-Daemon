@@ -1,6 +1,7 @@
 [Unit]
 Description=WebDAV file server
 Documentation=man:webdavd(1)
+After=network.target
 
 [Service]
 Type=simple
