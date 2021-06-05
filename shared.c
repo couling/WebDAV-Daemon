@@ -11,6 +11,7 @@
 #include <time.h>
 #include <pwd.h>
 #include <grp.h>
+#include <limits.h>
 
 size_t getWebDate(time_t rawtime, char * buf, size_t bufSize) {
 	struct tm * timeinfo = gmtime(&rawtime);
@@ -259,7 +260,15 @@ int lockToUser(const char * user, const char * chrootDir) {
 		return 0;
 	}
 	if (chrootDir) {
-		const char * actualChrootDir = ( strcmp("~", chrootDir ) ? chrootDir : pwd->pw_dir );
+		const char * actualChrootDir;
+		char buffer[PATH_MAX];
+		if (chrootDir[0] == '~' && (chrootDir[1] == '/' || chrootDir[1] == '\0')) {
+			snprintf(buffer, sizeof(buffer), "%s%s", pwd->pw_dir, chrootDir + 1);
+			actualChrootDir = buffer;
+		} else {
+			actualChrootDir = chrootDir;
+		}
+
 		if (chdir(actualChrootDir) || chroot(actualChrootDir)) {
 			stdLogError(errno, "Could not chroot to user (%s) home directory (%s)", user, actualChrootDir);
 			return 0;
