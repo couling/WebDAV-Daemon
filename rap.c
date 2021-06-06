@@ -697,17 +697,13 @@ static int respondToPropFind(const char * file, LockType lockProvided, PropertyS
 
 	struct stat fileStat;
 	int fd = open(file, O_RDONLY);
-	if (fd == -1 || fstat(fd, &fileStat) == -1
-			|| (lockProvided == LOCK_TYPE_NONE && flock(fd, LOCK_TYPE_SHARED) == -1)) {
-		if (fd != -1) close(fd);
+	if (fd == -1 || fstat(fd, &fileStat) == -1) {
 		int e = errno;
+		if (fd != -1) close(fd);
 		switch (e) {
 		case EACCES:
 			stdLogError(e, "PROPFIND access denied %s %s", authenticatedUser, file);
 			return writeErrorResponse(RAP_RESPOND_ACCESS_DENIED, strerror(e), NULL, file);
-		case EWOULDBLOCK:
-			stdLogError(e, "PROPFIND file locked %s %s", authenticatedUser, file);
-			return writeErrorResponse(RAP_RESPOND_LOCKED, strerror(e), NULL, file);
 		case ENOENT:
 		default:
 			stdLogError(e, "PROPFIND not found %s %s", authenticatedUser, file);
@@ -1446,19 +1442,11 @@ static ssize_t readFile(Message * requestMessage) {
 			listDir(fileName, fd, pipeEnds[PIPE_WRITE]);
 			return messageResult;
 		} else {
-			// Check if we have the apropriate lock on this file.
-			LockProvisions locks = messageParamTo(LockProvisions,
-					requestMessage->params[RAP_PARAM_REQUEST_LOCK]);
-			if (locks.source == LOCK_TYPE_NONE) {
-				// We have no lock but we need one so acquire it now.
-				if (flock(fd, LOCK_TYPE_SHARED | LOCK_NB) == -1) {
-					close(fd);
-					int e = errno;
-					const char * etxt = strerror(e);
-					stdLogError(e, "Could not read locked file %s", file);
-					return writeErrorResponse(RAP_RESPOND_LOCKED, etxt, "lock-token-submitted", file);
-				}
-			}
+			// http://www.webdav.org/specs/rfc4918.html#rfc.section.7.p.5 
+			// "All other HTTP/WebDAV methods defined so far -- GET in particular -- function independently of a write lock."
+			//
+			// We don't need to acquire a lock to handle a GET.
+
 			Message message = { .mID = RAP_RESPOND_OK, .fd = fd, .paramCount = 3 };
 			message.params[RAP_PARAM_RESPONSE_DATE] = toMessageParam(statinfo.st_mtime);
 			MimeType * mimeType = findMimeType(file);

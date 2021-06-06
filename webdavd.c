@@ -1209,7 +1209,7 @@ static Response * createFdResponse(int fd, uint64_t offset, uint64_t size, const
 	char dateBuf[100];
 	getWebDate(date, dateBuf, 100);
 	addHeader(response, "Content-Type", mimeType);
-	addHeader(response, "DAV", "1");
+	addHeader(response, "DAV", "1,2");
 	addHeader(response, "Accept-Ranges", "bytes");
 	addHeader(response, "Last-Modified", dateBuf);
 	addHeader(response, "Server", "couling-webdavd");
