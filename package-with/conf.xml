@@ -60,9 +60,10 @@
 			Supports format: [[[hours:]minutes:]seconds] -->
 		<session-timeout>5:00</session-timeout>
 
-		<!-- Chroot the server before serving requests.  This can be set to ~ forcing the
-			 server to chroot to the home directory per request.  Alternativly a static path
-			 can be specified. -->
+		<!-- Chroot the server before serving requests.  This can be set ~, or a path beginning with
+			~/ and then followed by additional directories, forcing the server to chroot to the
+			user's home directory, or a subdirectory of it, per request.  Alternatively a static
+			path can be specified.  -->
 		<chroot-path>~</chroot-path>
 
 		<!-- mime.types file default /etc/mime.types -->
