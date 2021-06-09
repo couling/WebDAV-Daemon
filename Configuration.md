@@ -177,6 +177,19 @@ Example
         <server><listen><port>80</port></listen></server>
     </server-config>
 
+
+## `<add-header>`
+It is possible to add custom response headers to the outgoing transactions by using `<add-header>` tags. This can for example be useful if you need to configure Cross Origin Resource Sharing (CORS).The headers are added to all outgoing reponses of the instance.
+
+The header name needs to be added to the tag attribute `name`. Its corresponding value is included inside the tags.
+
+Example
+
+    <server-config xmlns="http://couling.me/webdavd">
+        <add-header name="Access-Control-Allow-Origin">'https://www.example.com'</add-header>
+        <server><listen><port>80</port></listen></server>
+    </server-config>
+
 ## `<error-log>`
 The location to write the error log.  If unspecified the error log will be written to the stderr.
 
