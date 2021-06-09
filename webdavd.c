@@ -1971,6 +1971,10 @@ static void runServer() {
 	// Start up the daemons
 	daemons = mallocSafe(sizeof(*daemons) * config.daemonCount);
 	for (int i = 0; i < config.daemonCount; i++) {
+		unsigned int flags = MHD_USE_THREAD_PER_CONNECTION | MHD_USE_DUAL_STACK | MHD_USE_PEDANTIC_CHECKS;
+		// Addtional options of MHD_start_daemon.  Needs terminating MHD_OPTION_END entry.
+		struct MHD_OptionItem ops[2];
+		int nops = 0;
 		struct sockaddr_in6 address;
 		if (getBindAddress(&address, &config.daemons[i])) {
 			MHD_AccessHandlerCallback callback;
@@ -1987,25 +1991,17 @@ static void runServer() {
 							config.daemons[i].host ? config.daemons[i].host : "", config.daemons[i].port);
 					continue;
 				}
-				daemons[i] = MHD_start_daemon(
-						MHD_USE_THREAD_PER_CONNECTION | MHD_USE_DUAL_STACK | MHD_USE_PEDANTIC_CHECKS
-								| MHD_USE_SSL, 0 /* ignored */, NULL, NULL,                     //
-						callback, &config.daemons[i],                    //
-						MHD_OPTION_SOCK_ADDR, &address,                  // Specifies both host and port
-						MHD_OPTION_HTTPS_CERT_CALLBACK, &sslSNICallback, // enable ssl
-						MHD_OPTION_PER_IP_CONNECTION_LIMIT, config.maxConnectionsPerIp, //
-						MHD_OPTION_END);
-			} else {
-				// http
-				daemons[i] = MHD_start_daemon(
-						MHD_USE_THREAD_PER_CONNECTION | MHD_USE_DUAL_STACK | MHD_USE_PEDANTIC_CHECKS,
-						0 /* ignored */,
-						NULL, NULL,                                      //
-						callback, &config.daemons[i],                    //
-						MHD_OPTION_SOCK_ADDR, &address,                  // Specifies both host and port
-						MHD_OPTION_PER_IP_CONNECTION_LIMIT, config.maxConnectionsPerIp, //
-						MHD_OPTION_END);
+				flags |= MHD_USE_SSL;
+				ops[nops++] = (struct MHD_OptionItem){ MHD_OPTION_HTTPS_CERT_CALLBACK, 0, &sslSNICallback };
 			}
+			ops[nops++] = (struct MHD_OptionItem){ MHD_OPTION_END };
+
+			daemons[i] = MHD_start_daemon(flags, 0 /* ignored */, NULL, NULL,
+					callback, &config.daemons[i],                    //
+					MHD_OPTION_SOCK_ADDR, &address,                  // Specifies both host and port
+					MHD_OPTION_PER_IP_CONNECTION_LIMIT, config.maxConnectionsPerIp, //
+					MHD_OPTION_ARRAY, ops,
+					MHD_OPTION_END);
 			if (!daemons[i]) {
 				stdLogError(errno, "Unable to initialise daemon on port %d", config.daemons[i].port);
 			}
