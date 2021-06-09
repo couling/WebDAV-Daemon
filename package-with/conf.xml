@@ -9,6 +9,18 @@
 			default port. Default host "any ip". Default encryption is "none". The following 
 			will listening on all ips and be unencrypted -->
 
+		<!-- One may use socket based activation, as with a systemd .socket unit or inetd.  This
+			method has systemd open the port(s) listed in the socket units and it will start
+			webdavd only when a connection is made.  The ports, hostnames, UNIX domain socket
+			pathnames, interfaces bound to, and other options, many of which webdavd does not
+			support natively, are set in the systemd socket unit(s), see systemd.socket(5).
+
+			When using this, the port and host in a listen section will be ignored and may be
+			omitted.  The port(s) from the socket units will be matched to the listen section(s)
+			in order.  Or, FileDescriptorName can be specified in the system socket units and a
+			matching <name> specified in the <listen> section(s).  -->
+		<!-- <socket-activation /> -->
+
 		<listen>
 
 			<port>80</port>
@@ -16,6 +28,11 @@
 			<!-- A host tag will bind the server to listen on that IP. Domains will 
 				be convertied to an IP before binding. -->
 			<!-- <host>myHost.domain.tld</host> -->
+
+			<!-- When using socket based activation, described near the socket-activation tag,
+				the port and host above are not used.  A name can be specified here and will
+				be matched to the "FileDescriptorName" in the systemd socket unit.  -->
+			<name>http</name>
 
 			<encryption>none</encryption>
 
@@ -44,6 +61,9 @@
 		<listen>
 
 			<port>443</port>
+
+			<!-- When using socket activation, match name from socket unit and ignore port. -->
+			<name>https</name>
 
 			<!-- Only "none" and "ssl" are currently supported. Encrypting with SSL 
 				requires one or more <ssl-cert> certificates (see below) -->

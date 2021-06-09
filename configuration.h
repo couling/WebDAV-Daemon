@@ -2,6 +2,7 @@
 #define WEBDAV_CONFIGURATION_H
 
 #include <time.h>
+#include <stdbool.h>
 
 //////////////////////////////////////
 // Webdavd Configuration Structures //
@@ -9,7 +10,8 @@
 
 typedef struct DaemonConfig {
 	int port;
-	const char * host;
+	const char * host;	// For opening socket ourselves
+	const char * name;	// For socket activation, i.e. open socket passed to daemon
 	int sslEnabled;
 	int forwardToIsEncrypted;
 	int forwardToPort;
@@ -54,6 +56,9 @@ typedef struct WebdavdConfiguration {
 
 	// OPTIONS Requests
 	int unprotectOptions;
+
+	// Use systemd/xinetd style socket based activation
+	bool socketActivation;
 
 } WebdavdConfiguration;
 
