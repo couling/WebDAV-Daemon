@@ -1975,36 +1975,40 @@ static void runServer() {
 		// Addtional options of MHD_start_daemon.  Needs terminating MHD_OPTION_END entry.
 		struct MHD_OptionItem ops[2];
 		int nops = 0;
+
 		struct sockaddr_in6 address;
-		if (getBindAddress(&address, &config.daemons[i])) {
-			MHD_AccessHandlerCallback callback;
-			if (config.daemons[i].forwardToPort) {
-				callback = (MHD_AccessHandlerCallback) &answerForwardToRequest;
-			} else {
-				callback = (MHD_AccessHandlerCallback) &answerToRequest;
-			}
+		if (!getBindAddress(&address, &config.daemons[i])) {
+			// Already printed error message in getBindAddress
+			continue;
+		}
 
-			if (config.daemons[i].sslEnabled) {
-				// https
-				if (sslCertificateCount == 0) {
-					stdLogError(0, "No certificates available for ssl %s:%d",
-							config.daemons[i].host ? config.daemons[i].host : "", config.daemons[i].port);
-					continue;
-				}
-				flags |= MHD_USE_SSL;
-				ops[nops++] = (struct MHD_OptionItem){ MHD_OPTION_HTTPS_CERT_CALLBACK, 0, &sslSNICallback };
-			}
-			ops[nops++] = (struct MHD_OptionItem){ MHD_OPTION_END };
+		MHD_AccessHandlerCallback callback;
+		if (config.daemons[i].forwardToPort) {
+			callback = (MHD_AccessHandlerCallback) &answerForwardToRequest;
+		} else {
+			callback = (MHD_AccessHandlerCallback) &answerToRequest;
+		}
 
-			daemons[i] = MHD_start_daemon(flags, 0 /* ignored */, NULL, NULL,
-					callback, &config.daemons[i],                    //
-					MHD_OPTION_SOCK_ADDR, &address,                  // Specifies both host and port
-					MHD_OPTION_PER_IP_CONNECTION_LIMIT, config.maxConnectionsPerIp, //
-					MHD_OPTION_ARRAY, ops,
-					MHD_OPTION_END);
-			if (!daemons[i]) {
-				stdLogError(errno, "Unable to initialise daemon on port %d", config.daemons[i].port);
+		if (config.daemons[i].sslEnabled) {
+			// https
+			if (sslCertificateCount == 0) {
+				stdLogError(0, "No certificates available for ssl %s:%d",
+						config.daemons[i].host ? config.daemons[i].host : "", config.daemons[i].port);
+				continue;
 			}
+			flags |= MHD_USE_SSL;
+			ops[nops++] = (struct MHD_OptionItem){ MHD_OPTION_HTTPS_CERT_CALLBACK, 0, &sslSNICallback };
+		}
+		ops[nops++] = (struct MHD_OptionItem){ MHD_OPTION_END };
+
+		daemons[i] = MHD_start_daemon(flags, 0 /* ignored */, NULL, NULL,
+				callback, &config.daemons[i],                    //
+				MHD_OPTION_SOCK_ADDR, &address,                  // Specifies both host and port
+				MHD_OPTION_PER_IP_CONNECTION_LIMIT, config.maxConnectionsPerIp, //
+				MHD_OPTION_ARRAY, ops,
+				MHD_OPTION_END);
+		if (!daemons[i]) {
+			stdLogError(errno, "Unable to initialise daemon on port %d", config.daemons[i].port);
 		}
 	}
 }
