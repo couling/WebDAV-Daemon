@@ -1,0 +1,14 @@
+[Unit]
+Description=WebDAV server on HTTPS socket
+
+[Socket]
+Accept=no
+ListenStream=443
+FileDescriptorName=https
+DeferAcceptSec=1
+Service=webdavd.service
+# Add this to only allow connections over localhost
+# BindToDevice=lo
+
+[Install]
+WantedBy=sockets.target
