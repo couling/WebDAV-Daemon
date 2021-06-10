@@ -13,6 +13,7 @@ BuildRequires:  libxml2-devel
 BuildRequires:  pam-devel
 BuildRequires:	libuuid-devel
 BuildRequires:	make
+BuildRequires:	systemd-devel
 
 Requires:	gnutls
 Requires:	libmicrohttpd
@@ -36,7 +37,7 @@ webdavd is a WebDAV server designed to be a replace for SMBA providing access to
 %setup -n WebDAV-Daemon-%{version}
 
 %build
-%make_build
+%make_build HAVE_SYSTEMD=1
 
 %install
 install -Dpm 755 build/webdavd %{buildroot}%{_sbindir}/webdavd
@@ -46,6 +47,7 @@ install -Dpm 644 package-with/conf.xml %{buildroot}%{_sysconfdir}/webdavd
 install -d %{buildroot}%{_datadir}/webdavd
 install -Dpm 644 package-with/share/* %{buildroot}%{_datadir}/webdavd
 install -Dpm 644 package-with/systemd.service %{buildroot}%{_prefix}/lib/systemd/system/webdavd.service
+install -Dpm 644 package-with/webdavd-*.socket %{buildroot}%{_prefix}/lib/systemd/system
 install -Dpm 644 package-with/logrotate.conf %{buildroot}%{_sysconfdir}/logrotate.d/webdavd
 
 
@@ -57,6 +59,7 @@ install -Dpm 644 package-with/logrotate.conf %{buildroot}%{_sysconfdir}/logrotat
 %{_prefix}/lib/webdavd/webdav-worker
 %{_datadir}/webdavd/*
 %{_prefix}/lib/systemd/system/webdavd.service
+%{_prefix}/lib/systemd/system/webdavd-*.socket
 %config %{_sysconfdir}/pam.d/webdavd
 %config %{_sysconfdir}/webdavd
 %config %{_sysconfdir}/logrotate.d/webdavd

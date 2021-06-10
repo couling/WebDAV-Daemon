@@ -77,6 +77,7 @@ static int readConfigTime(xmlTextReaderPtr reader, time_t * value, const char * 
 
 static int configListen(WebdavdConfiguration * config, xmlTextReaderPtr reader, const char * configFile) {
 	//<listen><port>80</port><host>localhost</host><encryption>disabled</encryption></listen>
+	//<listen><name>http<name/></listen>
 	int index = config->daemonCount++;
 	config->daemons = reallocSafe(config->daemons, sizeof(*config->daemons) * config->daemonCount);
 	memset(&config->daemons[index], 0, sizeof(config->daemons[index]));
@@ -90,6 +91,8 @@ static int configListen(WebdavdConfiguration * config, xmlTextReaderPtr reader, 
 				result = readConfigInt(reader, &config->daemons[index].port, configFile);
 			} else if (!strcmp(xmlTextReaderConstLocalName(reader), "host")) {
 				result = readConfigString(reader, &config->daemons[index].host);
+			} else if (!strcmp(xmlTextReaderConstLocalName(reader), "name")) {
+				result = readConfigString(reader, &config->daemons[index].name);
 			} else if (!strcmp(xmlTextReaderConstLocalName(reader), "encryption")) {
 				const char * encryptionString;
 				result = stepOverText(reader, &encryptionString);
@@ -148,7 +151,7 @@ static int configListen(WebdavdConfiguration * config, xmlTextReaderPtr reader, 
 			result = stepOver(reader);
 		}
 	}
-	if (config->daemons[index].port == -1) {
+	if (!config->socketActivation && config->daemons[index].port == -1) {
 		stdLogError(0, "port not specified for listen in %s", configFile);
 		exit(1);
 	}
@@ -282,6 +285,17 @@ static int configUnprotectOptions(WebdavdConfiguration * config, xmlTextReaderPt
 	return result;
 }
 
+static int configSocketActivation(WebdavdConfiguration * config, xmlTextReaderPtr reader, const char * configFile) {
+	// <socket-activation />
+#ifdef HAVE_SYSTEMD
+	config->socketActivation = true;
+	return stepOver(reader);
+#else
+	stdLogError(0, "Socket activation support not enable at build time");
+	return false;
+#endif
+}
+
 ///////////////////////////
 // End Handler Functions //
 ///////////////////////////
@@ -314,6 +328,7 @@ static const ConfigurationFunction configFunctions[] = {
 		{ .nodeName = "rap-timeout", .func = &configRapTimeout },              // <rap-timeout />
 		{ .nodeName = "restricted", .func = &configRestricted },               // <restricted />
 		{ .nodeName = "session-timeout", .func = &configSessionTimeout },      // <session-timeout />
+		{ .nodeName = "socket-activation", .func = &configSocketActivation },	// <socket-activation />
 		{ .nodeName = "ssl-cert", .func = &configConfigSSLCert },              // <ssl-cert />
 		{ .nodeName = "static-response-dir", .func = &configResponseDir },      // <static-response-dir />
 		{ .nodeName = "unprotect-options", .func = &configUnprotectOptions }   // <unprotect-options />

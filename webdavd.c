@@ -20,6 +20,10 @@
 #include <unistd.h>
 #include <uuid/uuid.h>
 
+#if HAVE_SYSTEMD
+#include <systemd/sd-daemon.h>
+#endif
+
 ////////////////
 // Structures //
 ////////////////
@@ -89,6 +93,16 @@ typedef struct FDResponseData {
 	off_t size;
 	RAP * session;
 } FDResponseData;
+
+// Sockets passed to us by systemd
+typedef struct PassedSockets {
+	int count;
+	struct {
+		int fd;
+		char * name;
+		bool used;	// For us to mark socket as in use
+	} socket[];
+} PassedSockets;
 
 ////////////////////
 // End Structures //
@@ -1912,6 +1926,61 @@ static void initializeEnvVariables() {
 	else unsetenv("WEBDAVD_CHROOT_PATH");
 }
 
+static void freePassedSockets(PassedSockets * ps) {
+	if (ps) {
+		for (int i = 0; i < ps->count; i++)
+			free(ps->socket[i].name); // Allocated by libsystemd
+		freeSafe(ps); // Allocated by us
+	}
+}
+
+#if HAVE_SYSTEMD
+static void initializeSocketActivation(PassedSockets ** socketsRet) {
+	if (!config.socketActivation) {
+		*socketsRet = NULL;
+		return;
+	}
+
+	char **names;
+	// This will set close on exec on all sockets
+	int n = sd_listen_fds_with_names(1, &names);
+	if (n <= 0) {
+		*socketsRet = NULL;
+		return;
+	}
+	PassedSockets * ps = mallocSafe(sizeof(*ps) + sizeof(*ps->socket) * n);
+	ps->count = n;
+
+	bool error = false;
+	for (int i = 0; i < n; i++) {
+		ps->socket[i].fd = SD_LISTEN_FDS_START + i;
+		ps->socket[i].name = names[i]; // Take ownership of string, need to free on exit
+		ps->socket[i].used = false;
+		int ret = sd_is_socket(ps->socket[i].fd, AF_UNSPEC, SOCK_STREAM, true);
+		if (ret <= 0) {
+			stdLogError(-ret, "Socket #%d '%s' unstuitable for WebDAV", i, names[i]);
+			error = true;
+		}
+	}
+	free(names);
+
+	if (error) {
+		// Just clean up stuct now and refuse to use any sockets
+		freePassedSockets(ps);
+		ps = NULL;
+	}
+
+	*socketsRet = ps;
+	return;
+}
+#else
+// Only supported with systemd.  The old inetd system on stdin could work too,
+// but would need some more code to support it.
+static void initializeSocketActivation(PassedSockets ** socketsRet) {
+	*socketsRet = NULL;
+}
+#endif
+
 ////////////////////////
 // End Initialisation //
 ////////////////////////
@@ -1960,6 +2029,7 @@ static void runServer() {
 	if (!lockToUser(config.restrictedUser, NULL)) {
 		exit(1);
 	}
+	PassedSockets *passedSocks;
 
 	initializeLogs();
 	initializeStaticResponses();
@@ -1967,50 +2037,92 @@ static void runServer() {
 	initializeLockDB();
 	initializeSSL();
 	initializeEnvVariables();
+	initializeSocketActivation(&passedSocks);
+
+	if (config.socketActivation && !passedSocks) {
+		stdLogError(0, "Configured to use systemd-socket activation but no sockets passed");
+		return;
+	}
 
 	// Start up the daemons
 	daemons = mallocSafe(sizeof(*daemons) * config.daemonCount);
 	for (int i = 0; i < config.daemonCount; i++) {
-		struct sockaddr_in6 address;
-		if (getBindAddress(&address, &config.daemons[i])) {
-			MHD_AccessHandlerCallback callback;
-			if (config.daemons[i].forwardToPort) {
-				callback = (MHD_AccessHandlerCallback) &answerForwardToRequest;
-			} else {
-				callback = (MHD_AccessHandlerCallback) &answerToRequest;
-			}
+		unsigned int flags = MHD_USE_THREAD_PER_CONNECTION | MHD_USE_DUAL_STACK | MHD_USE_PEDANTIC_CHECKS;
+		// Addtional options of MHD_start_daemon.  Needs terminating MHD_OPTION_END entry.
+		struct MHD_OptionItem ops[3];
+		int nops = 0;
 
-			if (config.daemons[i].sslEnabled) {
-				// https
-				if (sslCertificateCount == 0) {
-					stdLogError(0, "No certificates available for ssl %s:%d",
-							config.daemons[i].host ? config.daemons[i].host : "", config.daemons[i].port);
+		if (config.socketActivation) {
+			int listenFd = -1;
+			// Socket should have been passed to us already
+			if (config.daemons[i].name) {
+				// Find by name
+				for (int j = 0; j < passedSocks->count; j++) {
+					if (!strcmp(passedSocks->socket[j].name, config.daemons[i].name)) {
+						if (passedSocks->socket[j].used) {
+							stdLogError(0, "Socket '%s' for listening port #%d has already been used", config.daemons[i].name, i);
+							continue;
+						}
+						listenFd = passedSocks->socket[j].fd;
+						passedSocks->socket[j].used = true;
+					}
+				}
+				if (listenFd == -1) {
+					stdLogError(0, "No socket named '%s' was passed to webdavd by systemd", config.daemons[i].name);
 					continue;
 				}
-				daemons[i] = MHD_start_daemon(
-						MHD_USE_THREAD_PER_CONNECTION | MHD_USE_DUAL_STACK | MHD_USE_PEDANTIC_CHECKS
-								| MHD_USE_SSL, 0 /* ignored */, NULL, NULL,                     //
-						callback, &config.daemons[i],                    //
-						MHD_OPTION_SOCK_ADDR, &address,                  // Specifies both host and port
-						MHD_OPTION_HTTPS_CERT_CALLBACK, &sslSNICallback, // enable ssl
-						MHD_OPTION_PER_IP_CONNECTION_LIMIT, config.maxConnectionsPerIp, //
-						MHD_OPTION_END);
 			} else {
-				// http
-				daemons[i] = MHD_start_daemon(
-						MHD_USE_THREAD_PER_CONNECTION | MHD_USE_DUAL_STACK | MHD_USE_PEDANTIC_CHECKS,
-						0 /* ignored */,
-						NULL, NULL,                                      //
-						callback, &config.daemons[i],                    //
-						MHD_OPTION_SOCK_ADDR, &address,                  // Specifies both host and port
-						MHD_OPTION_PER_IP_CONNECTION_LIMIT, config.maxConnectionsPerIp, //
-						MHD_OPTION_END);
+				// Assign sockets to daemons in order listed
+				if (i >= passedSocks->count || passedSocks->socket[i].used) {
+					stdLogError(0, "Socket for listening port #%d not passed via socket activation", i);
+					continue;
+				}
+				listenFd = passedSocks->socket[i].fd;
+				passedSocks->socket[i].used = true;
 			}
-			if (!daemons[i]) {
-				stdLogError(errno, "Unable to initialise daemon on port %d", config.daemons[i].port);
+			ops[nops++] = (struct MHD_OptionItem){ MHD_OPTION_LISTEN_SOCKET, (MHD_socket)listenFd };
+		} else {
+			struct sockaddr_in6 address;
+			if (!getBindAddress(&address, &config.daemons[i])) {
+				// Already printed error message in getBindAddress
+				continue;
 			}
+			// Specifies both host and port
+			ops[nops++] = (struct MHD_OptionItem){ MHD_OPTION_SOCK_ADDR, 0, &address };
+		}
+
+		MHD_AccessHandlerCallback callback;
+		if (config.daemons[i].forwardToPort) {
+			callback = (MHD_AccessHandlerCallback) &answerForwardToRequest;
+		} else {
+			callback = (MHD_AccessHandlerCallback) &answerToRequest;
+		}
+
+		if (config.daemons[i].sslEnabled) {
+			// https
+			if (sslCertificateCount == 0) {
+				stdLogError(0, "No certificates available for ssl %s:%d",
+						config.daemons[i].name ? config.daemons[i].name :
+							config.daemons[i].host ? config.daemons[i].host : "",
+						config.daemons[i].port);
+				continue;
+			}
+			flags |= MHD_USE_SSL;
+			ops[nops++] = (struct MHD_OptionItem){ MHD_OPTION_HTTPS_CERT_CALLBACK, 0, &sslSNICallback };
+		}
+
+		ops[nops++] = (struct MHD_OptionItem){ MHD_OPTION_END };
+		daemons[i] = MHD_start_daemon(flags, 0 /* ignored */, NULL, NULL,
+				callback, &config.daemons[i],                    //
+				MHD_OPTION_PER_IP_CONNECTION_LIMIT, config.maxConnectionsPerIp, //
+				MHD_OPTION_ARRAY, ops,
+				MHD_OPTION_END);
+		if (!daemons[i]) {
+			stdLogError(errno, "Unable to initialise daemon on port %d", config.daemons[i].port);
 		}
 	}
+
+	freePassedSockets(passedSocks);
 }
 
 int main(int argCount, char ** args) {
