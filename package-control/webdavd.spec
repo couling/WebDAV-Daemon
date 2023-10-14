@@ -1,6 +1,6 @@
 Name:		webdavd
 Version:	1.1
-Release:        1%{?dist}
+Release:        2%{?dist}
 Summary:	Webdav based file server using PAM authentication
 License:	MIT License
 
@@ -57,9 +57,9 @@ install -Dpm 644 package-with/logrotate.conf %{buildroot}%{_sysconfdir}/logrotat
 %{_prefix}/lib/webdavd/webdav-worker
 %{_datadir}/webdavd/*
 %{_prefix}/lib/systemd/system/webdavd.service
-%config %{_sysconfdir}/pam.d/webdavd
-%config %{_sysconfdir}/webdavd
-%config %{_sysconfdir}/logrotate.d/webdavd
+%config(noreplace) %{_sysconfdir}/pam.d/webdavd
+%config(noreplace) %{_sysconfdir}/webdavd
+%config(noreplace) %{_sysconfdir}/logrotate.d/webdavd
 
 %preun
 %systemd_preun %{name}.service
@@ -67,5 +67,8 @@ install -Dpm 644 package-with/logrotate.conf %{buildroot}%{_sysconfdir}/logrotat
 %postun
 
 %changelog
+* Sat Oct 14 2023 Stefan Bluhm <stefan.bluhm@clacee.eu> - 1.1-2
+- Don't replacing existing config files when installing/updating the package.
+
 * Fri Sep 18 2020 Stefan Bluhm <stefan.bluhm@clacee.eu> - 1.1-1
 - Initial package based on webdavd version 1.1 available at https://github.com/couling/WebDAV-Daemon
