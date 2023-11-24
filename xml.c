@@ -23,11 +23,11 @@ int stepInto(xmlTextReaderPtr reader) {
 	int result;
 	do {
 		result = xmlTextReaderRead(reader);
-	} while (result
+	} while (result > 0
 			&& (xmlTextReaderNodeType(reader) == XML_READER_TYPE_SIGNIFICANT_WHITESPACE
 					|| xmlTextReaderNodeType(reader) == XML_READER_TYPE_COMMENT
 					|| xmlTextReaderNodeType(reader) == XML_READER_TYPE_END_ELEMENT));
-	return result;
+	return result > 0;
 }
 
 int stepOver(xmlTextReaderPtr reader) {
@@ -35,14 +35,14 @@ int stepOver(xmlTextReaderPtr reader) {
 	int result;
 	do {
 		result = xmlTextReaderRead(reader);
-	} while (result && xmlTextReaderDepth(reader) > depth);
-	while (result
+	} while (result > 0 && xmlTextReaderDepth(reader) > depth);
+	while (result > 0
 			&& (xmlTextReaderNodeType(reader) == XML_READER_TYPE_SIGNIFICANT_WHITESPACE
 					|| xmlTextReaderNodeType(reader) == XML_READER_TYPE_COMMENT
 					|| xmlTextReaderNodeType(reader) == XML_READER_TYPE_END_ELEMENT)) {
 		result = xmlTextReaderRead(reader);
 	}
-	return result;
+	return result > 0;
 }
 
 int stepOut(xmlTextReaderPtr reader) {
@@ -50,27 +50,27 @@ int stepOut(xmlTextReaderPtr reader) {
 	int result;
 	do {
 		result = xmlTextReaderRead(reader);
-	} while (result && xmlTextReaderDepth(reader) > depth);
-	while (result
+	} while (result > 0 && xmlTextReaderDepth(reader) > depth);
+	while (result > 0
 			&& (xmlTextReaderNodeType(reader) == XML_READER_TYPE_SIGNIFICANT_WHITESPACE
 					|| xmlTextReaderNodeType(reader) == XML_READER_TYPE_COMMENT
 					|| xmlTextReaderNodeType(reader) == XML_READER_TYPE_END_ELEMENT)) {
 		result = xmlTextReaderRead(reader);
 	}
-	return result;
+	return result > 0;
 }
 
 int stepOverText(xmlTextReaderPtr reader, const char ** text) {
 	int depth = xmlTextReaderDepth(reader);
 	int result = stepInto(reader);
 	*text = NULL;
-	if (result && xmlTextReaderDepth(reader) > depth) {
+	if (result > 0 && xmlTextReaderDepth(reader) > depth) {
 		if (xmlTextReaderNodeType(reader) == XML_READER_TYPE_TEXT) {
 			*text = xmlTextReaderValue(reader);
 		}
 		result = stepOut(reader);
 	}
-	return result;
+	return result > 0;
 }
 
 int elementMatches(xmlTextReaderPtr reader, const char * namespace, const char * nodeName) {

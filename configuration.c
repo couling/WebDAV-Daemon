@@ -86,11 +86,12 @@ static int configListen(WebdavdConfiguration * config, xmlTextReaderPtr reader, 
 		if (xmlTextReaderNodeType(reader) == XML_READER_TYPE_ELEMENT
 				&& !strcmp(xmlTextReaderConstNamespaceUri(reader),
 				CONFIG_NAMESPACE)) {
-			if (!strcmp(xmlTextReaderConstLocalName(reader), "port")) {
+			const char * elementName = xmlTextReaderConstLocalName(reader);
+			if (!strcmp(elementName, "port")) {
 				result = readConfigInt(reader, &config->daemons[index].port, configFile);
-			} else if (!strcmp(xmlTextReaderConstLocalName(reader), "host")) {
+			} else if (!strcmp(elementName, "host")) {
 				result = readConfigString(reader, &config->daemons[index].host);
-			} else if (!strcmp(xmlTextReaderConstLocalName(reader), "encryption")) {
+			} else if (!strcmp(elementName, "encryption")) {
 				const char * encryptionString;
 				result = stepOverText(reader, &encryptionString);
 				if (encryptionString) {
@@ -104,7 +105,7 @@ static int configListen(WebdavdConfiguration * config, xmlTextReaderPtr reader, 
 					}
 					xmlFree((char *) encryptionString);
 				}
-			} else if (!strcmp(xmlTextReaderConstLocalName(reader), "forward-to")) {
+			} else if (!strcmp(elementName, "forward-to")) {
 				int depth2 = xmlTextReaderDepth(reader) + 1;
 				result = stepInto(reader);
 				config->daemons[index].forwardToIsEncrypted = -1;
@@ -143,6 +144,9 @@ static int configListen(WebdavdConfiguration * config, xmlTextReaderPtr reader, 
 								config->daemons[index].forwardToPort == 443 ? 1 : 0;
 					}
 				}
+			} else {
+				stdLogError(0, "Unknown element tag '%s' in listen section", elementName);
+				result = stepOver(reader);
 			}
 		} else {
 			result = stepOver(reader);
