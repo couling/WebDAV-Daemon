@@ -867,9 +867,10 @@ static ssize_t mkcol(Message * requestMessage) {
 		case ENOSPC:
 		case EDQUOT:
 			return writeErrorResponse(RAP_RESPOND_INSUFFICIENT_STORAGE, strerror(e), NULL, fileName);
+        case EEXIST:
+            return writeErrorResponse(RAP_RESPOND_METHOD_NOT_ALLOWED, strerror(e), NULL, fileName);
 		case ENOENT:
 		case EPERM:
-		case EEXIST:
 		case ENOTDIR:
 		default:
 			return writeErrorResponse(RAP_RESPOND_CONFLICT, strerror(e), NULL, fileName);
