@@ -93,8 +93,8 @@
 
 		<!-- File location for logs. If not specified or left blank the error log 
 			will print to stdout and the access log to stderr -->
-		<error-log>/var/log/webdav-error.log</error-log>
-		<access-log>/var/log/webdav-access.log</access-log>
+		<error-log>/var/log/webdavd/error.log</error-log>
+		<access-log>/var/log/webdavd/access.log</access-log>
 
 		<!-- At least one of these must be configured if you want an SSL encrypted 
 			connection. Certificates MUST have a Subject Alternative Name specified. 
