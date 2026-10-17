@@ -20,6 +20,11 @@
 #include <unistd.h>
 #include <uuid/uuid.h>
 
+// Older libmicrohttpd releases only define this as MHD_HTTP_REQUESTED_RANGE_NOT_SATISFIABLE
+#ifndef MHD_HTTP_RANGE_NOT_SATISFIABLE
+#define MHD_HTTP_RANGE_NOT_SATISFIABLE 416
+#endif
+
 ////////////////
 // Structures //
 ////////////////
@@ -1152,19 +1157,19 @@ static ssize_t fdContentReader(void *cls, uint64_t pos, char *buf, size_t max) {
 	FDResponseData * fdResponsedata = cls;
 	if (pos != fdResponsedata->pos) {
 		off_t seekTo = pos + fdResponsedata->offset;
-		off_t result = lseek(fdResponsedata->fd, pos + fdResponsedata->offset, SEEK_SET);
+		off_t result = lseek(fdResponsedata->fd, seekTo, SEEK_SET);
 		if (result != seekTo) {
 			stdLogError(errno, "Could not file seek for response");
 			return MHD_CONTENT_READER_END_WITH_ERROR;
 		} else {
-			fdResponsedata->pos = seekTo;
+			fdResponsedata->pos = pos;
 		}
 	}
 	if (fdResponsedata->size > 0 && fdResponsedata->size - pos < max) {
 		max = fdResponsedata->size - pos;
 	}
 
-	size_t bytesRead = read(fdResponsedata->fd, buf, max);
+	ssize_t bytesRead = read(fdResponsedata->fd, buf, max);
 	if (bytesRead <= 0) {
 		if (bytesRead == 0) {
 			return MHD_CONTENT_READER_END_OF_STREAM;
@@ -1174,7 +1179,7 @@ static ssize_t fdContentReader(void *cls, uint64_t pos, char *buf, size_t max) {
 		}
 	}
 	while (bytesRead < max) {
-		size_t newBytesRead = read(fdResponsedata->fd, buf + bytesRead, max - bytesRead);
+		ssize_t newBytesRead = read(fdResponsedata->fd, buf + bytesRead, max - bytesRead);
 		if (newBytesRead <= 0) {
 			break;
 		}
@@ -1196,7 +1201,8 @@ static Response * createFdResponse(int fd, uint64_t offset, uint64_t size, const
 
 	FDResponseData * fdResponseData = mallocSafe(sizeof(*fdResponseData));
 	fdResponseData->fd = fd;
-	fdResponseData->pos = 0;
+	// pos is relative to offset; -1 forces the first read to seek to offset
+	fdResponseData->pos = offset ? -1 : 0;
 	fdResponseData->offset = offset;
 	fdResponseData->size = size;
 	fdResponseData->session = rapSession;
@@ -1231,51 +1237,45 @@ static Response * createFileResponse(const char * fileName, const char * mimeTyp
 	return createFdResponse(fd, 0, statBuffer.st_size, mimeType, statBuffer.st_mtime, session);
 }
 
-static int processRangeHeader(off_t * offset, size_t * fileSize, const char *range) {
-	int result = strncmp(range, "bytes=", sizeof("bytes=") - 1);
-	if (result) {
-		return 0;
-	}
+typedef enum RangeResult {
+	RANGE_IGNORE, RANGE_SATISFIABLE, RANGE_NOT_SATISFIABLE
+} RangeResult;
 
-	long long from, to;
-
+// Parses a single "bytes=" range (RFC 7233). Multiple ranges and malformed headers are ignored so the
+// whole file is served instead.
+static RangeResult processRangeHeader(off_t * offset, off_t * length, off_t fileSize, const char * range) {
+	if (strncmp(range, "bytes=", sizeof("bytes=") - 1)) return RANGE_IGNORE;
 	range += sizeof("bytes=") - 1;
-	if (*range == '\0') {
-		return 0;
-	}
+	if (strchr(range, ',')) return RANGE_IGNORE;
 
+	char * endPtr;
+	long long from, to;
 	if (*range == '-') {
-		from = 0;
+		// Suffix range: the last N bytes
+		long long suffix = strtoll(range + 1, &endPtr, 10);
+		if (endPtr == range + 1 || *endPtr != '\0' || suffix < 0) return RANGE_IGNORE;
+		if (suffix == 0 || fileSize == 0) return RANGE_NOT_SATISFIABLE;
+		from = suffix > fileSize ? 0 : fileSize - suffix;
+		to = fileSize - 1;
 	} else {
-		char * endPtr;
+		if (*range < '0' || *range > '9') return RANGE_IGNORE;
 		from = strtoll(range, &endPtr, 10);
-		if (endPtr == range) {
-			return 0;
+		if (*endPtr != '-') return RANGE_IGNORE;
+		range = endPtr + 1;
+		if (*range == '\0') {
+			to = fileSize - 1;
 		} else {
-			range = endPtr;
+			if (*range < '0' || *range > '9') return RANGE_IGNORE;
+			to = strtoll(range, &endPtr, 10);
+			if (*endPtr != '\0' || to < from) return RANGE_IGNORE;
+			if (to >= fileSize) to = fileSize - 1;
 		}
-	}
-
-	if (*range == '\0') {
-		return 0;
-	}
-
-	range++;
-
-	if (*range == '\0') {
-		to = *fileSize;
-	} else {
-		char * endPtr;
-		to = strtoll(range, &endPtr, 10);
-		if (endPtr == range) {
-			return 0;
-		}
+		if (from >= fileSize) return RANGE_NOT_SATISFIABLE;
 	}
 
 	*offset = from;
-	*fileSize = to - from;
-
-	return 1;
+	*length = to - from + 1;
+	return RANGE_SATISFIABLE;
 }
 
 static int createResponseFromMessage(Request * request, Message * message, Response ** response,
@@ -1327,22 +1327,43 @@ static int createResponseFromMessage(Request * request, Message * message, Respo
 		struct stat stat;
 		fstat(message->fd, &stat);
 		if ((stat.st_mode & S_IFMT) == S_IFREG) {
-			if (statusCode == 200) {
+			if (statusCode == 200 && request) {
 				off_t offset = 0;
-				size_t fileSize = stat.st_size;
-				if (request) {
-					const char * rangeHeader = getHeader(request, "Range");
-					if (rangeHeader && processRangeHeader(&offset, &fileSize, rangeHeader)) {
-						statusCode = MHD_HTTP_PARTIAL_CONTENT;
+				off_t length = stat.st_size;
+				RangeResult rangeResult = RANGE_IGNORE;
+				const char * rangeHeader = getHeader(request, "Range");
+				if (rangeHeader) {
+					// If-Range only carries our Last-Modified date (we send no ETag); anything else means the
+					// client's copy is stale so it gets the whole file
+					const char * ifRange = getHeader(request, "If-Range");
+					char dateBuf[100];
+					getWebDate(date, dateBuf, sizeof(dateBuf));
+					if (!ifRange || !strcmp(ifRange, dateBuf)) {
+						rangeResult = processRangeHeader(&offset, &length, stat.st_size, rangeHeader);
 					}
 				}
-				*response = createFdResponse(message->fd, offset, fileSize, mimeType, date, session);
 
 				char contentRangeHeader[200];
-				snprintf(contentRangeHeader, sizeof(contentRangeHeader), "bytes %lld-%lld/%lld",
-						(long long) offset, (long long) (fileSize + offset), (long long) stat.st_size);
+				switch (rangeResult) {
+				case RANGE_SATISFIABLE:
+					statusCode = MHD_HTTP_PARTIAL_CONTENT;
+					*response = createFdResponse(message->fd, offset, length, mimeType, date, session);
+					snprintf(contentRangeHeader, sizeof(contentRangeHeader), "bytes %lld-%lld/%lld",
+							(long long) offset, (long long) (offset + length - 1), (long long) stat.st_size);
+					addHeader(*response, "Content-Range", contentRangeHeader);
+					break;
 
-				addHeader(*response, "Content-Range", contentRangeHeader);
+				case RANGE_NOT_SATISFIABLE:
+					statusCode = MHD_HTTP_RANGE_NOT_SATISFIABLE;
+					*response = createFdResponse(message->fd, 0, 0, mimeType, date, session);
+					snprintf(contentRangeHeader, sizeof(contentRangeHeader), "bytes */%lld",
+							(long long) stat.st_size);
+					addHeader(*response, "Content-Range", contentRangeHeader);
+					break;
+
+				default:
+					*response = createFdResponse(message->fd, 0, stat.st_size, mimeType, date, session);
+				}
 			} else {
 				*response = createFdResponse(message->fd, 0, stat.st_size, mimeType, date, session);
 			}
